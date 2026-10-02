@@ -9,7 +9,7 @@
   * 把整个窗口、5 个标签页、3 个弹窗都真的构造出来并渲染(能抓出控件参数写错、
     布局冲突这类只在运行时才暴露的问题)
   * 跑一遍代表性的数据操作(增/改/删元件、入库/盘点/移库、超额出库、重建校验)
-  * 结果写到 dist/gui_selftest.txt(UTF-8,避免控制台编码把中文弄乱)
+  * 结果写到 build/cache/gui_selftest.txt(UTF-8,避免控制台编码把中文弄乱)
 
 退出码 0 = 全部通过。
 """
@@ -31,8 +31,10 @@ import gui       # noqa: E402
 import server    # noqa: E402
 
 REAL_DB = os.path.join(ROOT, "data", "parts.db")
-TEST_DB = os.path.join(ROOT, "dist", "selftest.db")
-RESULT = os.path.join(ROOT, "dist", "gui_selftest.txt")
+# 自检的临时库和结果都放 build\cache\ —— dist\ 只放成品,不往里丢别的东西
+CACHE = os.path.join(ROOT, "build", "cache")
+TEST_DB = os.path.join(CACHE, "selftest.db")
+RESULT = os.path.join(CACHE, "gui_selftest.txt")
 
 OUT = io.StringIO()
 FAILS: list[str] = []
@@ -269,6 +271,11 @@ def main() -> int:
         app.update()
         p("  [OK ] 全量刷新")
         app.destroy()
+        # destroy() 不会关数据库连接 —— 不显式关掉,临时库就一直被占着删不掉
+        try:
+            app.con.close()
+        except Exception:  # noqa: BLE001
+            pass
         p("\n界面已正常关闭(连接与窗口都释放)")
 
     except Exception:  # noqa: BLE001

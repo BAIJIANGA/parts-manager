@@ -52,18 +52,27 @@ python build\test_gui.py
 
 在 `data\parts.db` 的**副本**上跑:把整个窗口、5 个标签页、3 个弹窗真的构造并渲染一遍,
 再跑一遍代表性的数据操作(增改删、入库/出库/盘点/移库、超额出库、按流水重建校验)。
-结果写到 `dist\gui_selftest.txt`。**不会动你的真实数据。**
+结果写到 `build\cache\gui_selftest.txt`。**不会动你的真实数据。**
 
-### 重新打包便携版
+### 重新打包
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
 ```
 
-产出 `dist\元器件物料管理\`(便携目录)和 `dist\元器件物料管理_便携版.zip`(可分发)。
+产出的就是 `dist\元器件物料管理\` 这一个目录 —— **它本身就是解压好的成品**,
+双击里面的 `元器件物料管理.exe` 即可,整个目录直接拷 U 盘。
 
 > 必须带 `-ExecutionPolicy Bypass`,否则 Windows 会拒绝执行
 > (`running scripts is disabled on this system`)。
+
+不生成 zip,不往 `dist\` 里放任何别的文件:
+
+- 构建中间产物(内嵌 Python、编译出的启动器、自检输出)全在 `build\cache\` 下
+- 打包前会检查目标目录里有没有程序正在运行 —— 有就直接报错并报出 PID。
+  因为 `Remove-Item` 遇到被占用的文件会删一半就停,留下一个缺文件的残目录,
+  比直接失败更糟
+- 如果 `dist\` 里还有别的东西(比如你自己解压出来在用的那份),脚本只提示、不动它
 
 三个容易踩的坑,脚本里都已经处理掉了:
 
@@ -142,15 +151,19 @@ parts-manager/
 │   ├── parts.db           ← 全部数据就在这一个文件里
 │   ├── backups/           每次启动 / 每次删除前自动快照(保留最近 20 份)
 │   └── inbox/             导入过的 BOM 原文件留档
-├── build/                 ← 便携版构建源
+├── build/                 ← 构建源 + 中间产物
 │   ├── Launcher.cs        启动器(编译成 exe)
 │   ├── make_icon.py       图标生成
+│   ├── app.ico            图标(生成结果,也当源用)
 │   ├── build.ps1          一键打包
 │   ├── test_gui.py        自检(逻辑 + 界面构造,不动真实数据)
-│   └── 使用说明.txt        随包一起发的说明
-├── dist/                  构建产物(不进版本库)
-│   ├── python-embed/      内嵌 Python 3.12 运行时(已注入 tkinter)
-│   └── 元器件物料管理/      ← 最终便携目录,双击里面的 exe
+│   ├── 使用说明.txt        随包一起发的说明
+│   └── cache/             中间产物(不进版本库)
+│       ├── python-embed/  内嵌 Python 3.12(已注入 tkinter)
+│       ├── 元器件物料管理.exe
+│       └── gui_selftest.txt
+├── dist/                  成品(不进版本库)
+│   └── 元器件物料管理/      ← 唯一的产物,双击里面的 exe;拷 U 盘就拷这个目录
 ├── scripts/
 │   └── 启动.bat           旧网页版的开发启动脚本(桌面版不需要它)
 ├── venv/                  项目自带 Python 环境
