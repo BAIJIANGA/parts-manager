@@ -175,14 +175,61 @@ def main() -> int:
 
         app.nb.select(0)
         app.update()
-        kids = app.tab_comp.tree.get_children()
-        check("元件页行数", len(kids), real_count)
-        if kids:
-            app.tab_comp.tree.selection_set(kids[0])
-            app.update()
-            p(f"  [OK ] 选中一行后详情加载,仓位分布 "
-              f"{len(app.tab_comp.t_stock.get_children())} 行,"
-              f"流水 {len(app.tab_comp.t_hist.get_children())} 行")
+        groups = app.tab_comp.tree.get_children()
+        texts = [app.tab_comp.tree.item(g, "text") for g in groups]
+        p(f"  元件页一级节点 {len(groups)} 个: {texts}")
+
+        gids = [g for g in groups if g.startswith("g:")]
+        pids = [g for g in groups if g.startswith("p:")]
+        check("一级不出现裸元件行",
+              [g for g in groups if g.startswith("c:") or g.startswith("pc:")], [])
+        check("一级大类数量在合理范围", 1 <= len(gids) <= real_count, True)
+        check("一级有项目节点", len(pids) >= 1, True)
+        check("项目节点名字带项目号",
+              "【项目】" in app.tab_comp.tree.item(pids[0], "text"), True)
+        check("一级默认全部折叠",
+              any(app.tab_comp.tree.item(g, "open") for g in groups), False)
+        check("大类行不带数量", all("(" not in t and "（" not in t for t in texts), True)
+
+        # 展开第一个大类 —— 二级应该就是具体型号
+        g0 = gids[0]
+        app.tab_comp.tree.item(g0, open=True)
+        app.update()
+        kids = app.tab_comp.tree.get_children(g0)
+        check("展开后二级都是元件行", all(k.startswith("c:") for k in kids), True)
+        p(f"  展开「{app.tab_comp.tree.item(g0, 'text')}」-> {len(kids)} 个型号")
+
+        app.tab_comp.tree.selection_set(kids[0])
+        app.update()
+        p(f"  [OK ] 选中元件后详情加载,仓位分布 "
+          f"{len(app.tab_comp.t_stock.get_children())} 行,"
+          f"流水 {len(app.tab_comp.t_hist.get_children())} 行")
+
+        # 选中一级分组行:不能当成元件,详情要清空
+        app.tab_comp.tree.selection_set(g0)
+        app.update()
+        check("选分组行时拿不到元件 id", app.tab_comp.selected_id(), None)
+        check("选分组行时详情清空", len(app.tab_comp.t_stock.get_children()), 0)
+
+        # 展开 / 折叠切换
+        app.tab_comp.toggle_all()
+        app.update()
+        check("全部展开后每个一级节点都开着",
+              all(app.tab_comp.tree.item(g, "open") for g in groups), True)
+        expanded = sum(len(app.tab_comp.tree.get_children(g)) for g in groups)
+        check("展开后元件行数 >= 元件种类数(项目节点处会重复)",
+              expanded >= real_count, True)
+        app.tab_comp.toggle_all()
+        app.update()
+        check("再点一次变全部折叠",
+              any(app.tab_comp.tree.item(g, "open") for g in groups), False)
+
+        # 项目节点下挂的应该正是该项目的 BOM 元件
+        proj_kids = app.tab_comp.tree.get_children(pids[0])
+        check("项目节点下有元件", len(proj_kids) > 0, True)
+        check("项目节点的子行是 pc: 前缀",
+              all(k.startswith("pc:") for k in proj_kids), True)
+        p(f"  项目节点「{app.tab_comp.tree.item(pids[0], 'text')}」下 {len(proj_kids)} 个元件")
 
         app.nb.select(1)
         app.update()
@@ -208,13 +255,12 @@ def main() -> int:
         d.update()
         p(f"  [OK ] 新增元件弹窗 {len(d.vars)} 个字段")
         d.destroy()
-        if kids:
-            cid0 = int(app.tab_comp.tree.get_children()[0])
-            d2 = gui.ComponentDialog(app, app, cid0)
-            d2.update()
-            check("编辑弹窗回填名称", bool(d2.vars["name"].get()), True)
-            d2.destroy()
-        mv = gui.MoveDialog(app, app, cid0 if kids else 1, "IN")
+        cid0 = int(kids[0][2:]) if kids else 1
+        d2 = gui.ComponentDialog(app, app, cid0)
+        d2.update()
+        check("编辑弹窗回填名称", bool(d2.vars["name"].get()), True)
+        d2.destroy()
+        mv = gui.MoveDialog(app, app, cid0, "IN")
         mv.update()
         p("  [OK ] 出入库弹窗")
         mv.destroy()
