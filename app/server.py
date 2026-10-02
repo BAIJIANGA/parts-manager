@@ -194,6 +194,11 @@ def list_components(ctx: Ctx, m):
     if state in ("ok", "low", "out"):
         outer_where.append("stock_state = ?")
         outer_args.append(state)
+    # stocked=1:只要真正有库存的。on_hand 是子查询算出来的,所以只能在外层过滤。
+    # 桌面版的「元件库存」首页靠它把库存为 0 的元件整个滤掉 —— 导入 BOM 只是记下
+    # 「这块板子要用什么」,东西还没买回来,那不算库存。
+    if ctx.q("stocked") in ("1", "true", "yes"):
+        outer_where.append("on_hand > 0")
     if outer_where:
         sql += " WHERE " + " AND ".join(outer_where)
 

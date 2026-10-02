@@ -19,6 +19,7 @@ import io
 import os
 import shutil
 import sys
+import tkinter as tk
 import traceback
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +51,17 @@ def check(label, got, want):
         FAILS.append(f"{label}: 得到 {got!r},期望 {want!r}")
     p(f"  [{'OK ' if ok else 'FAIL'}] {label}: {got!r}" + ("" if ok else f"  期望 {want!r}"))
     return ok
+
+
+def card_labels(card):
+    """把一张大类卡片上所有 Label 的文字取出来(卡片是 tk.Frame)。"""
+    out = []
+    for w in card.winfo_children():
+        if isinstance(w, tk.Label):
+            out.append(w.cget("text"))
+        elif isinstance(w, tk.Frame):
+            out += [c.cget("text") for c in w.winfo_children() if isinstance(c, tk.Label)]
+    return out
 
 
 def main() -> int:
@@ -177,61 +189,98 @@ def main() -> int:
 
         app.nb.select(0)
         app.update()
-        groups = app.tab_comp.tree.get_children()
-        texts = [app.tab_comp.tree.item(g, "text") for g in groups]
-        p(f"  元件页一级节点 {len(groups)} 个: {texts}")
+        tab = app.tab_comp
 
-        gids = [g for g in groups if g.startswith("g:")]
-        pids = [g for g in groups if g.startswith("p:")]
-        check("一级不出现裸元件行",
-              [g for g in groups if g.startswith("c:") or g.startswith("pc:")], [])
-        check("一级大类数量在合理范围", 1 <= len(gids) <= real_count, True)
-        check("一级有项目节点", len(pids) >= 1, True)
-        check("项目节点名字带项目号",
-              "【项目】" in app.tab_comp.tree.item(pids[0], "text"), True)
-        check("一级默认全部折叠",
-              any(app.tab_comp.tree.item(g, "open") for g in groups), False)
-        check("大类行不带数量", all("(" not in t and "（" not in t for t in texts), True)
+        # ---- 库存全为 0:首页应该是空的。导入 BOM 只是记下「这块板子要用到什么」,
+        #      东西还没买回来,那不算库存,不该出现在这一页。
+        check("没有库存时首页一张卡片都没有", tab.cards, {})
+        check("没有库存时停在首页", tab.view, "home")
+        check("没有库存时给出空状态提示", len(tab.card_area.winfo_children()), 1)
+        check("没有库存时明细表是空的", len(tab.tree.get_children()), 0)
+        p(f"  库存全 0:卡片 {len(tab.cards)} 张,只显示空状态提示")
 
-        # 展开第一个大类 —— 二级应该就是具体型号
-        g0 = gids[0]
-        app.tab_comp.tree.item(g0, open=True)
+        # ---- 入一点货,首页才该长出对应的大类卡片
+        p("\n【4】入库之后,该大类才出现在首页")
+        items = gui.call(app.con, server.list_components,
+                         query={"sort": "category"}, quiet=True)["items"]
+        by_cat = {}
+        for it in items:
+            by_cat.setdefault((it.get("category") or "").strip() or "未分类", []).append(it)
+        chosen = []
+        for c in sorted(by_cat, key=tab._cat_rank)[:2]:
+            chosen += [(c, it) for it in by_cat[c][:2]]
+        for _cat, it in chosen:
+            gui.call(app.con, server.stock_move,
+                     body={"kind": "IN", "component_id": it["id"], "qty": 7,
+                           "location": "未分类"}, quiet=True)
+        app.refresh_all()
         app.update()
-        kids = app.tab_comp.tree.get_children(g0)
-        check("展开后二级都是元件行", all(k.startswith("c:") for k in kids), True)
-        p(f"  展开「{app.tab_comp.tree.item(g0, 'text')}」-> {len(kids)} 个型号")
 
-        app.tab_comp.tree.selection_set(kids[0])
-        app.update()
-        p(f"  [OK ] 选中元件后详情加载,仓位分布 "
-          f"{len(app.tab_comp.t_stock.get_children())} 行,"
-          f"流水 {len(app.tab_comp.t_hist.get_children())} 行")
+        want_cards = sorted({c for c, _ in chosen})
+        check("入库后首页出现对应的大类卡片", sorted(tab.cards), want_cards)
+        check("卡片上只有名称,不带数量",
+              all(not any(ch.isdigit() for ch in t)
+                  for c in tab.cards.values() for t in card_labels(c)), True)
+        check("首页不显示任何项目", any("项目" in k for k in tab.cards), False)
+        check("在库元件就是入过货的那几个",
+              sorted(x["id"] for x in tab._all), sorted({it["id"] for _, it in chosen}))
+        check("在库元件库存都 > 0", all(x["on_hand"] > 0 for x in tab._all), True)
+        # 卡片尺寸必须就是设定值 —— 曾经因为子控件是 pack 的、却只关了
+        # grid_propagate,卡片被内容撑成 130x72,这里看住它
+        check("卡片尺寸就是设定值,没被内容撑变",
+              {(c.winfo_width(), c.winfo_height()) for c in tab.cards.values()},
+              {(gui.CARD_W, gui.CARD_H)})
+        check("有元件被库存过滤掉(证明过滤真的生效)",
+              len(items) - len(tab._all) > 0, True)
+        p(f"  入库 {len(chosen)} 种后:卡片 {want_cards},在库 {len(tab._all)} 种,"
+          f"其余 {len(items) - len(tab._all)} 种(库存 0)不显示")
 
-        # 选中一级分组行:不能当成元件,详情要清空
-        app.tab_comp.tree.selection_set(g0)
+        # ---- 点卡片 -> 独立的二级页面(不是树形展开)
+        cat0, first = chosen[0]
+        n0 = len(tab._cat_data[cat0])
+        tab.open_category(cat0)
         app.update()
-        check("选分组行时拿不到元件 id", app.tab_comp.selected_id(), None)
-        check("选分组行时详情清空", len(app.tab_comp.t_stock.get_children()), 0)
+        check("点卡片后切到二级页面", tab.view, "cat")
+        check("二级页面记住了在看哪个大类", tab.current_category, cat0)
+        check("二级页面已显示出来", bool(tab.page_cat.winfo_ismapped()), True)
+        check("首页已收起", bool(tab.page_home.winfo_ismapped()), False)
+        check("二级表行数 = 该大类在库元件数", len(tab.tree.get_children()), n0)
+        cols = [tab.tree.heading(c)["text"] for c in tab.tree["columns"]]
+        k_qty = cols.index("库存")
+        check("二级表里每行库存都 > 0",
+              all(float(tab.tree.item(k, "values")[k_qty]) > 0
+                  for k in tab.tree.get_children()), True)
+        show = str(tab.tree.cget("show"))
+        check("二级是平表,没有展开三角",
+              "headings" in show and "tree" not in show, True)
+        p(f"  点开「{cat0}」-> {n0} 个型号(该大类在库的全在这里),页面切换正常")
+        for k in tab.tree.get_children():
+            v = tab.tree.item(k, "values")
+            p(f"      {v[0]}  库存 {v[k_qty]}  {v[cols.index('状态')]}")
 
-        # 展开 / 折叠切换
-        app.tab_comp.toggle_all()
+        rows = tab.tree.get_children()
+        tab.tree.selection_set(rows[0])
         app.update()
-        check("全部展开后每个一级节点都开着",
-              all(app.tab_comp.tree.item(g, "open") for g in groups), True)
-        expanded = sum(len(app.tab_comp.tree.get_children(g)) for g in groups)
-        check("展开后元件行数 >= 元件种类数(项目节点处会重复)",
-              expanded >= real_count, True)
-        app.tab_comp.toggle_all()
-        app.update()
-        check("再点一次变全部折叠",
-              any(app.tab_comp.tree.item(g, "open") for g in groups), False)
+        check("选中元件能取到 id", isinstance(tab.selected_id(), int), True)
+        p(f"  [OK ] 选中元件后详情加载,仓位分布 {len(tab.t_stock.get_children())} 行,"
+          f"流水 {len(tab.t_hist.get_children())} 行")
 
-        # 项目节点下挂的应该正是该项目的 BOM 元件
-        proj_kids = app.tab_comp.tree.get_children(pids[0])
-        check("项目节点下有元件", len(proj_kids) > 0, True)
-        check("项目节点的子行是 pc: 前缀",
-              all(k.startswith("pc:") for k in proj_kids), True)
-        p(f"  项目节点「{app.tab_comp.tree.item(pids[0], 'text')}」下 {len(proj_kids)} 个元件")
+        tab.go_home()
+        app.update()
+        check("返回后回到首页", tab.view, "home")
+        check("返回后首页重新显示", bool(tab.page_home.winfo_ismapped()), True)
+        check("返回后二级页面收起", bool(tab.page_cat.winfo_ismapped()), False)
+
+        # ---- 搜索也是独立页面
+        tab.q.set(cat0)
+        tab.open_search()
+        app.update()
+        check("搜索切到独立页面", tab.view, "search")
+        check("搜索结果非空", len(tab.tree.get_children()) > 0, True)
+        p(f"  搜索「{cat0}」-> {len(tab.tree.get_children())} 条")
+        tab.q.set("")
+        tab.go_home()
+        app.update()
 
         app.nb.select(1)
         app.update()
@@ -257,7 +306,7 @@ def main() -> int:
         d.update()
         p(f"  [OK ] 新增元件弹窗 {len(d.vars)} 个字段")
         d.destroy()
-        cid0 = int(kids[0][2:]) if kids else 1
+        cid0 = chosen[0][1]["id"]
         d2 = gui.ComponentDialog(app, app, cid0)
         d2.update()
         check("编辑弹窗回填名称", bool(d2.vars["name"].get()), True)
