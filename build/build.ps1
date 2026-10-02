@@ -143,6 +143,13 @@ if ($LASTEXITCODE -ne 0) { throw 'csc 编译失败' }
 
 # ---------------------------------------------------------------- 6
 Step '6/7' '组装便携目录'
+# 程序正从目标目录运行的话,重建会把在用的 exe / 数据库覆盖掉,而且 Remove-Item
+# 会删一半就卡在占用的文件上,留下一个残缺的目录 —— 先拦住,让人去关窗口。
+$busy = Get-Process -Name '元器件物料管理', 'pythonw' -EA SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path -like "$Pkg\*" }
+if ($busy) {
+    throw "程序正在从 $Pkg 运行(PID $($busy.Id -join ', '))。请先关掉那个窗口,再重新打包。"
+}
 if (Test-Path $Pkg) { Remove-Item $Pkg -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Pkg | Out-Null
 Copy-Item (Join-Path $Dist '元器件物料管理.exe') $Pkg -Force
@@ -181,6 +188,7 @@ Write-Host "  $Pkg"
 Write-Host "  $zip"
 Write-Host ''
 Write-Host '自检(不碰你的数据,会复制一份数据库):  python build\test_gui.py' -ForegroundColor DarkGray
+
 
 
 
