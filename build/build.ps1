@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # 一键重建便携免安装版。用法(在 parts-manager 目录下):
 #     pwsh -File build\build.ps1
 #
@@ -66,8 +66,11 @@ New-Item -ItemType Directory -Force -Path $Pkg | Out-Null
 Copy-Item (Join-Path $Dist '元器件物料管理.exe') $Pkg -Force
 Copy-Item $Embed (Join-Path $Pkg 'runtime') -Recurse -Force
 Copy-Item (Join-Path $Root 'app') (Join-Path $Pkg 'app') -Recurse -Force
-Get-ChildItem (Join-Path $Pkg 'app') -Recurse -Directory -Filter __pycache__ |
-    Remove-Item -Recurse -Force -EA SilentlyContinue
+# 清掉 __pycache__ 和残留的目录,免得打进包里
+# (别用 -Filter __pycache__:实测匹配不到,字节码会漏进包里)
+Get-ChildItem (Join-Path $Pkg 'app') -Recurse -Directory -Force |
+    Where-Object { $_.Name -eq '__pycache__' -or $_.Name -eq 'routers' } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -EA SilentlyContinue }
 New-Item -ItemType Directory -Force -Path (Join-Path $Pkg 'data') | Out-Null
 $db = Join-Path $Root 'data\parts.db'
 if (Test-Path $db) { Copy-Item $db (Join-Path $Pkg 'data\parts.db') -Force }
