@@ -21,7 +21,14 @@ async function api(path, { method = 'GET', body, form } = {}) {
     init.headers['Content-Type'] = 'application/json; charset=utf-8';
     init.body = JSON.stringify(body);
   }
-  const res = await fetch(path, init);
+  let res;
+  try {
+    res = await fetch(path, init);
+  } catch {
+    // 浏览器只在网络层失败时抛这个,几乎总是「服务端没在跑」
+    throw new Error('连不上服务端。请确认「启动.bat」那个黑色命令行窗口还开着,'
+                  + '然后按 F5 刷新本页再试。');
+  }
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = { error: text }; }
