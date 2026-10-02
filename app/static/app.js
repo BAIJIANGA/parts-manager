@@ -707,6 +707,11 @@ $$('#tabs button').forEach((b) => {
 
 window.closeModal = closeModal;   // 供内联 onclick 调用
 
+/* 心跳:告诉本地服务「界面还开着」。
+   窗口一关请求就停了,便携版的服务会空闲超时自动退出 —— 靠这个收尾,
+   不依赖任何浏览器进程判断,Edge 换成默认浏览器也一样成立。 */
+setInterval(() => { fetch('/api/ping', { cache: 'no-store' }).catch(() => {}); }, 5000);
+
 (async function init() {
   await loadMeta();
   await refresh();

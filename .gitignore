@@ -16,3 +16,15 @@ data/tmp/
 data/*.out
 data/*.err
 *.log
+
+# 便携版构建产物(dist 只留源在 build/)
+dist/python-embed/
+dist/元器件物料管理/
+dist/元器件物料管理.exe
+dist/元器件物料管理_便携版.zip
+dist/LauncherDiag.exe
+dist/app.ico
+dist/*.zip
+
+# Edge 的临时配置目录
+profile/

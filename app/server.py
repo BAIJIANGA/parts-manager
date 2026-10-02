@@ -32,6 +32,53 @@ PROJECT_ROOT = os.path.dirname(BASE_DIR)
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "data", "parts.db")
 MAX_UPLOAD = 32 * 1024 * 1024  # 32MB,防内存被撑爆
 
+# 输出编码兜底。
+# 某些环境下 stdout/stderr 是 GBK(典型:被重定向到文件、或没设 PYTHONUTF8),
+# 此时打印任何 GBK 编不出的字符都会抛 UnicodeEncodeError,直接把服务打死在启动横幅上。
+# 这里统一改成「编不出就替换」,保证日志永远不会导致崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):  # 不是 TextIOWrapper 就跳过
+        pass
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+# 前端心跳。
+# 便携版启动器靠它判断「界面还开着吗」:网页每 5 秒打一次 /api/ping,
+# 一旦窗口被关掉请求就停了,空闲超时后服务自行退出,不会赖在后台。
+LAST_ACTIVE = [time.time()]
+# 页面心跳计数。启动器靠它判断「Edge 窗口到底有没有真的把页面跑起来」:
+# 拉起了 Edge 进程但计数不涨,说明窗口没出来,该退回默认浏览器了。
+PING_COUNT = [0]
+
+
+def start_idle_watchdog(seconds: int) -> None:
+    """空闲超过 seconds 秒没有收到任何请求,就整体退出。
+
+    只在便携版(--idle-exit)下启用。二次确认是为了容忍系统休眠:
+    唤醒后 time.time() 会跳变,给前端 3 秒机会把心跳打上来。
+    """
+    if seconds <= 0:
+        return
+
+    def loop() -> None:
+        while True:
+            time.sleep(5)
+            idle = time.time() - LAST_ACTIVE[0]
+            if idle > seconds:
+                time.sleep(3)
+                if time.time() - LAST_ACTIVE[0] > seconds:
+                    print(f"[空闲] {int(idle)} 秒没有前端活动,自动退出")
+                    try:
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+                    os._exit(0)
+
+    threading.Thread(target=loop, daemon=True).start()
+
 CATEGORY_SUGGESTIONS = [
     "电阻", "电容", "电感", "磁珠", "二极管", "发光二极管", "三极管/MOS",
     "芯片/IC", "连接器", "晶振", "开关", "电位器", "保险丝", "继电器",
@@ -461,6 +508,24 @@ def summary(ctx: Ctx, m):
                  "projects": projs, "recent": recent, "by_category": by_cat}
 
 
+@route("GET", r"/api/health")
+def health(ctx: Ctx, m):
+    """给便携版启动器用的身份标识。
+
+    启动器靠它判断某个端口上跑的是不是「本程序的这一份副本」——
+    必须连 root 也一致才敢复用,否则会把另一份副本的数据当成自己的。
+    """
+    return 200, {"app": "parts-manager", "api": 1, "root": PROJECT_ROOT,
+                 "pings": PING_COUNT[0]}
+
+
+@route("GET", r"/api/ping")
+def ping(ctx: Ctx, m):
+    """前端心跳。网页每 5 秒打一次,服务据此知道界面还开着。"""
+    PING_COUNT[0] += 1
+    return 200, {"ok": True}
+
+
 @route("POST", r"/api/rebuild")
 def rebuild(ctx: Ctx, m):
     """按流水顺序重放,重建 stock 表,并报告与现状的差异。"""
@@ -734,7 +799,13 @@ class Handler(BaseHTTPRequestHandler):
     db_path = DEFAULT_DB
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+        # 只有「界面发来的请求」才算活跃。
+        # 启动器自己每 3 秒轮询一次 /api/health 用来探活;如果那个也算数,
+        # 空闲看门狗就永远等不到空闲,服务会赖在后台不退出。
+        line = fmt % args
+        if "/api/health" not in line:
+            LAST_ACTIVE[0] = time.time()
+        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), line))
 
     # ---- 基础响应
 
@@ -769,6 +840,11 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
         query = urllib.parse.parse_qs(parsed.query)
+
+        # 删除不可逆:动库之前先整库快照一份,误删可直接从 data/backups 回滚。
+        # 快照失败绝不阻断请求(backup_db 内部已吞掉 IO 异常)。
+        if method == "DELETE" and path.startswith("/api/"):
+            backup_db(self.db_path)
 
         if not path.startswith("/api/"):
             if method in ("GET", "HEAD"):
@@ -875,6 +951,8 @@ def main(argv=None) -> int:
     ap.add_argument("--host", default="127.0.0.1", help="默认只监听本机")
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--no-backup", action="store_true", help="启动时不自动备份")
+    ap.add_argument("--idle-exit", type=int, default=0, metavar="SEC",
+                    help="便携版用:连续 SEC 秒没有任何请求就自动退出(0=常驻不退出)")
     args = ap.parse_args(argv)
 
     if not args.no_backup:
@@ -886,6 +964,9 @@ def main(argv=None) -> int:
     db.init_db(con)
     con.close()
 
+    # 便携版:界面关掉后自动退出,不留后台进程
+    start_idle_watchdog(args.idle_exit)
+
     Handler.db_path = args.db
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}/"
@@ -894,9 +975,9 @@ def main(argv=None) -> int:
     print(f"  浏览器打开: {url}")
     print(f"  数据库文件: {args.db}")
     print("-" * 64)
-    print("  ⚠  请保持本窗口开着 —— 关掉它服务就停了,网页会打不开。")
-    print("     网页报 “Failed to fetch” 通常就是本窗口被关了。")
-    print("     停止服务:在本窗口按 Ctrl+C,或直接关闭窗口。")
+    print("  [注意] 请保持本窗口开着 —— 关掉它服务就停了,网页会打不开。")
+    print("         网页报 \"连不上服务端\" 通常就是本窗口被关了。")
+    print("         停止服务:在本窗口按 Ctrl+C,或直接关闭窗口。")
     print("=" * 64)
     try:
         httpd.serve_forever()
