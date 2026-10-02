@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# 数据库与备份(重要:数据不进版本库)
+data/parts.db
+data/parts.db-journal
+data/parts.db-wal
+data/parts.db-shm
+data/backups/
+data/inbox/
+data/tmp/
+
+# 运行日志
+data/*.out
+data/*.err
+*.log

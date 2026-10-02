@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>元器件物料管理</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <h1>📦 元器件物料管理</h1>
+  <div class="stats" id="stats"></div>
+</header>
+
+<nav id="tabs">
+  <button data-tab="components" class="active">库存台账</button>
+  <button data-tab="stock">出入库</button>
+  <button data-tab="projects">项目 BOM</button>
+  <button data-tab="movements">流水</button>
+</nav>
+
+<main id="view"></main>
+
+<div class="toasts" id="toasts"></div>
+<div id="modal-root"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
