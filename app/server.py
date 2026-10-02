@@ -174,9 +174,9 @@ def list_components(ctx: Ctx, m):
         like = f"%{keyword}%"
         where.append(
             "(c.name LIKE ? OR c.lcsc_pn LIKE ? OR c.mpn LIKE ? OR c.manufacturer LIKE ?"
-            " OR c.value LIKE ? OR c.package LIKE ? OR c.note LIKE ?)"
+            " OR c.value LIKE ? OR c.package LIKE ? OR c.note LIKE ? OR c.category LIKE ?)"
         )
-        args += [like] * 7
+        args += [like] * 8
     if ctx.q("category"):
         where.append("c.category = ?")
         args.append(ctx.q("category"))

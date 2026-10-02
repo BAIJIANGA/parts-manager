@@ -1,62 +1,80 @@
 # 元器件物料管理系统
 
-一个跑在**本机浏览器**里的元器件库存 / 出入库 / 项目 BOM 管理系统。
+一个**本地原生窗口**的元器件库存 / 出入库 / 项目 BOM 管理程序。
 专为「Altium Designer + 立创商城(LCSC)」的工作流设计:**立创编号(C-号)是元件的天然主键**。
 
-**零第三方依赖** —— 只用 Python 标准库,不需要 pip、不需要 Node、不需要数据库服务。
+**零第三方依赖** —— 只用 Python 标准库(含 tkinter),不需要 pip、不需要 Node、
+不需要数据库服务、**不开端口、不连网络**。
 
 ---
 
-## 快速开始(推荐:便携免安装版)
+## 快速开始
 
 双击 `dist\元器件物料管理\元器件物料管理.exe` 即可。
 
-**不需要装 Python,不需要装任何东西,不弹命令行窗口。** 整个文件夹拷到 U 盘或别的电脑
-照样能跑 —— 因为内嵌了 Python 运行时(`runtime\`),程序自己带着解释器。
+**不需要装 Python,不需要装任何东西,不弹命令行窗口,也不打开浏览器。**
+整个文件夹拷到 U 盘或别的电脑照样能跑 —— 因为内嵌了 Python 运行时(`runtime\`)。
 
-窗口优先用 Edge 开一个**没有地址栏的独立应用窗口**(像原生软件);
-如果 Edge 起不来,会自动改用默认浏览器。走了哪条路写在 `data\server.log` 里。
+界面是原生 Tkinter 窗口,五个标签页:元件库存 / 出入库 / 项目 BOM / 流水 / 仓位。
+关掉窗口进程就退出,不残留后台。
 
-> 服务只监听 `127.0.0.1`,**不对外网开放**,因此不需要任何防火墙规则,手机/其他电脑也访问不到。
->
-> 关掉窗口后,服务会在约 2 分钟空闲后**自己退出**,不留后台进程。
+> 程序**完全不碰网络**:没有任何监听端口,没有 HTTP 服务,不需要防火墙规则。
 
-### 生命周期是怎么管的
+### 桌面版是怎么复用后端逻辑的
 
-不靠"盯着浏览器进程",而是靠**前端心跳**:
+`app/gui.py` **不重写任何业务逻辑**,而是直接调用 `app/server.py` 里的路由处理函数。
+能这么做的原因:`route` 装饰器原样返回函数,而 `Ctx` 只读 `query / body / upload / con`,
+完全不依赖 HTTP。
 
+```python
+ctx = server.Ctx(None, con, {"state": "out"}, {}, None)   # 合成一个请求上下文
+status, payload = server.list_components(ctx, None)       # 直接当普通函数调用
 ```
-网页每 5 秒打一次 /api/ping
-   ↓ 有请求 → 服务认为界面还开着
-   ↓ 窗口关掉 → 请求停了 → 空闲超时(120 秒)→ 服务退出 → 启动器跟着退出
-```
 
-这样无论窗口是 Edge 应用窗口还是普通浏览器标签页,收尾逻辑都成立。
-启动器自己用来探活的 `/api/health` 轮询**不算活跃**(见 `server.py` 里 `log_active` 的说明),
-否则看门狗永远等不到空闲。
+所以桌面版和(仍然保留的)网页版**语义逐字一致**,不存在两套实现慢慢走偏的问题。
 
 ---
 
 ## 从源码跑(开发用)
 
 ```
-venv\Scripts\python.exe app\server.py --port 8000
+venv\Scripts\python.exe app\gui.py        # 桌面版(机器上要有带 tkinter 的 Python)
+venv\Scripts\python.exe app\server.py     # 网页版(可选,仅对照用)
 ```
 
-只要 **Python 3.10 或更高版本**,零第三方依赖。也可用 `scripts\启动.bat`,
-但那条路会带一个命令行窗口,只是开发时方便看日志。
+只要 **Python 3.10 或更高版本**,零第三方依赖。
+
+### 自检
+
+```
+python build\test_gui.py
+```
+
+在 `data\parts.db` 的**副本**上跑:把整个窗口、5 个标签页、3 个弹窗真的构造并渲染一遍,
+再跑一遍代表性的数据操作(增改删、入库/出库/盘点/移库、超额出库、按流水重建校验)。
+结果写到 `dist\gui_selftest.txt`。**不会动你的真实数据。**
 
 ### 重新打包便携版
 
 ```
-pwsh -File build\build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
 ```
 
 产出 `dist\元器件物料管理\`(便携目录)和 `dist\元器件物料管理_便携版.zip`(可分发)。
-脚本会自动准备内嵌 Python、生成图标、编译启动器、组装并压缩。
 
-启动器 `build\Launcher.cs` 用 **Windows 自带的 `csc.exe`** 编译,
-不依赖 Visual Studio,也不需要装 .NET SDK。
+> 必须带 `-ExecutionPolicy Bypass`,否则 Windows 会拒绝执行
+> (`running scripts is disabled on this system`)。
+
+三个容易踩的坑,脚本里都已经处理掉了:
+
+- **官方 embeddable 包不含 tkinter**,而这个程序是原生窗口程序,必须有它。
+  脚本会从本机已装的 Python 里把 `_tkinter.pyd`、`tcl86t.dll` / `tk86t.dll`、
+  `tcl\` 脚本库和 `Lib\tkinter` 搬进内嵌运行时,并把 `Lib` 写进 `python312._pth`。
+  装完还会**当场 import tkinter 开一次窗口**做验证,不通过就直接报错终止。
+- **启动器 `build\Launcher.cs` 用 Windows 自带的 `csc.exe` 编译**,
+  不依赖 Visual Studio,也不需要 .NET SDK。
+- **脚本本身必须是 UTF-8 with BOM**。Windows PowerShell 5.1 会把没有 BOM 的 UTF-8
+  当 ANSI 读,中文一乱就变成语法错误。
 
 ---
 
@@ -98,7 +116,8 @@ pwsh -File build\build.ps1
 ```
 parts-manager/
 ├── app/
-│   ├── server.py          HTTP 服务 + JSON API(标准库 http.server)
+│   ├── gui.py             ★ 桌面版界面(原生 tkinter),程序入口
+│   ├── server.py          业务逻辑 + JSON API(网页版用;桌面版直接复用它的处理函数)
 │   ├── db.py              SQLite 建表、连接、工具
 │   ├── bom.py             Altium BOM 解析与导入、缺料计算
 │   ├── xlsx.py            纯标准库 .xlsx 读取器(zipfile + xml)
@@ -114,12 +133,13 @@ parts-manager/
 │   ├── Launcher.cs        启动器(编译成 exe)
 │   ├── make_icon.py       图标生成
 │   ├── build.ps1          一键打包
+│   ├── test_gui.py        自检(逻辑 + 界面构造,不动真实数据)
 │   └── 使用说明.txt        随包一起发的说明
 ├── dist/                  构建产物(不进版本库)
-│   ├── python-embed/      内嵌 Python 3.12 运行时
+│   ├── python-embed/      内嵌 Python 3.12 运行时(已注入 tkinter)
 │   └── 元器件物料管理/      ← 最终便携目录,双击里面的 exe
 ├── scripts/
-│   └── 启动.bat           开发用(会带命令行窗口)
+│   └── 启动.bat           旧网页版的开发启动脚本(桌面版不需要它)
 ├── venv/                  项目自带 Python 环境
 ├── .gitignore
 └── README.md
@@ -180,27 +200,35 @@ project_bom   项目 BOM = 项目 × 元件 × 需求数量 + 位号
 
 ## 备份与恢复
 
-- **自动**:每次启动服务时,把 `data/parts.db` 快照到 `data/backups/parts_<时间戳>.db`,自动只留最近 20 份
-- **手动**:直接复制 `data/parts.db` 即可(单文件数据库,不需要停止服务也能复制)
-- **恢复**:把备份文件改名为 `data/parts.db` 覆盖过去,重启服务
+- **自动**:每次启动程序时,以及每次**删除类操作之前**,把 `data/parts.db` 快照到
+  `data/backups/parts_<时间戳>.db`,只留最近 20 份
+- **手动**:直接复制 `data/parts.db`(单文件数据库,程序开着也能复制),或点「文件 → 备份数据库」
+- **恢复**:关掉程序,把备份文件改名为 `data/parts.db` 覆盖过去,再打开
 - `data/` 已在 `.gitignore` 里,**数据库不会被提交到版本库**
 
 ---
 
 ## 常见问题
 
-**端口被占用?**
-换端口启动:`venv\Scripts\python.exe app\server.py --port 8010`
+**双击 exe 没反应 / 弹了个报错框?**
+打开 `data\gui.log` 看最后几十行,原因基本都写在里面。日志里若**没有**
+「`[就绪] 窗口已显示`」这一行,说明窗口根本没起来,那几行 traceback 就是答案。
 
-**页面打开是空白 / 一直在转?**
-先确认命令行窗口里打印出了 `元器件物料管理系统已启动`。若报错,把错误贴出来。
+**提示"程序已经在运行了"?**
+同一时刻只允许开一个窗口(避免两个窗口改同一个数据库)。到任务栏找那个窗口,
+或先在任务管理器里结束 `pythonw.exe`。
+
+**关掉窗口后任务管理器里还有 python.exe?**
+正常不会。若有,确认不是在跑**旧版网页版**(`app\server.py`)——那一版靠心跳超时退出。
 
 **中文显示成乱码?**
-启动脚本已设置 `chcp 65001` 和 `PYTHONUTF8=1`。若仍异常,检查系统区域设置中的「Beta: 使用 Unicode UTF-8 提供全球语言支持」。
+桌面版窗口用系统字体,不涉及编码;启动器给子进程设了 `PYTHONUTF8=1`,
+所以 `data\gui.log` 也是 UTF-8。若记事本打开日志像乱码,换 VS Code 打开即可。
 
 **想换台电脑用?**
-用便携版:把 `dist\元器件物料管理\` 整个文件夹拷过去,双击 exe 即可,**目标机什么都不用装**。
-(从源码跑才需要目标机有 Python 3.10+。)`profile\` 是 Edge 的工作数据,删掉会自动重建。
+把 `dist\元器件物料管理\` 整个文件夹拷过去,双击 exe 即可,**目标机什么都不用装**。
+exe 必须和 `runtime\`、`app\` 两个文件夹放在一起,单独拷 exe 是跑不起来的。
+(从源码跑才需要目标机有 Python 3.10+,且必须带 tkinter。)
 
 **`data/tmp/` 里有个删不掉的空目录?**
 那是最初在 DSH 沙箱里试装 Python 包时留下的痕迹(受限进程建的目录带保护性权限项)。与本系统无关,系统不使用该目录,忽略即可。
@@ -226,10 +254,13 @@ BOM 这种规整表格只需要读共享字符串表和单元格值,约 150 行�
 
 ---
 
-## API 一览
+## 处理函数一览
+
+下表是 `app/server.py` 里注册的路由。**桌面版不经过 HTTP**,而是合成一个 `Ctx`
+直接调用这些函数(路径参数则用 `gui._Match` 顶替正则匹配对象);网页版才把它们挂到 `/api/*`。
 
 ```
-GET    /api/summary                       总览统计
+GET    /api/summary    ← 桌面版就是 server.summary(ctx, None)
 GET    /api/components?q=&category=&state=&sort=&limit=&offset=
 POST   /api/components                    新建元件
 GET    /api/components/{id}               元件详情(含仓位分布与流水)

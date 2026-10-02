@@ -25,6 +25,10 @@ dist/元器件物料管理_便携版.zip
 dist/LauncherDiag.exe
 dist/app.ico
 dist/*.zip
+dist/selftest.db
+dist/gui_selftest.txt
+dist/t_*.py
+dist/t_*.txt
 
-# Edge 的临时配置目录
+# Edge 的临时配置目录(旧版浏览器方案遗留)
 profile/
