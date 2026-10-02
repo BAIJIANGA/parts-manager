@@ -191,16 +191,34 @@ def main() -> int:
         app.update()
         tab = app.tab_comp
 
-        # ---- 库存全为 0:首页应该是空的。导入 BOM 只是记下「这块板子要用到什么」,
-        #      东西还没买回来,那不算库存,不该出现在这一页。
-        check("没有库存时首页一张卡片都没有", tab.cards, {})
+        # ---- 首页固定列出 16 个标准大类:有没有库存都列出来,一眼看得到分类全貌
+        check("首页固定列出全部 16 个标准大类,一个不少",
+              [c for c in gui.CATEGORY_ORDER if c not in tab.cards], [])
+        check("卡片数 = 标准大类数 + 库里另有品类的补充",
+              len(tab.cards), len(tab._card_names))
         check("没有库存时停在首页", tab.view, "home")
-        check("没有库存时给出空状态提示", len(tab.card_area.winfo_children()), 1)
         check("没有库存时明细表是空的", len(tab.tree.get_children()), 0)
-        p(f"  库存全 0:卡片 {len(tab.cards)} 张,只显示空状态提示")
+        check("没有库存的大类卡片仍显示为可点(不是隐藏)",
+              len(tab.cards), len(gui.CATEGORY_ORDER) > 0 and len(tab.cards))
 
-        # ---- 入一点货,首页才该长出对应的大类卡片
-        p("\n【4】入库之后,该大类才出现在首页")
+        empty_cats = [n for n in tab._card_names if not tab._cat_data.get(n)]
+        check("库存全 0,所以每张大类卡片都标着「暂无库存」",
+              all("暂无库存" in "".join(card_labels(tab.cards[n])) for n in empty_cats), True)
+        p(f"  库存全 0:16 张大类卡片都在,都标着「暂无库存」(不是隐藏)")
+
+        # ---- 点进一个没货的大类:二级页面能打开,里面什么都没有
+        probe = "磁珠"
+        check("「磁珠」是标准大类但库里没有", probe in tab.cards and probe in empty_cats, True)
+        tab.open_category(probe)
+        app.update()
+        check("点进没货的大类也能打开二级页面", tab.view, "cat")
+        check("没货的大类二级页面里一行都不显示", len(tab.tree.get_children()), 0)
+        check("没货的大类给出「暂无库存元件」", tab.cat_count.get(), "暂无库存元件")
+        tab.go_home()
+        app.update()
+
+        # ---- 入一点货,对应的大类才从「暂无库存」变成有东西
+        p("\n【4】入库之后对应大类才有东西,而且反复刷新不能把卡片弄丢")
         items = gui.call(app.con, server.list_components,
                          query={"sort": "category"}, quiet=True)["items"]
         by_cat = {}
@@ -216,24 +234,40 @@ def main() -> int:
         app.refresh_all()
         app.update()
 
-        want_cards = sorted({c for c, _ in chosen})
-        check("入库后首页出现对应的大类卡片", sorted(tab.cards), want_cards)
-        check("卡片上只有名称,不带数量",
-              all(not any(ch.isdigit() for ch in t)
-                  for c in tab.cards.values() for t in card_labels(c)), True)
-        check("首页不显示任何项目", any("项目" in k for k in tab.cards), False)
+        check("入库后 16 个大类卡片一张没少(还是全套,不是只剩有货的)",
+              [c for c in gui.CATEGORY_ORDER if c not in tab.cards], [])
+        check("入过货的大类不再标「暂无库存」",
+              all("暂无库存" not in "".join(card_labels(tab.cards[c])) for c, _ in chosen), True)
+        check("没入过货的大类仍然标「暂无库存」",
+              "暂无库存" in "".join(card_labels(tab.cards[probe])), True)
         check("在库元件就是入过货的那几个",
               sorted(x["id"] for x in tab._all), sorted({it["id"] for _, it in chosen}))
         check("在库元件库存都 > 0", all(x["on_hand"] > 0 for x in tab._all), True)
+        check("有元件被库存过滤掉(证明 SQL 层过滤真的生效)",
+              len(items) - len(tab._all) > 0, True)
         # 卡片尺寸必须就是设定值 —— 曾经因为子控件是 pack 的、却只关了
         # grid_propagate,卡片被内容撑成 130x72,这里看住它
         check("卡片尺寸就是设定值,没被内容撑变",
               {(c.winfo_width(), c.winfo_height()) for c in tab.cards.values()},
               {(gui.CARD_W, gui.CARD_H)})
-        check("有元件被库存过滤掉(证明过滤真的生效)",
-              len(items) - len(tab._all) > 0, True)
-        p(f"  入库 {len(chosen)} 种后:卡片 {want_cards},在库 {len(tab._all)} 种,"
-          f"其余 {len(items) - len(tab._all)} 种(库存 0)不显示")
+
+        # ---- 关键回归:每次刷新都会把卡片 destroy 再重建,如果重排时列表里还留着
+        #      上一步销毁的控件,对它们调 .grid() 会抛 TclError("bad window path
+        #      name"),整次 reload 中断 —— 表现就是「入库之后首页一片空白」。
+        for _ in range(3):
+            app.refresh_all()
+            app.update()
+        check("连刷 3 次,大类卡片一张都不少(入库后首页没变空白)",
+              [c for c in gui.CATEGORY_ORDER if c not in tab.cards], [])
+        check("连刷 3 次后卡片真的显示在界面上",
+              all(c.winfo_ismapped() for c in tab.cards.values()), True)
+        check("重排列表里没有残留的死控件", len(tab.board._seq), len(tab.cards))
+        check("重排列表里的控件全都还活着",
+              all(c.winfo_exists() for c in tab.board._seq), True)
+        pos = [(c.grid_info().get("row"), c.grid_info().get("column"))
+               for c in tab.cards.values()]
+        check("每张卡片占的格子都不一样,没有互相盖住", len(set(pos)), len(pos))
+        p(f"  连刷 3 次后 {len(tab.cards)} 张卡片仍全部可见,占 {len(set(pos))} 个格子")
 
         # ---- 点卡片 -> 独立的二级页面(不是树形展开)
         cat0, first = chosen[0]
@@ -277,18 +311,97 @@ def main() -> int:
         app.update()
         check("搜索切到独立页面", tab.view, "search")
         check("搜索结果非空", len(tab.tree.get_children()) > 0, True)
-        p(f"  搜索「{cat0}」-> {len(tab.tree.get_children())} 条")
         tab.q.set("")
         tab.go_home()
         app.update()
 
+        # ---------------------------------------------------------- 出入库
+        p("\n【5】出入库:拆成入库 / 出库两个页签,先选项目再进二级页")
         app.nb.select(1)
         app.update()
-        for k in ("TRANSFER", "ADJUST", "IN", "OUT"):
-            app.tab_stock.kind.set(k)
-            app.tab_stock._sync()
-            app.update()
-        p("  [OK ] 出入库页四种动作切换正常")
+        st = app.tab_stock
+        check("默认停在入库", st.action, "IN")
+        check("进来是项目卡片首页", st.view, "home")
+        check("入库 / 出库两个按钮都在", sorted(st.btn), ["IN", "OUT"])
+        check("项目卡片里有「不指定项目」那一格", "0" in st.cards, True)
+        check("项目卡片数 = 项目数 + 1(不指定项目)",
+              len(st.cards), len(st._projects) + 1)
+        check("每张项目卡片都写着「点开开单 / 看记录」",
+              all("点开开单" in "".join(card_labels(c)) for c in st.cards.values()), True)
+        p(f"  项目卡片 {sorted(st.cards)}")
+
+        st.open_project("0")
+        app.update()
+        check("选了项目后进二级页", st.view, "proj")
+        check("二级页已显示", bool(st.page_proj.winfo_ismapped()), True)
+        check("项目首页已收起", bool(st.page_home.winfo_ismapped()), False)
+        check("标题写出了动作和项目", st.proj_title.get(), "入库 · 不指定项目")
+        # 【4】里那几次入库没挂项目,所以本来就该出现在「不指定项目」下
+        base = len(gui.call(app.con, server.list_movements,
+                            query={"project": "none", "kind": "IN"}, quiet=True)["items"])
+        check("「不指定项目」只收没挂项目的流水",
+              all(m["project_id"] is None for m in gui.call(
+                  app.con, server.list_movements,
+                  query={"project": "none", "kind": "IN"}, quiet=True)["items"]), True)
+        check("二级页显示的就是这个项目 + 这个动作的全部记录",
+              len(st.t_rec.get_children()), base)
+        check("记录表是平表,没有展开三角",
+              "headings" in str(st.t_rec.cget("show"))
+              and "tree" not in str(st.t_rec.cget("show")), True)
+
+        it = chosen[0][1]
+        st.tree.selection_set(str(it["id"]))
+        app.update()
+        st.qty.set("5")
+        st.loc.set("未分类")
+        st.note.set("自检第一条")
+        st.submit()
+        app.update()
+        recs = st.t_rec.get_children()
+        check("开单后记录表立刻多一条(刷新要跟上,不能是旧的)", len(recs), base + 1)
+        v = st.t_rec.item(recs[0], "values")
+        check("最新一条就是刚入的元件", v[1], it["name"])
+        check("记录里数量对", int(v[3]), 5)
+
+        st.qty.set("3")
+        st.note.set("自检第二条")
+        st.submit()
+        app.update()
+        recs = st.t_rec.get_children()
+        check("再开一单,记录再多一条", len(recs), base + 2)
+        check("记录按时间倒序(新的在最上面)",
+              st.t_rec.item(recs[0], "values")[6], "自检第二条")
+        check("倒序:第二新的在它下面",
+              st.t_rec.item(recs[1], "values")[6], "自检第一条")
+
+        # ---- 出库是独立的一套,不会和入库混在一起
+        st.set_action("OUT")
+        app.update()
+        check("切到出库后先回项目卡片首页", st.view, "home")
+        check("出库页签记住自己是出库", st.action, "OUT")
+        st.open_project("0")
+        app.update()
+        check("出库的标题跟着动作变", st.proj_title.get(), "出库 · 不指定项目")
+        base_out = len(gui.call(app.con, server.list_movements,
+                                query={"project": "none", "kind": "OUT"},
+                                quiet=True)["items"])
+        check("入库那几单不会出现在出库记录里",
+              len(st.t_rec.get_children()), base_out)
+        st.tree.selection_set(str(it["id"]))
+        st.qty.set("2")
+        st.note.set("自检出库")
+        st.submit()
+        app.update()
+        check("开一单出库,出库记录里多一条",
+              len(st.t_rec.get_children()), base_out + 1)
+        st.set_action("IN")
+        st.open_project("0")
+        app.update()
+        check("切回入库,出库那一单不会混进来",
+              len(st.t_rec.get_children()), base + 2)
+        st.go_home()
+        app.update()
+        check("返回项目卡片首页正常", st.view, "home")
 
         app.nb.select(2)
         app.update()
@@ -313,7 +426,7 @@ def main() -> int:
         d2.destroy()
         mv = gui.MoveDialog(app, app, cid0, "IN")
         mv.update()
-        p("  [OK ] 出入库弹窗")
+        p("  [OK ] 出入库弹窗(盘点 / 移库也从这里走)")
         mv.destroy()
 
         app.refresh_all()

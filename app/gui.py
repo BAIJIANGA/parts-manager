@@ -345,7 +345,7 @@ class App(tk.Tk):
         self.destroy()
 
 
-# --------------------------------------------------------------------- 元件库存
+# --------------------------------------------------------------------- 卡片区
 
 # 大类卡片上的字母标识与配色。字母沿用电子行业画原理图时的位号习惯
 # (R / C / L / J / Y …),比抽象图标更容易一眼认出来;颜色只用来区分,
@@ -369,7 +369,9 @@ CATEGORY_STYLE = {
     "其他":       ("…",   "#607d8b"),
 }
 UNCATEGORIZED = "未分类"
-CATEGORY_ORDER = list(CATEGORY_STYLE) + [UNCATEGORIZED]
+# 首页固定列出这 16 个标准大类,库里有货没货都列出来 —— 一眼能看到分类全貌,
+# 点进去没有再说没有。「未分类」和自定义品类只有在库里真出现时才补在后面。
+CATEGORY_ORDER = list(CATEGORY_STYLE)
 DEFAULT_CAT_STYLE = ("•", "#7f8c8d")
 
 HOME_BG = "#eef1f5"          # 卡片区的浅灰底,衬托白卡片
@@ -377,20 +379,144 @@ CARD_BG = "#ffffff"
 CARD_BG_HOVER = "#e8f1ff"
 CARD_EDGE = "#d5dbe3"
 CARD_EDGE_HOVER = "#2d6cdf"
-CARD_W = 220          # 卡片尺寸;一行放几张由窗口宽度算,不写死
+CARD_W = 220                 # 卡片尺寸;一行放几张按窗口宽度算,不写死
 CARD_H = 88
 CARD_GAP = 16
+DIM_BADGE = "#b9c0c9"        # 空的大类:标识和文字都变灰,一眼看出没东西
+DIM_TITLE = "#9aa3af"
+PROJECT_COLORS = ["#3d6b9e", "#0b6e4f", "#8e5a2b", "#6a4c93",
+                  "#a33b5b", "#2b7a78", "#7a5c2b", "#4a5568"]
 
+
+class CardBoard(ttk.Frame):
+    """一格一格的卡片区,可滚动、按宽度自动决定一行摆几张。
+
+    库存首页的大类和出入库的项目页都用它,所以那张「卡片尺寸必须等于设定值」
+    的坑只需要在这里躲一次。
+    """
+
+    def __init__(self, parent, on_pick):
+        super().__init__(parent)
+        self.on_pick = on_pick
+        self.cards = {}          # key -> 卡片控件
+        self._seq = []           # 显示顺序,重排时用
+        self._cols = 0
+
+        wrap = tk.Frame(self, bg=HOME_BG, highlightbackground=CARD_EDGE,
+                        highlightthickness=1)
+        wrap.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(wrap, bg=HOME_BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.area = tk.Frame(self.canvas, bg=HOME_BG)
+        self._win = self.canvas.create_window((0, 0), window=self.area, anchor="nw")
+        self.area.bind("<Configure>", lambda _e: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, event):
+        self.canvas.itemconfigure(self._win, width=event.width)
+        self.reflow()
+
+    def render(self, specs, empty_text="没有可显示的内容。"):
+        """specs: [(key, 标题, 字母标识, 颜色, 副标题, 是否置灰), ...]"""
+        for w in self.area.winfo_children():
+            w.destroy()
+        self.cards = {}
+        # 这一句是必须的:上面刚把旧卡片 destroy() 掉,列表里留的还是那些死控件,
+        # 重排时对它们调 .grid() 会抛 TclError("bad window path name"),
+        # 把整个 reload() 打断 —— 表现就是入库之后首页一片空白。
+        self._seq = []
+        self._cols = 0
+        if not specs:
+            tk.Label(self.area, bg=HOME_BG, fg="#98a2b3", justify="left",
+                     font=("Microsoft YaHei UI", 10), text=empty_text
+                     ).grid(row=0, column=0, sticky="w", padx=28, pady=40)
+            return
+        for key, title, glyph, color, sub, dim in specs:
+            card = self._make_card(key, title, glyph, color, sub, dim)
+            self.cards[key] = card
+            self._seq.append(card)
+        self.reflow()
+
+    def reflow(self):
+        """按当前宽度决定一行摆几张卡片 —— 窗口拉宽就多摆几张,不留一大片空白。"""
+        if not self._seq:
+            return
+        avail = self.canvas.winfo_width()
+        if avail <= 1:
+            return
+        cols = max(1, (avail - CARD_GAP) // (CARD_W + CARD_GAP))
+        if cols == self._cols:
+            return
+        self._cols = cols
+        for i, card in enumerate(self._seq):
+            if not card.winfo_exists():     # 兜底:死控件跳过,不要让整次刷新陪葬
+                continue
+            card.grid(row=i // cols, column=i % cols,
+                      padx=CARD_GAP // 2, pady=CARD_GAP // 2, sticky="nw")
+
+    def _make_card(self, key, title, glyph, color, sub, dim):
+        badge_bg = DIM_BADGE if dim else color
+        title_fg = DIM_TITLE if dim else "#1f2937"
+        card = tk.Frame(self.area, bg=CARD_BG, highlightbackground=CARD_EDGE,
+                        highlightthickness=1, cursor="hand2",
+                        width=CARD_W, height=CARD_H)
+        # 子控件是用 pack 摆的,必须关掉 pack_propagate —— 关 grid_propagate 没用,
+        # 卡片会被内容撑成 130x72 而不是设定的尺寸。
+        card.pack_propagate(False)
+        card.grid_propagate(False)
+
+        badge = tk.Label(card, text=glyph, bg=badge_bg, fg="white", width=4, height=2,
+                         font=("Microsoft YaHei UI", 10, "bold"))
+        badge.pack(side="left", padx=(14, 12))
+
+        body = tk.Frame(card, bg=CARD_BG)
+        body.pack(side="left", fill="both", expand=True)
+        lbl = tk.Label(body, text=title, bg=CARD_BG, fg=title_fg, anchor="w",
+                       font=("Microsoft YaHei UI", 12, "bold"))
+        lbl.pack(anchor="w", pady=(18, 0))
+        hint = tk.Label(body, text=sub, bg=CARD_BG, fg="#98a2b3", anchor="w",
+                        font=("Microsoft YaHei UI", 8))
+        hint.pack(anchor="w")
+
+        # 子控件会吃掉点击,所以逐个绑;悬停时整张卡片一起变色
+        parts = (card, badge, body, lbl, hint)
+        for w in parts:
+            w.bind("<Button-1>", lambda _e, k=key: self.on_pick(k))
+            w.bind("<Enter>", lambda _e, ws=parts: self._tint(ws, CARD_BG_HOVER))
+            w.bind("<Leave>", lambda _e, ws=parts: self._tint(ws, CARD_BG))
+        card.bind("<Enter>", lambda _e: card.configure(highlightbackground=CARD_EDGE_HOVER),
+                  add="+")
+        card.bind("<Leave>", lambda _e: card.configure(highlightbackground=CARD_EDGE),
+                  add="+")
+        return card
+
+    @staticmethod
+    def _tint(parts, bg):
+        """整张卡片换底色;badge(parts[1])保持自己的颜色不动。"""
+        for i, w in enumerate(parts):
+            if i == 1:
+                continue
+            try:
+                w.configure(bg=bg)
+            except tk.TclError:
+                pass
+
+
+# --------------------------------------------------------------------- 元件库存
 
 class ComponentsTab(ttk.Frame):
     """元件库存。
 
-    首页是一格一格的「大类卡片」(电阻 / 电容 / 电感 …),点卡片进入**独立的
+    首页固定列出 16 个标准大类(电阻 / 电容 / 电感 …),点一张卡片进入**独立的
     二级页面**看具体型号 —— 不是树形展开,首页也没有那个「加号」。
 
-    这里只显示**真正有库存的元件**:库存为 0 的元件在这个页面上根本不出现。
-    因为导入 BOM 只是把「这块板子要用到什么」记下来,东西还没买回来,那属于
-    「要买什么」,不是「已经有什么」。库存在「出入库」页入库之后才会出现在这里。
+    但二级页面里**只列有库存的元件**:库存为 0 的元件在这一页不出现,点进去就是
+    空的。因为导入 BOM 只是把「这块板子要用到什么」记下来,东西还没买回来,那属于
+    「要买什么」,不是「已经有什么」。库存在「出入库」里入进来之后才会显示。
 
     项目视角也不在这里 —— 项目 BOM 回答的是「这批料是给谁配的」,和库存是两本账,
     混在一棵树里只会让人分不清。项目在「项目 BOM」页里单独看。
@@ -402,15 +528,12 @@ class ComponentsTab(ttk.Frame):
         self.con = app.con
 
         self._all = []            # 有库存的元件(全量)
-        self._cat_data = {}       # 大类名 -> [元件...]
+        self._cat_data = {}       # 大类名 -> 有库存的元件
         self._rows = {}           # 元件 id -> 行数据
-        self.cards = {}           # 大类名 -> 卡片控件(自检要靠它数卡片)
-        self._cards_seq = []      # 卡片的显示顺序,重排时用
-        self._cols = 0
+        self._card_names = []     # 首页要列的大类
         self.view = "home"        # home / cat / search
         self.current_category = None
 
-        # 两个页面轮流占住 holder 这一格,来回切换就是「另一个界面」
         self.holder = ttk.Frame(self)
         self.holder.pack(fill="both", expand=True)
         self.page_home = ttk.Frame(self.holder)
@@ -419,6 +542,15 @@ class ComponentsTab(ttk.Frame):
         self._build_home()
         self._build_cat()
         self.go_home()
+
+    # ---- 给自检用的快捷入口
+    @property
+    def cards(self):
+        return self.board.cards
+
+    @property
+    def card_area(self):
+        return self.board.area
 
     # ------------------------------------------------------ 页面:大类卡片
 
@@ -442,71 +574,8 @@ class ComponentsTab(ttk.Frame):
         ttk.Label(sbox, text="名称 / 立创编号 / 料号 / 封装 / 值",
                   style="Dim.TLabel").pack(side="left", padx=6)
 
-        # 卡片区放在 Canvas 里,大类多了可以滚
-        wrap = tk.Frame(self.page_home, bg=HOME_BG, highlightbackground=CARD_EDGE,
-                        highlightthickness=1)
-        wrap.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(wrap, bg=HOME_BG, highlightthickness=0)
-        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vsb.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-        self.card_area = tk.Frame(self.canvas, bg=HOME_BG)
-        self._card_win = self.canvas.create_window((0, 0), window=self.card_area, anchor="nw")
-        self.card_area.bind(
-            "<Configure>",
-            lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", self._on_canvas_resize)
-
-    def _on_canvas_resize(self, event):
-        self.canvas.itemconfigure(self._card_win, width=event.width)
-        self._reflow()
-
-    def _make_card(self, parent, name):
-        glyph, color = CATEGORY_STYLE.get(name, DEFAULT_CAT_STYLE)
-        card = tk.Frame(parent, bg=CARD_BG, highlightbackground=CARD_EDGE,
-                        highlightthickness=1, cursor="hand2",
-                        width=CARD_W, height=CARD_H)
-        # 子控件是用 pack 摆的,必须关掉 pack_propagate —— 关 grid_propagate 没用,
-        # 卡片会被内容撑成 130x72 而不是设定的尺寸。
-        card.pack_propagate(False)
-        card.grid_propagate(False)
-
-        badge = tk.Label(card, text=glyph, bg=color, fg="white", width=4, height=2,
-                         font=("Microsoft YaHei UI", 10, "bold"))
-        badge.pack(side="left", padx=(14, 12))
-
-        body = tk.Frame(card, bg=CARD_BG)
-        body.pack(side="left", fill="both", expand=True)
-        title = tk.Label(body, text=name, bg=CARD_BG, fg="#1f2937", anchor="w",
-                         font=("Microsoft YaHei UI", 12, "bold"))
-        title.pack(anchor="w", pady=(18, 0))
-        hint = tk.Label(body, text="点开查看 →", bg=CARD_BG, fg="#98a2b3", anchor="w",
-                        font=("Microsoft YaHei UI", 8))
-        hint.pack(anchor="w")
-
-        # 子控件会吃掉点击,所以逐个绑;悬停时整张卡片一起变色
-        parts = (card, badge, body, title, hint)
-        for w in parts:
-            w.bind("<Button-1>", lambda _e, n=name: self.open_category(n))
-            w.bind("<Enter>", lambda _e, ws=parts: self._tint(ws, CARD_BG_HOVER))
-            w.bind("<Leave>", lambda _e, ws=parts: self._tint(ws, CARD_BG))
-        card.bind("<Enter>", lambda _e: card.configure(highlightbackground=CARD_EDGE_HOVER),
-                  add="+")
-        card.bind("<Leave>", lambda _e: card.configure(highlightbackground=CARD_EDGE),
-                  add="+")
-        return card
-
-    @staticmethod
-    def _tint(parts, bg):
-        """整张卡片换底色;badge(parts[1])保持自己的颜色不动。"""
-        for i, w in enumerate(parts):
-            if i == 1:
-                continue
-            try:
-                w.configure(bg=bg)
-            except tk.TclError:
-                pass
+        self.board = CardBoard(self.page_home, self.open_category)
+        self.board.pack(fill="both", expand=True)
 
     # ------------------------------------------------------ 页面:某个大类
 
@@ -532,8 +601,6 @@ class ComponentsTab(ttk.Frame):
 
         top = ttk.Frame(pane)
         # 这里是平表,不是树 —— 没有 #0 列,也就没有展开三角
-        # 只有文字类列跟着窗口伸缩。要是只让「名称」伸缩,它会从 200 被撑到 700 多,
-        # 一列空白看着很怪。
         frame, self.tree = make_tree(top, [
             ("name", "名称", 200, "w", True),
             ("lcsc_pn", "立创编号", 95, "center"),
@@ -599,10 +666,10 @@ class ComponentsTab(ttk.Frame):
         self.view = "cat"
         self.current_category = name
         glyph, color = CATEGORY_STYLE.get(name, DEFAULT_CAT_STYLE)
-        self.cat_badge.configure(text=glyph, bg=color)
-        self.cat_title.set(name)
         rows = self._cat_data.get(name, [])
-        self.cat_count.set(f"共 {len(rows)} 种")
+        self.cat_badge.configure(text=glyph, bg=color if rows else DIM_BADGE)
+        self.cat_title.set(name)
+        self.cat_count.set(f"共 {len(rows)} 种" if rows else "暂无库存元件")
         self._swap(self.page_cat)
         self._fill(rows)
 
@@ -616,7 +683,7 @@ class ComponentsTab(ttk.Frame):
         hits = [it for it in self._all if self._match(it, kw)]
         self.cat_badge.configure(text="⌕", bg="#546e7a")
         self.cat_title.set(f"搜索:{kw}")
-        self.cat_count.set(f"找到 {len(hits)} 种")
+        self.cat_count.set(f"找到 {len(hits)} 种" if hits else "没找到")
         self._swap(self.page_cat)
         self._fill(hits)
 
@@ -639,7 +706,7 @@ class ComponentsTab(ttk.Frame):
     # ------------------------------------------------------ 数据
 
     def reload(self):
-        # stocked=1:库存为 0 的元件在 SQL 层就被滤掉了,首页自然只剩有货的大类
+        # stocked=1:库存为 0 的元件在 SQL 层就被滤掉,二级页面自然只剩有货的
         data = call(self.con, server.list_components,
                     query={"stocked": "1", "sort": "category"}, quiet=True)
         if data is None:
@@ -651,15 +718,21 @@ class ComponentsTab(ttk.Frame):
             name = (it.get("category") or "").strip() or UNCATEGORIZED
             self._cat_data.setdefault(name, []).append(it)
 
-        self._render_cards()
-        if self._all:
-            self.count.set(f"{len(self._all)} 种在库元件 · {len(self._cat_data)} 个大类")
-        else:
-            self.count.set("")
+        # 首页固定列出 16 个标准大类;库里另有自定义品类或未分类的,补在后面
+        meta = call(self.con, server.meta, quiet=True) or {}
+        real = [c for c in ((meta.get("filters") or {}).get("categories") or []) if c]
+        names = list(CATEGORY_ORDER)
+        names += sorted(c for c in real if c not in CATEGORY_ORDER)
+        if any(not c.strip() for c in real):
+            names.append(UNCATEGORIZED)
+        self._card_names = names
 
-        # 刷新前停在哪儿就还停在哪儿;所在的类没了就退回首页
+        self._render_cards()
+        n = len(self._all)
+        self.count.set(f"{n} 种在库元件" if n else "还没有元件入库")
+
         if self.view == "cat":
-            if self.current_category in self._cat_data:
+            if self.current_category in self._card_names:
                 self.open_category(self.current_category)
             else:
                 self.go_home()
@@ -670,39 +743,13 @@ class ComponentsTab(ttk.Frame):
                 self.go_home()
 
     def _render_cards(self):
-        for w in self.card_area.winfo_children():
-            w.destroy()
-        self.cards = {}
-        if not self._cat_data:
-            tk.Label(
-                self.card_area, bg=HOME_BG, fg="#98a2b3", justify="left",
-                font=("Microsoft YaHei UI", 10),
-                text=("还没有入库任何元件。\n\n"
-                      "库存为 0 的元件不会显示在这一页 —— 先到「出入库」页把料入进来,\n"
-                      "有货的大类才会出现在这里。")
-            ).grid(row=0, column=0, sticky="w", padx=28, pady=40)
-            return
-        for name in sorted(self._cat_data, key=self._cat_rank):
-            card = self._make_card(self.card_area, name)
-            self.cards[name] = card
-            self._cards_seq.append(card)
-        self._cols = 0
-        self._reflow()
-
-    def _reflow(self):
-        """按当前宽度决定一行摆几张卡片 —— 窗口拉宽就多摆几张,不留一大片空白。"""
-        if not self._cards_seq:
-            return
-        avail = self.canvas.winfo_width()
-        if avail <= 1:
-            return
-        cols = max(1, (avail - CARD_GAP) // (CARD_W + CARD_GAP))
-        if cols == self._cols:
-            return
-        self._cols = cols
-        for i, card in enumerate(self._cards_seq):
-            card.grid(row=i // cols, column=i % cols,
-                      padx=CARD_GAP // 2, pady=CARD_GAP // 2, sticky="nw")
+        specs = []
+        for name in self._card_names:
+            glyph, color = CATEGORY_STYLE.get(name, DEFAULT_CAT_STYLE)
+            has = bool(self._cat_data.get(name))
+            specs.append((name, name, glyph, color,
+                          "点开查看 →" if has else "暂无库存", not has))
+        self.board.render(specs, empty_text="还没有元件入库。")
 
     def _insert_component(self, it):
         self.tree.insert("", "end", iid=str(it["id"]), values=(
@@ -725,8 +772,8 @@ class ComponentsTab(ttk.Frame):
 
     # ------------------------------------------------------ 选中与右键
 
-    def _on_double(self, _event):
-        if self.tree.identify_row(_event.y):
+    def _on_double(self, event):
+        if self.tree.identify_row(event.y):
             self.edit()
 
     def _on_select(self, _event=None):
@@ -796,7 +843,7 @@ class ComponentsTab(ttk.Frame):
                     "删除失败:可能被项目 BOM 引用。\n\n"
                     "强行删除会同时移除它在各项目 BOM 里的行(库存流水会保留)。\n继续吗?", parent=self):
                 res = call(self.con, server.delete_component, query={"force": "1"},
-                           match=(cid,), parent=self)
+                           match=(cid,), parent=self, quiet=True)
                 if res is None:
                     return
             else:
@@ -807,13 +854,128 @@ class ComponentsTab(ttk.Frame):
 # --------------------------------------------------------------------- 出入库
 
 class StockTab(ttk.Frame):
+    """出入库 —— 拆成「入库」和「出库」两个页签。
+
+    这两件事方向相反、看的东西也不一样,挤在一个单选框里容易点错。每一页都是:
+
+        先选项目(卡片)  →  进这个项目的二级页,在里面开单,并看这个项目
+                            在这个动作下的全部记录(按时间倒序)
+
+    项目是这批料的去向,所以按项目分开看最自然;「不指定项目」那一格用来记
+    不带项目的日常补货。盘点 / 移库不在这两个页签里,用下面那个按钮开,
+    它们本来也不是「进 / 出」这种方向性的动作。
+    """
+
+    ACTIONS = (("IN", "入库"), ("OUT", "出库"))
+    NO_PROJECT = "不指定项目"
+
     def __init__(self, parent, app: App):
         super().__init__(parent, padding=8)
         self.app = app
         self.con = app.con
         self._items = {}
+        self._projects = []
+        self.action = "IN"
+        self.project_id = None      # None = 停在项目首页;0 = 不指定项目;>0 = 项目 id
+        self.view = "home"
 
-        left = ttk.Frame(self)
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", pady=(0, 8))
+        self.btn = {}
+        for val, label in self.ACTIONS:
+            b = ttk.Button(bar, text=label, width=10,
+                           command=lambda v=val: self.set_action(v))
+            b.pack(side="left", padx=(0, 6))
+            self.btn[val] = b
+        self.head = tk.StringVar()
+        ttk.Label(bar, textvariable=self.head, style="Dim.TLabel").pack(side="left", padx=12)
+        ttk.Button(bar, text="盘点 / 移库…", command=self.other_move).pack(side="right")
+        ttk.Button(bar, text="刷新", command=self.reload).pack(side="right", padx=6)
+
+        self.holder = ttk.Frame(self)
+        self.holder.pack(fill="both", expand=True)
+        self.page_home = ttk.Frame(self.holder)
+        self.page_proj = ttk.Frame(self.holder)
+
+        self._build_home()
+        self._build_proj()
+        self.set_action("IN")
+
+    @property
+    def cards(self):
+        return self.board.cards
+
+    # ------------------------------------------------------ 顶部动作切换
+
+    def set_action(self, val):
+        self.action = val
+        for k, b in self.btn.items():
+            b.state(["pressed"] if k == val else ["!pressed"])
+        self.go_home()
+        self.reload()
+
+    def _act_label(self):
+        return dict(self.ACTIONS)[self.action]
+
+    # ------------------------------------------------------ 页面:项目卡片
+
+    def _build_home(self):
+        self.board = CardBoard(self.page_home, self.open_project)
+        self.board.pack(fill="both", expand=True)
+
+    def open_project(self, key):
+        self.view = "proj"
+        self.project_id = int(key)
+        if self.project_id:
+            proj = next((p for p in self._projects if p["id"] == self.project_id), {})
+            name = proj.get("name") or f"项目 {self.project_id}"
+        else:
+            name = self.NO_PROJECT
+        self.proj_title.set(f"{self._act_label()} · {name}")
+        self._swap(self.page_proj)
+        self._load_records()
+        self.reload()
+
+    def go_home(self):
+        self.view = "home"
+        self.project_id = None
+        self._swap(self.page_home)
+
+    def _swap(self, page):
+        self.page_home.pack_forget()
+        self.page_proj.pack_forget()
+        page.pack(fill="both", expand=True)
+
+    def _render_cards(self):
+        specs = []
+        for i, p in enumerate(self._projects):
+            name = p.get("name") or f"项目 {p['id']}"
+            specs.append((str(p["id"]), name, (name.strip()[:1] or "P").upper(),
+                          PROJECT_COLORS[i % len(PROJECT_COLORS)],
+                          "点开开单 / 看记录", False))
+        specs.append(("0", self.NO_PROJECT, "—", "#8d99a6",
+                      "点开开单 / 看记录", False))
+        self.board.render(specs, empty_text="还没有项目。先到「项目 BOM」页导入一个。")
+
+    # ------------------------------------------------------ 页面:某个项目
+
+    def _build_proj(self):
+        head = ttk.Frame(self.page_proj)
+        head.pack(fill="x", pady=(0, 8))
+        ttk.Button(head, text="← 返回", command=self.go_home, width=9).pack(side="left",
+                                                                         padx=(0, 10))
+        self.proj_title = tk.StringVar()
+        ttk.Label(head, textvariable=self.proj_title, style="H1.TLabel").pack(side="left")
+        self.proj_info = tk.StringVar()
+        ttk.Label(head, textvariable=self.proj_info, style="Dim.TLabel").pack(side="left",
+                                                                             padx=12)
+
+        pane = ttk.Panedwindow(self.page_proj, orient="vertical")
+        pane.pack(fill="both", expand=True)
+
+        # ---- 上半:开单(左挑元件,右填单)
+        top = ttk.Frame(pane)
+        left = ttk.Frame(top)
         left.pack(side="left", fill="both", expand=True, padx=(0, 8))
 
         sbar = ttk.Frame(left)
@@ -822,66 +984,74 @@ class StockTab(ttk.Frame):
         self.q = tk.StringVar()
         ent = ttk.Entry(sbar, textvariable=self.q, width=24)
         ent.pack(side="left")
-        ent.bind("<KeyRelease>", lambda _e: self.reload())
+        ent.bind("<KeyRelease>", lambda _e: self._load_components())
         ttk.Button(sbar, text="只看缺货", command=self.only_low).pack(side="left", padx=6)
 
         f, self.tree = make_tree(left, [
-            ("name", "名称", 190, "w"),
+            ("name", "名称", 190, "w", True),
             ("lcsc_pn", "立创编号", 90, "center"),
             ("package", "封装", 100, "w"),
             ("on_hand", "库存", 60, "e"),
-            ("state", "状态", 60, "center")], height=20)
+            ("state", "状态", 60, "center")], height=12)
         f.pack(fill="both", expand=True)
         self.tree.tag_configure("out", background="#ffe3e3")
         self.tree.tag_configure("low", background="#fff6dd")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
-        right = ttk.LabelFrame(self, text="填单", padding=10)
+        right = ttk.LabelFrame(top, text="开单", padding=10)
         right.pack(side="left", fill="y")
         self.target = tk.StringVar(value="（左侧选一个元件）")
         ttk.Label(right, textvariable=self.target, style="Big.TLabel",
-                  wraplength=280).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky="w")
+                  wraplength=260).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky="w")
 
-        ttk.Label(right, text="动作").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=3)
-        self.kind = tk.StringVar(value="IN")
-        kf = ttk.Frame(right)
-        kf.grid(row=1, column=1, sticky="w")
-        for i, (val, label) in enumerate(KIND_LABEL.items()):
-            ttk.Radiobutton(kf, text=label, value=val, variable=self.kind,
-                            command=self._sync).grid(row=0, column=i, padx=1)
-
-        ttk.Label(right, text="数量").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=3)
+        ttk.Label(right, text="数量").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=3)
         self.qty = tk.StringVar()
-        ttk.Entry(right, textvariable=self.qty, width=14).grid(row=2, column=1, sticky="w")
+        ttk.Entry(right, textvariable=self.qty, width=14).grid(row=1, column=1, sticky="w")
 
-        ttk.Label(right, text="仓位").grid(row=3, column=0, sticky="e", padx=(0, 6), pady=3)
+        ttk.Label(right, text="仓位").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=3)
         self.loc = tk.StringVar(value="未分类")
         self.cb_loc = ttk.Combobox(right, textvariable=self.loc, width=12)
-        self.cb_loc.grid(row=3, column=1, sticky="w")
+        self.cb_loc.grid(row=2, column=1, sticky="w")
 
+        # 移库才用得到,平时藏起来
         self.lbl_to = ttk.Label(right, text="移到")
-        self.lbl_to.grid(row=4, column=0, sticky="e", padx=(0, 6), pady=3)
+        self.lbl_to.grid(row=3, column=0, sticky="e", padx=(0, 6), pady=3)
         self.to_loc = tk.StringVar()
         self.cb_to = ttk.Combobox(right, textvariable=self.to_loc, width=12)
-        self.cb_to.grid(row=4, column=1, sticky="w")
+        self.cb_to.grid(row=3, column=1, sticky="w")
 
-        ttk.Label(right, text="操作人").grid(row=5, column=0, sticky="e", padx=(0, 6), pady=3)
+        ttk.Label(right, text="操作人").grid(row=4, column=0, sticky="e", padx=(0, 6), pady=3)
         self.who = tk.StringVar(value="本地用户")
-        ttk.Entry(right, textvariable=self.who, width=14).grid(row=5, column=1, sticky="w")
+        ttk.Entry(right, textvariable=self.who, width=14).grid(row=4, column=1, sticky="w")
 
-        ttk.Label(right, text="备注").grid(row=6, column=0, sticky="e", padx=(0, 6), pady=3)
+        ttk.Label(right, text="备注").grid(row=5, column=0, sticky="e", padx=(0, 6), pady=3)
         self.note = tk.StringVar()
-        ttk.Entry(right, textvariable=self.note, width=22).grid(row=6, column=1, columnspan=2,
-                                                               sticky="w")
+        ttk.Entry(right, textvariable=self.note, width=22).grid(row=5, column=1,
+                                                               columnspan=2, sticky="w")
 
         self.hint = tk.StringVar()
         ttk.Label(right, textvariable=self.hint, style="Dim.TLabel",
-                  wraplength=280, justify="left").grid(
-            row=7, column=0, columnspan=2, pady=(6, 0), sticky="w")
-
+                  wraplength=260, justify="left").grid(
+            row=6, column=0, columnspan=2, pady=(6, 0), sticky="w")
         ttk.Button(right, text="提交", command=self.submit, width=16).grid(
-            row=8, column=0, columnspan=2, pady=12)
-        self._sync()
+            row=7, column=0, columnspan=2, pady=12)
+        pane.add(top, weight=3)
+
+        # ---- 下半:这个项目在这个动作下的记录,按时间倒序
+        box = ttk.LabelFrame(pane, text=f"{self._act_label()}记录(按时间倒序)", padding=6)
+        f2, self.t_rec = make_tree(box, [
+            ("created_at", "时间", 150, "center"),
+            ("component_name", "元件", 200, "w", True),
+            ("lcsc_pn", "立创编号", 95, "center"),
+            ("qty", "数量", 60, "e"),
+            ("location_code", "仓位", 90, "w"),
+            ("operator", "操作人", 90, "w"),
+            ("note", "备注", 200, "w", True)], height=7)
+        f2.pack(fill="both", expand=True)
+        self.box_rec = box
+        pane.add(box, weight=2)
+
+    # ------------------------------------------------------ 数据
 
     def reload(self):
         meta = call(self.con, server.meta, quiet=True) or {}
@@ -891,6 +1061,23 @@ class StockTab(ttk.Frame):
         if not self.to_loc.get() and codes:
             self.to_loc.set(codes[0])
 
+        projects = call(self.con, server.list_projects, quiet=True) or {}
+        self._projects = projects.get("items") or []
+
+        self._render_cards()
+        self._load_components()
+        self._sync_hint()
+        if self.view == "proj":
+            self.head.set(f"{self._act_label()}:下面是这个项目的开单区和记录")
+            self.box_rec.configure(text=f"{self._act_label()}记录(按时间倒序)")
+            # 开完单 app.refresh_all() 会走到这里 —— 必须重读记录表,
+            # 否则提交成功了但下面那半张表还是旧的
+            self._load_records()
+        else:
+            self.head.set(f"{self._act_label()}:先选一个项目,进去开单并看记录")
+
+    def _load_components(self):
+        keep = self._current_id()      # 刷之前选中的是谁,刷完要还选回去
         query = {"limit": 500}
         if self.q.get().strip():
             query["q"] = self.q.get().strip()
@@ -908,10 +1095,32 @@ class StockTab(ttk.Frame):
                 it.get("on_hand") or 0, STATE_LABEL.get(it.get("stock_state"), "")),
                 tags=(it.get("stock_state") or "",))
             self._items[it["id"]] = it
+        # 开完单 app.refresh_all() 会走到这里。不把选中还回去的话,左侧会变成
+        # 没选中任何元件的状态,下一次开单得重新点一遍 —— 连续入库很难用。
+        if keep and keep in self._items:      # _items 的键是 int,别拿 str 去比
+            self.tree.selection_set(str(keep))
+            self.tree.see(str(keep))
+
+    def _load_records(self):
+        clear_tree(self.t_rec)
+        query = {"kind": self.action, "limit": 500}
+        if self.project_id:
+            query["project_id"] = str(self.project_id)
+        else:
+            query["project"] = "none"
+        data = call(self.con, server.list_movements, query=query, quiet=True) or {}
+        items = data.get("items") or []
+        for mv in items:
+            self.t_rec.insert("", "end", values=(
+                (mv.get("created_at") or "")[:19], mv.get("component_name") or "",
+                mv.get("lcsc_pn") or "", mv.get("qty") or 0,
+                mv.get("location_code") or "", mv.get("operator") or "",
+                mv.get("note") or ""))
+        self.proj_info.set(f"{len(items)} 条记录" if items else "还没有记录")
 
     def only_low(self):
         self._only_low = not getattr(self, "_only_low", False)
-        self.reload()
+        self._load_components()
 
     def _on_select(self, _event=None):
         sel = self.tree.selection()
@@ -919,26 +1128,21 @@ class StockTab(ttk.Frame):
             return
         it = self._items.get(int(sel[0])) or {}
         self.target.set(f"{it.get('name')}\n现有 {it.get('on_hand') or 0} {it.get('unit') or '个'}")
-        self._sync()
 
     def _current_id(self):
         sel = self.tree.selection()
         return int(sel[0]) if sel else None
 
-    def _sync(self):
-        kind = self.kind.get()
-        if kind == "TRANSFER":
-            self.lbl_to.grid()
-            self.cb_to.grid()
-            self.hint.set("移库:从「仓位」搬到「移到」,两边数量一减一增,总量不变。")
+    def _sync_hint(self):
+        if self.action == "IN":
+            self.hint.set("入库:数量填入库数量。提交后记在这个项目名下,并按时间排在下面。")
         else:
-            self.lbl_to.grid_remove()
-            self.cb_to.grid_remove()
-            self.hint.set({
-                "IN": "入库:数量填入库数。",
-                "OUT": "出库:数量填出库数,不足会被拒绝。",
-                "ADJUST": "盘点:数量填**实际数到的总数**(不是差值),系统会改成这个数。",
-            }.get(kind, ""))
+            self.hint.set("出库:数量填出库数量,库存不足会被拒绝。")
+
+    def _sync(self):        # 兼容老代码的调用
+        self._sync_hint()
+
+    # ------------------------------------------------------ 动作
 
     def submit(self):
         cid = self._current_id()
@@ -949,21 +1153,33 @@ class StockTab(ttk.Frame):
         if not raw.isdigit():
             messagebox.showinfo("提示", "数量要填非负整数。", parent=self)
             return
-        body = {"kind": self.kind.get(), "component_id": cid, "qty": int(raw),
+        body = {"kind": self.action, "component_id": cid, "qty": int(raw),
                 "location": self.loc.get().strip() or "未分类",
                 "operator": self.who.get().strip() or "本地用户",
                 "note": self.note.get().strip()}
-        if self.kind.get() == "TRANSFER":
-            body["to_location"] = self.to_loc.get().strip()
+        if self.project_id:
+            body["project_id"] = self.project_id
         res = call(self.con, server.stock_move, body=body, parent=self)
         if res is None:
             return
         self.qty.set("")
         self.note.set("")
         self.app.set_status(
-            f"{KIND_LABEL[self.kind.get()]}完成:该仓位现有 {res['qty_at_location']},"
+            f"{self._act_label()}完成:该仓位现有 {res['qty_at_location']},"
             f"总库存 {res['on_hand']}")
         self.app.refresh_all()
+
+    def other_move(self):
+        """盘点 / 移库:不是「进 / 出」这种方向性动作,单独开弹窗做。"""
+        cid = self._current_id()
+        if not cid:
+            messagebox.showinfo("提示", "请先在左边选中一个元件,再选盘点或移库。",
+                                parent=self)
+            return
+        dlg = MoveDialog(self, self.app, cid, "ADJUST")
+        self.app.wait_window(dlg)
+        if dlg.done:
+            self.app.refresh_all()
 
 
 # --------------------------------------------------------------------- 项目 BOM

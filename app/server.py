@@ -465,6 +465,9 @@ def list_movements(ctx: Ctx, m):
     if ctx.qi("project_id"):
         where.append("mv.project_id = ?")
         args.append(ctx.qi("project_id"))
+    elif ctx.q("project") == "none":
+        # 「不指定项目」的日常补货/领用:project_id 为空的那种流水
+        where.append("mv.project_id IS NULL")
     if ctx.q("kind"):
         where.append("mv.kind = ?")
         args.append(ctx.q("kind").upper())
