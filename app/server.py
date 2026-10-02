@@ -889,12 +889,15 @@ def main(argv=None) -> int:
     Handler.db_path = args.db
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}/"
-    print("=" * 58)
-    print("  元器件物料管理系统已启动")
+    print("=" * 64)
+    print("  元器件物料管理系统 已启动")
     print(f"  浏览器打开: {url}")
     print(f"  数据库文件: {args.db}")
-    print("  按 Ctrl+C 停止")
-    print("=" * 58)
+    print("-" * 64)
+    print("  ⚠  请保持本窗口开着 —— 关掉它服务就停了,网页会打不开。")
+    print("     网页报 “Failed to fetch” 通常就是本窗口被关了。")
+    print("     停止服务:在本窗口按 Ctrl+C,或直接关闭窗口。")
+    print("=" * 64)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
