@@ -160,6 +160,11 @@ $busy = Get-Process -Name '元器件物料管理', 'pythonw' -EA SilentlyContinu
 if ($busy) {
     throw "程序正在从 $Pkg 运行(PID $($busy.Id -join ', '))。请先关掉那个窗口,再重新打包。"
 }
+# data\ 里是库存、BOM、流水 —— 先挪出来再放回去。绝不能因为重新打包,
+# 就把你往运行的包里录进去的数据删掉。
+$dataKeep = Join-Path $Cache '_pkgdata'
+if (Test-Path $dataKeep) { Remove-Item $dataKeep -Recurse -Force }
+if (Test-Path (Join-Path $Pkg 'data')) { Move-Item (Join-Path $Pkg 'data') $dataKeep -Force }
 if (Test-Path $Pkg) { Remove-Item $Pkg -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Pkg | Out-Null
 Copy-Item (Join-Path $Cache '元器件物料管理.exe') $Pkg -Force
@@ -182,7 +187,17 @@ foreach ($web in 'index.html', 'app.js', 'style.css') {
     Remove-Item (Join-Path $Pkg "app\static\$web") -Force -EA SilentlyContinue
 }
 
-New-Item -ItemType Directory -Force -Path (Join-Path $Pkg 'data') | Out-Null
+if (Test-Path $dataKeep) {
+    Move-Item $dataKeep (Join-Path $Pkg 'data') -Force
+    Write-Host '  保留包里原有的数据库(没有覆盖你录进去的数据)' -ForegroundColor Yellow
+} else {
+    New-Item -ItemType Directory -Force -Path (Join-Path $Pkg 'data') | Out-Null
+    $devDb = Join-Path $Root 'data\parts.db'
+    if (Test-Path $devDb) {
+        Copy-Item $devDb (Join-Path $Pkg 'data\parts.db') -Force
+        Write-Host '  已放入当前数据库,打开就能看到已有的元件'
+    }
+}
 Copy-Item (Join-Path $Build '使用说明.txt') $Pkg -Force -EA SilentlyContinue
 
 # ---------------------------------------------------------------- 汇报
@@ -197,5 +212,6 @@ if ($stray) {
 }
 Write-Host ''
 Write-Host '自检(不碰你的数据,会复制一份数据库):  python build\test_gui.py' -ForegroundColor DarkGray
+
 
 
