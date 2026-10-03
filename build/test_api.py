@@ -32,6 +32,7 @@ import sys
 ROOT = sys.argv[1]
 sys.path.insert(0, os.path.join(ROOT, "app"))
 
+import bom       # noqa: E402
 import db        # noqa: E402
 import server    # noqa: E402
 
@@ -477,6 +478,272 @@ check("候选最多 8 条,不刷屏", len(r["candidates"]) <= 8, True)
 _s, r = call(server.resolve_component, query={"q": "库里绝对没有的料 XYZ-404"})
 check("完全没有就报 none(可以安全地新建)", r["how"], "none")
 check("none 时 match 是 None", r["match"], None)
+
+p("\n【21】撤销:写反向流水,不删记录")
+_s, undo = call(server.create_component, body={
+    "name": "撤销测试料", "category": "其他", "package": "SOT-23"})
+U = undo["id"]
+
+
+def u_at(loc="测试抽屉"):
+    row = CON.execute("SELECT qty FROM stock WHERE component_id=? AND location_id="
+                      "(SELECT id FROM location WHERE code=?)", (U, loc)).fetchone()
+    return int(row["qty"]) if row else 0
+
+
+_s, r = call(server.stock_move, body={"kind": "IN", "component_id": U, "qty": 10,
+                                      "location": "测试抽屉"})
+mv_in = r["movement_id"]
+check("入库 10 个", u_at(), 10)
+
+_s, r = call(server.void_movement, match=(str(mv_in),))
+check("撤销返回新流水号", r["movement_id"] > mv_in, True)
+check("库存回到 0", u_at(), 0)
+check("撤销的是哪一笔如实报出", r["voided"], mv_in)
+
+row = CON.execute("SELECT * FROM movement WHERE id=?", (mv_in,)).fetchone()
+check("原记录被标成已撤销,但没被删", row["voided"], 1)
+back = CON.execute("SELECT * FROM movement WHERE void_of=?", (mv_in,)).fetchone()
+check("写了一条反向流水", back is not None, True)
+check("反向流水的方向和原来相反", back["kind"], "OUT")
+check("反向流水指向被撤销的那一笔", back["void_of"], mv_in)
+check("反向流水的说明写清了撤销谁", f"撤销 #{mv_in}" in back["note"], True)
+check("反向流水也记下了改动前的数量", back["qty_before"], 10)
+check("原记录还在表里(账本只增不删)",
+      CON.execute("SELECT COUNT(*) FROM movement WHERE id=?", (mv_in,)).fetchone()[0], 1)
+
+try:
+    call(server.void_movement, match=(str(mv_in),))
+    check("同一笔不能撤销两次", False, True)
+except server.ApiError as exc:
+    check("同一笔不能撤销两次", "已经撤销过" in exc.message, True)
+
+try:
+    call(server.void_movement, match=(str(back["id"]),))
+    check("撤销记录本身不能再被撤销", False, True)
+except server.ApiError as exc:
+    check("撤销记录本身不能再被撤销", "本身就是一条撤销" in exc.message, True)
+
+_s, r = call(server.stock_move, body={"kind": "IN", "component_id": U, "qty": 4,
+                                      "location": "测试抽屉"})
+call(server.stock_move, body={"kind": "OUT", "component_id": U, "qty": 3,
+                             "location": "测试抽屉"})
+check("先入 4 再出 3,剩 1", u_at(), 1)
+_s, last = call(server.last_movement)
+check("最近一笔就是那条出库", last["movement"]["kind"], "OUT")
+check("最近一笔带了中文动作名", last["movement"]["kind_label"], "出库")
+call(server.void_movement, match=(str(last["movement"]["id"]),))
+check("撤销出库后数量加回去", u_at(), 4)
+_s, last = call(server.last_movement)
+check("已撤销的那笔不再算「最近可撤销」", last["movement"]["kind"], "IN")
+check("取到的正是那笔入库(数量 4)", last["movement"]["qty"], 4)
+
+# 盘点也要能撤销 —— 关键是 qty_before 存下来了
+call(server.stocktake_location, body={"items": [{"component_id": U, "qty": 99}]},
+     match=(str(LID),))
+check("盘点成 99", u_at(), 99)
+_s, last = call(server.last_movement)
+adj = CON.execute("SELECT qty_before FROM movement WHERE id=?",
+                  (last["movement"]["id"],)).fetchone()[0]
+check("盘点流水里存了「原来多少」", adj, 4)
+call(server.void_movement, match=(str(last["movement"]["id"]),))
+check("撤销盘点后回到盘点前的数量", u_at(), 4)
+
+# 移库也要能撤销
+_s, drawer2 = call(server.create_location, body={"code": "测试抽屉2"})
+LID2 = drawer2["id"]
+_s, r = call(server.stock_move, body={"kind": "TRANSFER", "component_id": U, "qty": 3,
+                                      "location": "测试抽屉", "to_location": "测试抽屉2"})
+check("移走 3 个", (u_at(), u_at("测试抽屉2")), (1, 3))
+call(server.void_movement, match=(str(r["movement_id"]),))
+check("撤销移库后两边都还原", (u_at(), u_at("测试抽屉2")), (4, 0))
+
+p("\n【22】撤销采购到货:得把采购单的已收数也退回去")
+_s, uc = call(server.create_component, body={"name": "撤销采购测试料", "category": "其他"})
+_s, po = call(server.create_purchase, body={"component_id": uc["id"], "qty": 20,
+                                            "supplier": "测试供应商",
+                                            "status": "ordered"})
+po_id = po["id"]
+_s, res = call(server.receive_purchase, body={"qty": 20, "location": "测试抽屉"},
+               match=(str(po_id),))
+check("收了 20 个", res["received"], 20)
+check("收完状态变成已到货", CON.execute("SELECT status FROM purchase WHERE id=?",
+                                        (po_id,)).fetchone()[0], "arrived")
+mvid = CON.execute("SELECT id FROM movement WHERE purchase_id=? ORDER BY id DESC",
+                   (po_id,)).fetchone()[0]
+check("到货流水挂上了采购单号",
+      CON.execute("SELECT purchase_id FROM movement WHERE id=?",
+                  (mvid,)).fetchone()[0], po_id)
+_s, r = call(server.void_movement, match=(str(mvid),))
+check("撤销后采购单的已收数退回 0",
+      CON.execute("SELECT received FROM purchase WHERE id=?", (po_id,)).fetchone()[0], 0)
+check("状态退回「已下单」(货还在路上)",
+      CON.execute("SELECT status FROM purchase WHERE id=?", (po_id,)).fetchone()[0],
+      "ordered")
+check("库存也退回去了",
+      CON.execute("SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?",
+                  (uc["id"],)).fetchone()[0], 0)
+
+_s, _r = call(server.rebuild)
+check("按流水重建后余额仍然对得上",
+      CON.execute("SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?",
+                  (U,)).fetchone()[0], 4)
+check("撤销没有破坏「流水只增不改」:条数只增不减",
+      CON.execute("SELECT COUNT(*) FROM movement WHERE void_of IS NOT NULL"
+                  ).fetchone()[0] > 0, True)
+
+p("\n【23】查重:找出反复导入 BOM 长出来的重复料")
+_s, d1 = call(server.create_component, body={
+    "name": "查重电阻甲", "category": "其他", "mpn": "DUP-MPN-001",
+    "value": "1kΩ", "package": "0603"})
+_s, d2 = call(server.create_component, body={
+    "name": "查重电阻乙", "category": "其他", "mpn": "DUP-MPN-001",
+    "value": "1kΩ", "package": "0603"})
+d1, d2 = d1["id"], d2["id"]
+for nm in ("查重同名料甲", "查重同名料乙"):
+    call(server.create_component, body={"name": "查重同名料", "category": "其他",
+                                        "value": "2k2Ω", "package": "0805"})
+_s, d5 = call(server.create_component, body={
+    "name": "查重值封装丙", "category": "其他", "value": "47uF", "package": "1206"})
+_s, d6 = call(server.create_component, body={
+    "name": "查重值封装丁", "category": "其他", "value": "47uF", "package": "1206"})
+d5, d6 = d5["id"], d6["id"]
+
+_s, dup = call(server.component_duplicates)
+reasons = {g["reason"] for g in dup["groups"]}
+check("能按厂家料号找出重复", "mpn" in reasons, True)
+check("能按完全同名找出重复", "name" in reasons, True)
+check("能按值 + 封装找出重复", "vf" in reasons, True)
+check("按「有多确定」排:料号最前(它是硬证据)", dup["groups"][0]["reason"], "mpn")
+check("多出来的条数如实统计", dup["extra"] >= 3, True)
+
+g_mpn = [g for g in dup["groups"] if g["reason"] == "mpn" and g["key"] == "DUP-MPN-001"]
+check("找到了这个料号的重复组", len(g_mpn), 1)
+check("组里两条都在", sorted(i["id"] for i in g_mpn[0]["items"]), sorted([d1, d2]))
+check("每条都带上现有库存,好判断哪条才是「正主」",
+      "on_hand" in g_mpn[0]["items"][0], True)
+check("组里给了一句「怎么判断」的提示", "基本可以确定" in g_mpn[0]["hint"], True)
+g_vf = [g for g in dup["groups"] if g["reason"] == "vf" and g["key"] == "47uF / 1206"]
+check("值+封装那档也找到了", len(g_vf), 1)
+check("可疑档的提示让人自己确认,不替他拍板",
+      "请自己确认" in g_vf[0]["hint"], True)
+
+p("\n【24】合并:库存相加、BOM 行并成一条、采购单改指,但流水一条不动")
+call(server.stock_move, body={"kind": "IN", "component_id": d1, "qty": 30,
+                              "location": "测试抽屉"})
+call(server.stock_move, body={"kind": "IN", "component_id": d2, "qty": 12,
+                              "location": "测试抽屉"})
+call(server.stock_move, body={"kind": "IN", "component_id": d2, "qty": 5,
+                              "location": "测试抽屉2"})
+_s, po2 = call(server.create_purchase, body={"component_id": d2, "qty": 7,
+                                             "status": "todo"})
+_s, proj_m = call(server.create_project, body={"name": "合并测试项目甲"})
+_s, proj_n = call(server.create_project, body={"name": "合并测试项目乙"})
+PM, PN = proj_m["id"], proj_n["id"]
+CON.execute("INSERT INTO project_bom(project_id, component_id, required_qty, designators)"
+            " VALUES(?,?,?,?)", (PM, d1, 2, "R1 R2"))
+CON.execute("INSERT INTO project_bom(project_id, component_id, required_qty, designators)"
+            " VALUES(?,?,?,?)", (PM, d2, 3, "R3"))
+CON.execute("INSERT INTO project_bom(project_id, component_id, required_qty)"
+            " VALUES(?,?,?)", (PN, d2, 5))
+# 替代料也要跟着走:同一条 BOM 行上两条重复料的替代关系要合成一条
+row_b = CON.execute("SELECT id FROM project_bom WHERE project_id=? AND component_id=?",
+                    (PN, d2)).fetchone()[0]
+CON.execute("INSERT INTO bom_substitute(bom_id, component_id) VALUES(?,?)", (row_b, d5))
+CON.commit()
+n_mv_before = CON.execute(
+    "SELECT COUNT(*) FROM movement WHERE component_id IN (?,?)", (d1, d2)).fetchone()[0]
+n_comp_before = CON.execute("SELECT COUNT(*) FROM component WHERE merged_into IS NULL"
+                            ).fetchone()[0]
+
+
+def q_at(cid, code):
+    r = CON.execute("SELECT qty FROM stock WHERE component_id=? AND location_id="
+                    "(SELECT id FROM location WHERE code=?)", (cid, code)).fetchone()
+    return int(r["qty"]) if r else 0
+
+
+_s, res = call(server.merge_components, body={"keep": d1, "drop": [d2]})
+check("合并报告了并掉的 id", res["dropped"], [d2])
+check("保留的那条还叫原来那个名字", res["keep"]["name"], "查重电阻甲")
+check("同一仓位的库存相加(30 + 12)", q_at(d1, "测试抽屉"), 42)
+check("别的仓位的库存整行挪过来", q_at(d1, "测试抽屉2"), 5)
+check("被并的那条库存清零了", q_at(d2, "测试抽屉") + q_at(d2, "测试抽屉2"), 0)
+check("被并的那条被标记、不是被删",
+      CON.execute("SELECT merged_into FROM component WHERE id=?",
+                  (d2,)).fetchone()[0], d1)
+check("被并的那条还在表里(历史不能断)",
+      CON.execute("SELECT COUNT(*) FROM component WHERE id=?", (d2,)).fetchone()[0], 1)
+check("它自己的料号留着,方便以后追「这条原来是什么」",
+      CON.execute("SELECT mpn FROM component WHERE id=?", (d2,)).fetchone()[0],
+      "DUP-MPN-001")
+check("元件总数少了一个",
+      CON.execute("SELECT COUNT(*) FROM component WHERE merged_into IS NULL"
+                  ).fetchone()[0], n_comp_before - 1)
+_s, lst = call(server.list_components, query={"limit": "0"})
+check("被并的那条不再出现在列表里",
+      any(i["id"] == d2 for i in lst["items"]), False)
+check("保留的那条还在列表里", any(i["id"] == d1 for i in lst["items"]), True)
+_s, det = call(server.get_component, match=(str(d2),))
+check("但按 id 直接查还查得到(能追回去)", det["id"], d2)
+
+check("同一个项目里的两行 BOM 并成了一行",
+      CON.execute("SELECT COUNT(*) FROM project_bom WHERE project_id=? AND component_id IN "
+                  "(?,?)", (PM, d1, d2)).fetchone()[0], 1)
+check("用量相加(2 + 3)",
+      CON.execute("SELECT required_qty FROM project_bom WHERE project_id=? AND component_id=?",
+                  (PM, d1)).fetchone()[0], 5)
+check("位号拼起来了",
+      CON.execute("SELECT designators FROM project_bom WHERE project_id=? AND component_id=?",
+                  (PM, d1)).fetchone()[0], "R1 R2 R3")
+check("另一个项目里只有一条,直接改指过来",
+      CON.execute("SELECT component_id FROM project_bom WHERE project_id=?", (PN,)
+                  ).fetchone()[0], d1)
+check("BOM 里再没有指向被并那条的",
+      CON.execute("SELECT COUNT(*) FROM project_bom WHERE component_id=?",
+                  (d2,)).fetchone()[0], 0)
+check("原来挂在被并那条上的替代料也改指过来了",
+      CON.execute("SELECT COUNT(*) FROM bom_substitute WHERE bom_id=? AND component_id=?",
+                  (row_b, d5)).fetchone()[0], 1)
+check("采购单改指到保留的那条",
+      CON.execute("SELECT component_id FROM purchase WHERE id=?",
+                  (po2["id"],)).fetchone()[0], d1)
+check("流水一条都没少(合并绝不能删历史)",
+      CON.execute("SELECT COUNT(*) FROM movement WHERE component_id IN (?,?)",
+                  (d1, d2)).fetchone()[0], n_mv_before)
+check("被并那条名下的流水仍然挂在它身上(那是真实发生过的)",
+      CON.execute("SELECT COUNT(*) FROM movement WHERE component_id=?",
+                  (d2,)).fetchone()[0] > 0, True)
+
+for bad_body, why, err in (
+        ({"keep": d1, "drop": [d2]}, "已经被并过的不能再并一次", 409),
+        ({"keep": d1, "drop": [d1]}, "不能把自己并进自己", 400),
+        ({"keep": d1, "drop": []}, "没指定要并掉谁", 400),
+        ({"keep": 999999, "drop": [d1]}, "保留的那条不存在", 404)):
+    try:
+        call(server.merge_components, body=bad_body)
+        check(f"拒绝:{why}", False, True)
+    except server.ApiError as exc:
+        check(f"拒绝:{why}", exc.status, err)
+
+_s, merged = call(server.merged_components)
+check("已合并清单里有它", any(i["id"] == d2 for i in merged["items"]), True)
+check("已合并清单会告诉你并到哪条去了",
+      [i["keep_name"] for i in merged["items"] if i["id"] == d2][0], "查重电阻甲")
+
+# 最要紧的一条:合并之后,再导入带这个料号的 BOM 必须挂到保留的那条上,
+# 否则刚合掉的重复下一分钟就长回来了
+items_p, _w = bom.rows_to_items([["Designator", "Quantity", "MPN"],
+                                 ["R9", "1", "DUP-MPN-001"]])
+bom.import_items(CON, items_p, "合并后再导入")
+got = CON.execute(
+    "SELECT b.component_id FROM project_bom b JOIN project p ON p.id=b.project_id "
+    "WHERE p.name='合并后再导入'").fetchone()[0]
+check("合并后重新导入,料挂到保留的那条上(不会又长回一条重复)", got, d1)
+
+_s, dup2 = call(server.component_duplicates)
+g2 = [g for g in dup2["groups"] if g["reason"] == "mpn" and g["key"] == "DUP-MPN-001"]
+check("查重结果里那一组消失了", len(g2), 0)
 
 CON.close()
 p("\n" + "=" * 62)

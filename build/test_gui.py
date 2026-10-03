@@ -947,6 +947,142 @@ def main() -> int:
         finally:
             gui.messagebox = real_box
 
+        p("\n【21】撤销上一次出入库(录错了当场退回去)")
+        box3 = FakeBox()
+        gui.messagebox = box3
+        try:
+            c = API(server.create_component, body={"name": "撤销界面测试料",
+                                                   "category": "其他"})
+            cid = c["id"]
+
+            def stock_of():
+                return app_con.execute(
+                    "SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?",
+                    (cid,)).fetchone()[0]
+
+            API(server.stock_move, body={"kind": "IN", "component_id": cid, "qty": 12})
+            app.refresh_all()
+            app.update()
+            tab_mv = app.tab_move
+            app.nb.select(tab_mv)
+            tab_mv.reload()
+            app.update()
+            first = tab_mv.tree.get_children()[0]
+            check("流水页列出了刚入库的那条",
+                  tab_mv.tree.item(first, "values")[1], "入库")
+
+            app.focus_set()
+            app.update()
+            box3.asks.clear()
+            app.undo_last()
+            app.update()
+            check("撤销前先问一遍 —— 不问就动手太危险", len(box3.asks), 1)
+            check("问的时候把这一笔原样摆出来了",
+                  "撤销界面测试料" in box3.asks[0][1], True)
+            check("并说清是补反向流水、不是删记录",
+                  "反向流水" in box3.asks[0][1], True)
+            check("撤销后库存归零", stock_of(), 0)
+            check("原记录还在,只是标成已撤销",
+                  app_con.execute("SELECT voided FROM movement WHERE component_id=? "
+                                  "ORDER BY id LIMIT 1", (cid,)).fetchone()[0], 1)
+
+            tab_mv.reload()
+            app.update()
+            shown = {tab_mv.tree.item(i, "values")[1]: tab_mv.tree.item(i, "tags")
+                     for i in tab_mv.tree.get_children()}
+            check("流水页把已撤销的那笔标出来",
+                  any("已撤销" in k for k in shown), True)
+            check("已撤销的行淡显而不是隐藏(历史要看得见)",
+                  any("voided" in t for t in shown.values()), True)
+            check("反向流水本身也在流水页里",
+                  any("·撤销" in k for k in shown), True)
+
+            box3.answer = False
+            API(server.stock_move, body={"kind": "IN", "component_id": cid, "qty": 3})
+            app.focus_set()
+            app.update()
+            app.undo_last()
+            check("在确认框里点「否」就真的什么都不做", stock_of(), 3)
+
+            box3.answer = True
+            API(server.stock_move, body={"kind": "OUT", "component_id": cid, "qty": 3})
+            app.focus_set()
+            app.update()
+            app.undo_last()
+            app.update()
+            check("撤销出库后数量加回来", stock_of(), 3)
+            check("撤销完给了状态栏提示", "已撤销" in app.status.get(), True)
+            check("Ctrl+Z 绑上了撤销", bool(app.bind_all("<Control-z>")), True)
+
+            box3.answer = False
+            app.focus_set()
+            app.update()
+            app.undo_last()
+            check("再点否还是不动", stock_of(), 3)
+        finally:
+            gui.messagebox = real_box
+
+        p("\n【22】查重与合并")
+        box4 = FakeBox()
+        gui.messagebox = box4
+        try:
+            e1 = API(server.create_component, body={
+                "name": "界面查重甲", "category": "其他", "mpn": "GUI-DUP-1",
+                "value": "3k3Ω", "package": "0603"})["id"]
+            e2 = API(server.create_component, body={
+                "name": "界面查重乙", "category": "其他", "mpn": "GUI-DUP-1",
+                "value": "3k3Ω", "package": "0603"})["id"]
+            API(server.stock_move, body={"kind": "IN", "component_id": e1, "qty": 5})
+            API(server.stock_move, body={"kind": "IN", "component_id": e2, "qty": 8})
+            app.refresh_all()
+
+            dd = gui.DedupeDialog(app, app)
+            dd.update()
+            row = [i for i in dd.t_groups.get_children()
+                   if dd.t_groups.item(i, "values")[1] == "GUI-DUP-1"]
+            check("扫出了这一组重复", len(row), 1)
+            check("依据显示成中文而不是 mpn 这种内部码",
+                  dd.t_groups.item(row[0], "values")[0], "料号相同")
+            dd.t_groups.selection_set(row[0])
+            dd.show_group()
+            dd.update()
+            check("右边列出了这一组的成员", len(dd.t_items.get_children()), 2)
+            check("成员表带上了各自的现有库存,好判断哪条是正主",
+                  sorted(int(dd.t_items.item(i, "values")[5])
+                         for i in dd.t_items.get_children()), [5, 8])
+
+            keep_iid = [i for i in dd.t_items.get_children()
+                        if int(dd.t_items.item(i, "values")[5]) == 8][0]
+            drop_iid = [i for i in dd.t_items.get_children() if i != keep_iid][0]
+            dd.t_items.selection_set(keep_iid)
+            box4.asks.clear()
+            dd.merge()
+            dd.update()
+            check("合并前把要保留和要并掉的名字都摆出来问一遍", len(box4.asks), 1)
+            check("确认框里明说了流水一条不动",
+                  "流水一条不动" in box4.asks[0][1], True)
+            check("也说了被并的那条不删",
+                  "不删" in box4.asks[0][1], True)
+            check("库存相加到保留的那条(5 + 8)",
+                  app_con.execute("SELECT COALESCE(SUM(qty),0) FROM stock "
+                                  "WHERE component_id=?", (int(keep_iid),)).fetchone()[0], 13)
+            check("被并的那条标上 merged_into",
+                  app_con.execute("SELECT merged_into FROM component WHERE id=?",
+                                  (int(drop_iid),)).fetchone()[0], int(keep_iid))
+            check("合并后自动重扫,那一组不见了",
+                  any(dd.t_groups.item(i, "values")[1] == "GUI-DUP-1"
+                      for i in dd.t_groups.get_children()), False)
+            check("合并标记了 done,主界面会刷新", dd.done, True)
+            check("合并完给了状态栏提示", "已把" in app.status.get(), True)
+
+            box4.infos.clear()
+            dd.show_merged()
+            check("「已合并的元件…」能查回并到哪儿去了",
+                  "界面查重甲" in box4.infos[-1][1], True)
+            dd.destroy()
+        finally:
+            gui.messagebox = real_box
+
         app.refresh_all()
         app.update()
         p("  [OK ] 全量刷新")

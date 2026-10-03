@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS component (
   supplier      TEXT,                           -- 常用供应商
   unit_price    REAL NOT NULL DEFAULT 0,        -- 参考单价,用来估库存价值
   default_loc_id INTEGER REFERENCES location(id) ON DELETE SET NULL,
+  merged_into   INTEGER REFERENCES component(id), -- 已并入哪个元件(合并采用标记,不删行)
   note          TEXT,
   created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime')),
   updated_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
@@ -119,6 +120,9 @@ CREATE TABLE IF NOT EXISTS movement (
   ref            TEXT,                          -- 单据号
   operator       TEXT,
   note           TEXT,
+  qty_before     INTEGER,                       -- 这一笔之前该仓位的数量(撤销 ADJUST 要用)
+  voided         INTEGER NOT NULL DEFAULT 0,    -- 这笔已被撤销
+  void_of        INTEGER REFERENCES movement(id), -- 这笔是在撤销哪一笔
   created_at     TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 
@@ -180,6 +184,11 @@ ADDED_COLUMNS = {
         "supplier": "TEXT",
         "unit_price": "REAL NOT NULL DEFAULT 0",
         "default_loc_id": "INTEGER REFERENCES location(id) ON DELETE SET NULL",
+        # 合并重复元件时,被并掉的那条**不删**,只记「并到谁那儿去了」。
+        # 删掉的话,它名下的流水会被外键 ON DELETE CASCADE 一起带走 ——
+        # 那些流水是真实发生过的收发货,删了历史就断了,而且没法后悔。
+        # 标成 merged_into 之后:列表里不再出现,但流水、单据、BOM 都还查得到。
+        "merged_into": "INTEGER REFERENCES component(id)",
     },
     "location": {
         "parent_id": "INTEGER REFERENCES location(id) ON DELETE CASCADE",
@@ -195,6 +204,13 @@ ADDED_COLUMNS = {
     },
     "movement": {
         "purchase_id": "INTEGER REFERENCES purchase(id) ON DELETE SET NULL",
+        # 撤销用的三列。做法是**写一条反向流水**并把原记录标记为已撤销,
+        # 而不是把原记录删掉 —— 账本必须能重建,删了就查不出「那天到底是谁
+        # 把它改成这样的」。qty_before 只在撤销盘点(ADJUST)时才用得上:
+        # 盘点记录里存的 qty 是「新数量」,不知道原来是多少就没法还原。
+        "qty_before": "INTEGER",
+        "voided": "INTEGER NOT NULL DEFAULT 0",
+        "void_of": "INTEGER REFERENCES movement(id)",
     },
     "purchase": {
         "received": "INTEGER NOT NULL DEFAULT 0",

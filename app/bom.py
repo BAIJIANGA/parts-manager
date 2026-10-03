@@ -321,18 +321,24 @@ def find_component(con, lcsc_pn: str | None, mpn: str | None, name: str | None =
 
     两者都没有时(纯 Value + Footprint 的 KiCad / EasyEDA BOM)退回按元件名找。
     名字本来就是由值、封装、料号推出来的,所以同一个元件反复导入不会变成两条。
+
+    始终跳过 merged_into 不为空的行:那些是合并掉的重复料,已经不在列表里了,
+    再往它们身上挂 BOM 行等于把刚合掉的重复又长回来。
     """
     if lcsc_pn:
-        row = con.execute("SELECT * FROM component WHERE lcsc_pn=?", (lcsc_pn,)).fetchone()
+        row = con.execute("SELECT * FROM component WHERE lcsc_pn=? AND merged_into IS NULL",
+                          (lcsc_pn,)).fetchone()
         if row:
             return row
     if mpn:
-        row = con.execute("SELECT * FROM component WHERE mpn=?", (mpn,)).fetchone()
+        row = con.execute("SELECT * FROM component WHERE mpn=? AND merged_into IS NULL",
+                          (mpn,)).fetchone()
         if row:
             return row
     if not lcsc_pn and not mpn and name:
         row = con.execute(
-            "SELECT * FROM component WHERE name=? AND (lcsc_pn IS NULL OR lcsc_pn='')"
+            "SELECT * FROM component WHERE name=? AND merged_into IS NULL"
+            " AND (lcsc_pn IS NULL OR lcsc_pn='')"
             " AND (mpn IS NULL OR mpn='')", (name,)).fetchone()
         if row:
             return row

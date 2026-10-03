@@ -35,6 +35,9 @@ ICON_PATH = os.path.join(server.PROJECT_ROOT, "app", "static", "app.ico")
 BACKUP_DIR = os.path.join(server.PROJECT_ROOT, "data", "backups")
 
 KIND_LABEL = {"IN": "入库", "OUT": "出库", "ADJUST": "盘点", "TRANSFER": "移库"}
+# 查重的三档依据。前两档是硬证据,第三档只是可疑 —— 界面上要能看出这个区别,
+# 免得把「值封装一样」也当成「肯定是同一个东西」直接合掉。
+REASON_LABEL = {"mpn": "料号相同", "name": "名称相同", "vf": "值+封装相同"}
 STATE_LABEL = dict(server.STATE_LABEL)   # 跟后端共用一份口径,别各写一份
 FONT = ("Microsoft YaHei UI", 9)
 
@@ -237,6 +240,10 @@ class App(tk.Tk):
         m_tool.add_command(label="⚡ 快速入库…", accelerator="Ctrl+I", command=self.quick_in)
         m_tool.add_command(label="📋 批量入库…", accelerator="Ctrl+B", command=self.batch_in)
         m_tool.add_separator()
+        m_tool.add_command(label="↶ 撤销上一次出入库", accelerator="Ctrl+Z",
+                           command=self.undo_last)
+        m_tool.add_command(label="🔍 查重与合并…", command=self.dedupe)
+        m_tool.add_separator()
         m_tool.add_command(label="按流水重建库存余额(校验)", command=self.rebuild_stock)
         m_tool.add_command(label="导出元件清单 CSV…", command=self.export_components)
         m_tool.add_separator()
@@ -251,6 +258,7 @@ class App(tk.Tk):
         # 收货时手上可能还拿着袋子,让快捷键能一键到位
         self.bind_all("<Control-i>", lambda _e: self.quick_in())
         self.bind_all("<Control-b>", lambda _e: self.batch_in())
+        self.bind_all("<Control-z>", lambda _e: self.undo_last())
         self.bind_all("<F5>", lambda _e: self.refresh_all())
 
     def quick_in(self):
@@ -264,6 +272,36 @@ class App(tk.Tk):
         self.wait_window(dlg)
         if dlg.done:
             self.refresh_all()
+
+    def dedupe(self):
+        dlg = DedupeDialog(self, self)
+        self.wait_window(dlg)
+
+    def undo_last(self):
+        """撤销最近一笔。录错了当场按 Ctrl+Z 就能退回去 ——
+        正因为「收货即录入」,录错才反而更容易发生,所以得留一条退路。"""
+        w = self.focus_get()
+        # 正在文本框里打字时,Ctrl+Z 归文本框自己管(它有自己的撤销),
+        # bind_all 是全局的,不挡一下连批量入库的输入框都会弹这个窗
+        if isinstance(w, (tk.Text, ttk.Entry, tk.Entry)):
+            try:
+                w.event_generate("<<Undo>>")
+            except tk.TclError:
+                pass
+            return
+        got = call(self.con, server.last_movement, quiet=True) or {}
+        mv = got.get("movement")
+        if not mv:
+            messagebox.showinfo("没有可撤销的", "流水里没有还能撤销的记录。", parent=self)
+            return
+        where = mv.get("location_code") or "—"
+        if mv.get("to_location_code"):
+            where += f" → {mv['to_location_code']}"
+        label = (f"{mv['kind_label']}  {mv['component_name']}  {mv['qty']} 个  {where}"
+                 f"\n{(mv.get('created_at') or '')[:19]}")
+        if mv.get("note"):
+            label += f"\n{mv['note']}"
+        undo_movement(self, self, mv["id"], label)
 
     # ---------------------------------------------------------- 数据
 
@@ -287,6 +325,12 @@ class App(tk.Tk):
             traceback.print_exc()
 
     def refresh_status(self):
+        # 有临时消息在显示时不要覆盖它。这条判断是必要的:set_status 之后通常还会
+        # refresh_all(),而 refresh_all 结尾就是 refresh_status —— 不挡一下的话
+        # 「已入库:xxx × 3」「批量入库完成」这类刚给用户的反馈会立刻被统计数字顶掉,
+        # 用户根本来不及看见。_status_hold 归 0 后由定时器把统计数字放回来。
+        if getattr(self, "_status_hold", 0):
+            return
         s = call(self.con, server.summary, quiet=True)
         if not s:
             self.status.set("统计读取失败")
@@ -297,8 +341,18 @@ class App(tk.Tk):
         )
 
     def set_status(self, text, seconds=4):
+        """在状态栏留一句话,seconds 秒后自动换回统计数字。"""
+        self._status_hold = getattr(self, "_status_hold", 0) + 1
+        hold = self._status_hold
         self.status.set(text)
-        self.after(seconds * 1000, self.refresh_status)
+        self.after(int(seconds * 1000), lambda: self._status_release(hold))
+
+    def _status_release(self, hold):
+        # 期间又来了更新的临时消息,就让那一条的定时器负责恢复
+        if hold != getattr(self, "_status_hold", 0):
+            return
+        self._status_hold = 0
+        self.refresh_status()
 
     # ---------------------------------------------------------- 动作
 
@@ -607,6 +661,7 @@ class ComponentsTab(ttk.Frame):
         # 而不是等攒了一堆之后再补录 —— 补录是这类系统最常见的死法
         ttk.Button(head, text="⚡ 快速入库", command=self.quick_in).pack(side="right")
         ttk.Button(head, text="📋 批量入库", command=self.batch_in).pack(side="right", padx=6)
+        ttk.Button(head, text="🔍 查重", command=self.app.dedupe).pack(side="right", padx=6)
         ttk.Button(head, text="＋ 新增元件", command=self.add).pack(side="right", padx=6)
         ttk.Button(head, text="刷新", command=self.reload).pack(side="right", padx=6)
 
@@ -1728,6 +1783,29 @@ class ProjectsTab(ttk.Frame):
 
 # --------------------------------------------------------------------- 流水
 
+def undo_movement(parent, app: App, mid: int, label=None) -> bool:
+    """撤销一笔流水。
+
+    撤销是这里唯一一个「会改动已经记下的历史」的操作,所以先把这一笔原样摆出来
+    问一遍 —— 不看清楚就点确定,正是最容易出事的地方。
+
+    实现上是补一笔反向流水、把原记录标成「已撤销」,不删记录:账本必须还能按
+    流水重建,删了就查不出这一笔到底怎么了。
+    """
+    if not messagebox.askyesno(
+            "撤销这一次操作",
+            f"{label or ('流水 #' + str(mid))}\n\n"
+            "撤销不会删掉记录,而是补一笔反向流水,原记录标成「已撤销」。\n"
+            "确定要撤销吗?", parent=parent):
+        return False
+    res = call(app.con, server.void_movement, match=(str(mid),), parent=parent)
+    if res is None:
+        return False
+    app.set_status(f"已撤销 #{mid};「{res['name']}」现在 {res['on_hand']} 个", 8)
+    app.refresh_all()
+    return True
+
+
 class MovementsTab(ttk.Frame):
     def __init__(self, parent, app: App):
         super().__init__(parent, padding=8)
@@ -1748,19 +1826,23 @@ class MovementsTab(ttk.Frame):
         ttk.Combobox(bar, textvariable=self.limit, width=6, state="readonly",
                      values=["100", "300", "1000", "5000"]).pack(side="left", padx=(0, 10))
         ttk.Button(bar, text="刷新", command=self.reload).pack(side="left")
+        ttk.Button(bar, text="↶ 撤销选中的记录", command=self.undo).pack(side="right")
 
         f, self.tree = make_tree(self, [
             ("created_at", "时间", 145, "center"),
-            ("kind", "动作", 60, "center"),
-            ("component_name", "元件", 180, "w"),
-            ("lcsc_pn", "立创编号", 90, "center"),
-            ("qty", "数量", 60, "e"),
-            ("location_code", "仓位", 95, "w"),
-            ("to_location_code", "移到", 95, "w"),
-            ("project_name", "项目", 130, "w"),
-            ("operator", "操作人", 85, "center"),
-            ("note", "备注", 220, "w")], height=22)
+            ("kind", "动作", 100, "center"),
+            ("component_name", "元件", 175, "w"),
+            ("lcsc_pn", "立创编号", 88, "center"),
+            ("qty", "数量", 55, "e"),
+            ("location_code", "仓位", 90, "w"),
+            ("to_location_code", "移到", 90, "w"),
+            ("project_name", "项目", 120, "w"),
+            ("operator", "操作人", 80, "center"),
+            ("note", "备注", 200, "w")], height=22)
         f.pack(fill="both", expand=True)
+        # 撤销过的记录淡掉但不隐藏 —— 历史要看得见,只是别再当它是有效的
+        self.tree.tag_configure("voided", foreground="#95a5a6")
+        self.tree.tag_configure("reversal", foreground="#2471a3")
 
     def reload(self):
         query = {"limit": self.limit.get()}
@@ -1772,13 +1854,33 @@ class MovementsTab(ttk.Frame):
             return
         clear_tree(self.tree)
         for mv in data["items"]:
-            self.tree.insert("", "end", values=(
-                (mv.get("created_at") or "")[:19],
-                KIND_LABEL.get(mv.get("kind"), mv.get("kind")),
+            kind_txt = KIND_LABEL.get(mv.get("kind"), mv.get("kind"))
+            if mv.get("voided"):
+                kind_txt += "(已撤销)"
+                tags = ("voided",)
+            elif mv.get("void_of"):
+                kind_txt += "·撤销"
+                tags = ("reversal",)
+            else:
+                tags = ()
+            self.tree.insert("", "end", iid=str(mv["id"]), values=(
+                (mv.get("created_at") or "")[:19], kind_txt,
                 mv.get("component_name") or "", mv.get("lcsc_pn") or "",
                 mv.get("qty") or 0, mv.get("location_code") or "",
                 mv.get("to_location_code") or "", mv.get("project_name") or "",
-                mv.get("operator") or "", mv.get("note") or ""))
+                mv.get("operator") or "", mv.get("note") or ""), tags=tags)
+
+    def undo(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先点一行要撤销的记录。", parent=self)
+            return
+        mid = int(sel[0])
+        vals = self.tree.item(sel[0], "values")
+        label = f"{vals[1]}  {vals[2]}  {vals[4]} 个  {vals[5]}\n{vals[0]}"
+        if vals[9]:
+            label += f"\n{vals[9]}"
+        undo_movement(self, self.app, mid, label)
 
 
 # --------------------------------------------------------------------- 仓位
@@ -2539,6 +2641,168 @@ class BatchInDialog(tk.Toplevel):
         self.app.refresh_all()
         if not failed:
             self.destroy()
+
+
+class DedupeDialog(tk.Toplevel):
+    """查重与合并 —— 收拾反复导入 BOM 长出来的重复料。
+
+    重复料是这类工具最难躲开的数据腐烂:同一颗电阻,一期 BOM 带着立创编号,
+    另一期只有值和封装,于是库里长出两条,库存还分散记在两处。它不会自己好,
+    只会越来越难收拾 —— 所以得有个地方能定期扫一遍。
+
+    合并**不删除**被并掉的那条,只标一下「并到谁那儿去了」:它名下挂着真实发生过的
+    收发货流水,而流水是 ON DELETE CASCADE,直接删元件会把历史一起带走。
+    标一下既能让列表干净,又保住了来龙去脉,合错了也查得回来。
+    """
+
+    def __init__(self, parent, app: App):
+        super().__init__(parent)
+        self.app = app
+        self.con = app.con
+        self.done = False
+        self.groups = []
+
+        self.title("查重与合并")
+        self.transient(parent)
+        self.geometry("1060x660")
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+
+        head = ttk.Frame(body)
+        head.pack(fill="x")
+        ttk.Label(head, text="查重与合并", style="Big.TLabel").pack(side="left")
+        ttk.Button(head, text="重新扫描", command=self.scan).pack(side="right")
+        ttk.Button(head, text="已合并的元件…", command=self.show_merged).pack(
+            side="right", padx=6)
+        ttk.Label(body, text="左边按「有多确定」排:料号相同是硬证据,"
+                             "「值 + 封装相同」只是可疑,要你自己确认。",
+                  style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
+
+        pan = ttk.PanedWindow(body, orient="horizontal")
+        pan.pack(fill="both", expand=True)
+
+        left = ttk.Frame(pan, padding=(0, 0, 8, 0))
+        f1, self.t_groups = make_tree(left, [
+            ("reason", "依据", 78, "w"),
+            ("key", "相同点", 138, "w", True),
+            ("n", "条数", 42, "e")], height=13)
+        f1.pack(fill="both", expand=True)
+        self.t_groups.bind("<<TreeviewSelect>>", lambda _e: self.show_group())
+        pan.add(left, weight=1)
+
+        right = ttk.Frame(pan)
+        ttk.Label(right, text="点一行选中「要保留的那条」,再把其余的并过来").pack(anchor="w")
+        f2, self.t_items = make_tree(right, [
+            ("name", "名称", 165, "w", True),
+            ("lcsc_pn", "立创编号", 86, "center"),
+            ("mpn", "厂家料号", 108, "w"),
+            ("value", "值", 60, "w"),
+            ("package", "封装", 70, "w"),
+            ("on_hand", "现有", 46, "e"),
+            ("where", "在哪些项目里用", 120, "w", True)], height=13)
+        f2.pack(fill="both", expand=True)
+        self.t_items.bind("<Double-1>", lambda _e: self.merge())
+        pan.add(right, weight=2)
+
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(8, 0))
+        self.hint = tk.StringVar()
+        ttk.Label(btns, textvariable=self.hint, foreground="#b9770e").pack(side="left")
+        ttk.Button(btns, text="关闭", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="把其余的并到选中的这一条", command=self.merge).pack(
+            side="right", padx=6)
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        self.scan()
+
+    # ---------------------------------------------------------- 扫描
+
+    def scan(self):
+        data = call(self.con, server.component_duplicates, quiet=True) or {}
+        self.groups = data.get("groups") or []
+        clear_tree(self.t_groups)
+        for i, g in enumerate(self.groups):
+            self.t_groups.insert("", "end", iid=str(i), values=(
+                REASON_LABEL.get(g["reason"], g["reason"]), g["key"], len(g["items"])))
+        if self.groups:
+            self.hint.set(f"发现 {len(self.groups)} 组疑似重复,"
+                          f"合并后能少 {data.get('extra', 0)} 条")
+            self.t_groups.selection_set("0")
+            self.show_group()
+        else:
+            self.hint.set("没有发现重复,挺好的。")
+            clear_tree(self.t_items)
+
+    def show_group(self):
+        sel = self.t_groups.selection()
+        clear_tree(self.t_items)
+        if not sel:
+            return
+        g = self.groups[int(sel[0])]
+        # 每条重复料都查一下它被哪些项目用到 —— 这决定并哪一条更省事
+        for it in g["items"]:
+            used = [r["name"] for r in self.con.execute(
+                """SELECT DISTINCT p.name FROM project_bom b
+                   JOIN project p ON p.id = b.project_id
+                   WHERE b.component_id=? ORDER BY p.name""", (it["id"],))]
+            self.t_items.insert("", "end", iid=str(it["id"]), values=(
+                it["name"], it.get("lcsc_pn") or "", it.get("mpn") or "",
+                it.get("value") or "", it.get("package") or "",
+                it.get("on_hand") or 0, "、".join(used) or "—"))
+        first = self.t_items.get_children()
+        if first:
+            self.t_items.selection_set(first[0])
+        self.hint.set(g["hint"])
+
+    # ---------------------------------------------------------- 合并
+
+    def merge(self):
+        sel = self.t_items.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先在右边点一行,选「要保留的那一条」。",
+                                parent=self)
+            return
+        keep = int(sel[0])
+        drop = [int(i) for i in self.t_items.get_children() if int(i) != keep]
+        if not drop:
+            messagebox.showinfo("提示", "这一组只有一条,没什么可并的。", parent=self)
+            return
+        kname = self.t_items.item(sel[0], "values")[0]
+        names = "、".join(self.t_items.item(str(d), "values")[0] for d in drop)
+        if not messagebox.askyesno(
+                "合并元件",
+                f"保留:「{kname}」\n并入:「{names}」\n\n"
+                "会这样处理:\n"
+                "  · 各仓位的库存相加到保留的那条上\n"
+                "  · BOM 里指向被并那些的行改指过来(同一个项目里会并成一行)\n"
+                "  · 采购单、替代料一起改指\n"
+                "  · **出入库流水一条不动**(那是真实发生过的,删了账就重建不出来)\n"
+                "  · 被并的那条不删,只标记「已并入」,列表里不再出现\n\n"
+                "确定合并吗?", parent=self):
+            return
+        res = call(self.con, server.merge_components,
+                   body={"keep": keep, "drop": drop}, parent=self)
+        if res is None:
+            return
+        self.done = True
+        self.app.set_status(f"已把 {len(drop)} 条重复料并入「{kname}」", 8)
+        self.scan()
+        self.app.refresh_all()
+
+    def show_merged(self):
+        """已经并掉的那些。留着这个清单是为了「当初并到哪儿去了」能查回来。"""
+        data = call(self.con, server.merged_components, quiet=True) or {}
+        items = data.get("items") or []
+        if not items:
+            messagebox.showinfo("已合并的元件", "还没有合并过任何元件。", parent=self)
+            return
+        lines = [f"  {i['name']}  →  {i['keep_name'] or '(已不存在)'}"
+                 for i in items[:40]]
+        more = f"\n…… 另有 {len(items) - 40} 条" if len(items) > 40 else ""
+        messagebox.showinfo("已合并的元件",
+                            f"共 {len(items)} 条:\n\n" + "\n".join(lines) + more,
+                            parent=self)
 
 
 # --------------------------------------------------------------------- 总览

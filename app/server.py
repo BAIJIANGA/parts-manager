@@ -223,6 +223,16 @@ FROM component c
 
 # 库存状态的显示名,界面和报表共用
 STATE_LABEL = {"ok": "充足", "low": "偏低", "short": "缺料", "out": "缺货"}
+KIND_LABEL = {"IN": "入库", "OUT": "出库", "ADJUST": "盘点", "TRANSFER": "移库"}
+
+
+def _qty_at(con, component_id: int, location_id) -> int:
+    """某个元件在某个仓位上的现有数量。没有那一行就是 0。"""
+    if location_id is None:
+        return 0
+    row = con.execute("SELECT qty FROM stock WHERE component_id=? AND location_id=?",
+                      (component_id, location_id)).fetchone()
+    return int(row["qty"]) if row else 0
 
 
 def component_row(row) -> dict:
@@ -236,7 +246,7 @@ def list_components(ctx: Ctx, m):
     # base = 关键字 / 品类 / 厂家。分面(封装、单位)只按 base 算,不把用户已经选中的
     # 封装、单位、值区间也叠进去 —— 否则选定一个封装之后别的封装就从下拉里消失,
     # 想换个封装看看都不行了。
-    base_where, base_args = [], []
+    base_where, base_args = ["c.merged_into IS NULL"], []
     keyword = ctx.q("q")
     if keyword:
         like = f"%{keyword}%"
@@ -489,13 +499,14 @@ def delete_component(ctx: Ctx, m):
 @route("GET", r"/api/meta")
 def meta(ctx: Ctx, m):
     cats = [r["category"] for r in ctx.con.execute(
-        "SELECT DISTINCT category FROM component WHERE category IS NOT NULL ORDER BY category")]
+        "SELECT DISTINCT category FROM component WHERE category IS NOT NULL "
+        "AND merged_into IS NULL ORDER BY category")]
     pkgs = [r["package"] for r in ctx.con.execute(
         "SELECT DISTINCT package FROM component WHERE package IS NOT NULL AND package<>'' "
-        "ORDER BY package LIMIT 200")]
+        "AND merged_into IS NULL ORDER BY package LIMIT 200")]
     mfrs = [r["manufacturer"] for r in ctx.con.execute(
         "SELECT DISTINCT manufacturer FROM component WHERE manufacturer IS NOT NULL "
-        "AND manufacturer<>'' ORDER BY manufacturer LIMIT 200")]
+        "AND manufacturer<>'' AND merged_into IS NULL ORDER BY manufacturer LIMIT 200")]
     return 200, {
         "categories": sorted(set(cats) | set(CATEGORY_SUGGESTIONS)),
         "filters": {"categories": cats, "packages": pkgs, "manufacturers": mfrs},
@@ -641,7 +652,7 @@ def stocktake_location(ctx: Ctx, m):
             continue
         _bump(ctx.con, cid, lid, qty - was)
         _log_move(ctx.con, "ADJUST", cid, lid, qty, ref=ctx.b("ref"),
-                  operator=ctx.b("operator"),
+                  operator=ctx.b("operator"), qty_before=was,
                   note=f"盘点 {loc['code']}:账面 {was} → 实盘 {qty}")
         changed.append({"component_id": cid, "name": comp["name"], "was": was, "now": qty})
     ctx.con.commit()
@@ -693,14 +704,17 @@ def location_contents(ctx: Ctx, m):
 
 
 def _log_move(con, kind, component_id, location_id, qty, *, to_location_id=None,
-              project_id=None, ref=None, operator=None, note=None) -> int:
-    """写一条流水。出入库和盘点都走这里,免得两处字段顺序对不上。"""
+              project_id=None, purchase_id=None, ref=None, operator=None, note=None,
+              qty_before=None, void_of=None) -> int:
+    """写一条流水。出入库、盘点、领料、到货和撤销都走这里,
+    免得几处 INSERT 的字段顺序各写各的、漏字段。"""
     cur = con.execute(
         """INSERT INTO movement(kind, component_id, location_id, to_location_id, qty,
-                                project_id, ref, operator, note)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
+                                project_id, purchase_id, ref, operator, note,
+                                qty_before, void_of)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
         (kind, component_id, location_id, to_location_id, qty, project_id,
-         ref, operator or "本地用户", note),
+         purchase_id, ref, operator or "本地用户", note, qty_before, void_of),
     )
     db.touch_component(con, component_id)
     return int(cur.lastrowid)
@@ -800,27 +814,136 @@ def stock_move(ctx: Ctx, m):
         raise ApiError(400, "数量必须大于 0")
 
     if kind == "IN":
+        before = _qty_at(ctx.con, cid, loc)
         after = _bump(ctx.con, cid, loc, qty)
     elif kind == "OUT":
+        before = _qty_at(ctx.con, cid, loc)
         after = _bump(ctx.con, cid, loc, -qty)
     elif kind == "ADJUST":
-        row = ctx.con.execute("SELECT qty FROM stock WHERE component_id=? AND location_id=?",
-                              (cid, loc)).fetchone()
-        old = int(row["qty"]) if row else 0
-        after = _bump(ctx.con, cid, loc, qty - old)
-        ctx.body["note"] = (ctx.b("note") or "") + f"（盘点:原 {old} → 新 {qty}）"
+        before = _qty_at(ctx.con, cid, loc)
+        after = _bump(ctx.con, cid, loc, qty - before)
+        # 盘点记录里的 qty 是「新数量」,所以必须把「原来多少」也存下来,
+        # 否则以后没法撤销它
+        ctx.body["note"] = (ctx.b("note") or "") + f"（盘点:原 {before} → 新 {qty}）"
     else:  # TRANSFER
+        before = _qty_at(ctx.con, cid, loc)
         _bump(ctx.con, cid, loc, -qty)
         after = _bump(ctx.con, cid, to_loc, qty)
 
     mid = _log_move(ctx.con, kind, cid, loc, qty, to_location_id=to_loc,
                     project_id=ctx.bi("project_id"), ref=ctx.b("ref"),
-                    operator=ctx.b("operator"), note=ctx.b("note"))
+                    operator=ctx.b("operator"), note=ctx.b("note"),
+                    qty_before=before)
     ctx.con.commit()
 
     on_hand = db.stock_total(ctx.con, cid)
     return 200, {"ok": True, "movement_id": mid, "qty_at_location": after,
                  "on_hand": on_hand}
+
+
+@route("POST", r"/api/movements/(\d+)/void")
+def void_movement(ctx: Ctx, m):
+    """撤销一条出入库 / 盘点 / 移库记录。
+
+    做法是**写一条反向流水**并把原记录标记成「已撤销」,而不是把原记录删掉。
+    原因:这套东西的口径是「流水只增不改,余额随时能按流水重建」——
+    删记录的话余额就重建不出来了,而且事后查不出「那天到底是谁把它改成这样的」。
+    反向流水本身也是一笔正常流水,所以重建逻辑一行都不用改。
+
+    还原规则按动作分:
+      IN       → 从原仓位减回去
+      OUT      → 加回原仓位
+      ADJUST   → 回到盘点前的数量(靠流水里的 qty_before)
+      TRANSFER → 从目标仓位挪回原仓位
+    """
+    mid = int(m.group(1))
+    mv = ctx.con.execute("SELECT * FROM movement WHERE id=?", (mid,)).fetchone()
+    if not mv:
+        raise ApiError(404, "这条记录不存在")
+    if mv["voided"]:
+        raise ApiError(409, "这条已经撤销过了")
+    if mv["void_of"]:
+        raise ApiError(409, "这本身就是一条撤销记录,不能再撤销")
+
+    kind = mv["kind"]
+    cid, qty = int(mv["component_id"]), int(mv["qty"])
+    loc, to_loc = mv["location_id"], mv["to_location_id"]
+    comp = ctx.con.execute("SELECT name FROM component WHERE id=?", (cid,)).fetchone()
+    who = comp["name"] if comp else f"#{cid}"
+
+    # 反向流水自己也要记下「改动前是多少」,否则它将来同样撤销不了。
+    # 注意 TRANSFER 的反向是从 to_loc 挪回 loc,所以 qty_before 取的是 to_loc 的。
+    if kind == "IN":
+        was = _qty_at(ctx.con, cid, loc)
+        _bump(ctx.con, cid, loc, -qty)
+        back = {"kind": "OUT", "location_id": loc, "to_location_id": None,
+                "qty": qty, "qty_before": was}
+    elif kind == "OUT":
+        was = _qty_at(ctx.con, cid, loc)
+        _bump(ctx.con, cid, loc, qty)
+        back = {"kind": "IN", "location_id": loc, "to_location_id": None,
+                "qty": qty, "qty_before": was}
+    elif kind == "ADJUST":
+        if mv["qty_before"] is None:
+            # 老版本(v2 之前)的盘点记录没存 qty_before,还原不了 —— 宁可拒绝
+            raise ApiError(409, "这条盘点记录是旧版本写的,没留下原来的数量,"
+                                "没法自动撤销;请手动盘点回正确的数量")
+        was = _qty_at(ctx.con, cid, loc)
+        _bump(ctx.con, cid, loc, int(mv["qty_before"]) - was)
+        back = {"kind": "ADJUST", "location_id": loc, "to_location_id": None,
+                "qty": int(mv["qty_before"]), "qty_before": was}
+    else:  # TRANSFER
+        was = _qty_at(ctx.con, cid, to_loc)
+        _bump(ctx.con, cid, to_loc, -qty)
+        _bump(ctx.con, cid, loc, qty)
+        back = {"kind": "TRANSFER", "location_id": to_loc, "to_location_id": loc,
+                "qty": qty, "qty_before": was}
+
+    new_id = _log_move(
+        ctx.con, back["kind"], cid, back["location_id"], back["qty"],
+        to_location_id=back.get("to_location_id"),
+        project_id=mv["project_id"], ref=mv["ref"], operator=ctx.b("operator"),
+        note=f"撤销 #{mid}({who} {KIND_LABEL.get(kind, kind)} {qty})",
+        qty_before=back.get("qty_before"), void_of=mid)
+    ctx.con.execute("UPDATE movement SET voided=1 WHERE id=?", (mid,))
+
+    # 撤销「采购到货」时,采购单的已收数量也得退回去 —— 否则那张单永远收不完,
+    # 而且「在途」会一直少算这一笔
+    if mv["purchase_id"] and kind == "IN":
+        pur = ctx.con.execute("SELECT qty, received FROM purchase WHERE id=?",
+                              (mv["purchase_id"],)).fetchone()
+        if pur:
+            got = max(0, int(pur["received"]) - qty)
+            ctx.con.execute("UPDATE purchase SET received=?, status=? WHERE id=?",
+                            (got, "arrived" if got >= int(pur["qty"]) else "ordered",
+                             mv["purchase_id"]))
+
+    ctx.con.commit()
+    return 200, {"ok": True, "movement_id": new_id, "voided": mid,
+                 "on_hand": db.stock_total(ctx.con, cid), "name": who}
+
+
+@route("GET", r"/api/movements/last")
+def last_movement(ctx: Ctx, m):
+    """最近一笔还能撤销的流水。给「撤销上一次出入库」用。
+
+    已撤销的(voided)和撤销记录本身(void_of)都要排除 —— 否则连按两次 Ctrl+Z
+    会一直撤销那条撤销记录。
+    """
+    row = ctx.con.execute(
+        """SELECT mv.*, c.name AS component_name,
+                  l.code AS location_code, tl.code AS to_location_code
+           FROM movement mv
+           JOIN component c ON c.id = mv.component_id
+           LEFT JOIN location l  ON l.id  = mv.location_id
+           LEFT JOIN location tl ON tl.id = mv.to_location_id
+           WHERE mv.voided = 0 AND mv.void_of IS NULL
+           ORDER BY mv.id DESC LIMIT 1""").fetchone()
+    if not row:
+        return 200, {"movement": None}
+    out = db.row_to_dict(row)
+    out["kind_label"] = KIND_LABEL.get(out["kind"], out["kind"])
+    return 200, {"movement": out}
 
 
 @route("GET", r"/api/movements")
@@ -861,7 +984,9 @@ def lowstock(ctx: Ctx, m):
 @route("GET", r"/api/summary")
 def summary(ctx: Ctx, m):
     con = ctx.con
-    comps = con.execute("SELECT COUNT(*) AS n FROM component").fetchone()["n"]
+    # 已合并掉的元件不算数(它们的库存早就并给保留的那条了)
+    comps = con.execute("SELECT COUNT(*) AS n FROM component WHERE merged_into IS NULL"
+                        ).fetchone()["n"]
     lots = con.execute("SELECT COALESCE(SUM(qty),0) AS n FROM stock").fetchone()["n"]
     low = con.execute(
         f"SELECT COUNT(*) AS n FROM ({COMPONENT_SELECT}) WHERE stock_state='low'").fetchone()["n"]
@@ -878,9 +1003,214 @@ def summary(ctx: Ctx, m):
     by_cat = [db.row_to_dict(r) for r in con.execute(
         """SELECT c.category, COUNT(*) AS kinds,
                   COALESCE(SUM((SELECT SUM(qty) FROM stock s WHERE s.component_id=c.id)),0) AS qty
-           FROM component c GROUP BY c.category ORDER BY kinds DESC""")]
+           FROM component c WHERE c.merged_into IS NULL
+           GROUP BY c.category ORDER BY kinds DESC""")]
     return 200, {"components": comps, "total_qty": lots, "low": low, "out": out,
                  "projects": projs, "recent": recent, "by_category": by_cat}
+
+
+# ------------------------------------------------------------------ 查重与合并
+
+# 查重的三档依据,按「有多确定」排。前两档几乎可以肯定是重复,第三档只是可疑 ——
+# 所以界面上要分档显示,让人自己判断,而不是替他把「可疑」当「确定」处理。
+DUP_RULES = (
+    ("mpn", "厂家料号相同", "同一个厂家料号在库里出现了多次,基本可以确定是重复录入"),
+    ("name", "名称完全相同", "名字一模一样的两条,一般是反复导入 BOM 长出来的"),
+    ("vf", "值 + 封装相同", "没有料号可依,只能按「值 + 封装 + 品类」判断;"
+                            "请自己确认是不是同一个东西(比如不同耐压的电容会长得一样)"),
+)
+
+
+@route("GET", r"/api/components/duplicates")
+def component_duplicates(ctx: Ctx, m):
+    """找出可疑的重复元件。
+
+    为什么需要它:BOM 是反复导入的,而不同时期的 BOM 里同一个料可能一条带料号、
+    一条只有值+封装 —— 于是一个元件在库里长成两三条,库存还被分散记着。
+    这类「数据腐烂」不会自己好,只会越来越难收拾,所以得有个工具定期扫一遍。
+    """
+    con = ctx.con
+    groups, seen_pairs = [], set()
+
+    def items_of(ids):
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        return [component_row(r) for r in con.execute(
+            COMPONENT_SELECT + f" WHERE c.id IN ({marks}) ORDER BY c.id", ids)]
+
+    def add(reason, title, sql, key_sql):
+        rows = con.execute(sql).fetchall()
+        for r in rows:
+            ids = [int(x) for x in r["ids"].split(",")]
+            if len(ids) < 2:
+                continue
+            pair = tuple(sorted(ids))
+            if (reason, pair) in seen_pairs:
+                continue
+            seen_pairs.add((reason, pair))
+            groups.append({"reason": reason, "title": title,
+                           "key": key_sql(r), "items": items_of(ids),
+                           "hint": dict((k, h) for k, _t, h in DUP_RULES)[reason]})
+
+    base = ("FROM component WHERE merged_into IS NULL "
+            "AND {col} IS NOT NULL AND TRIM({col}) <> '' "
+            "GROUP BY UPPER(TRIM({col})) HAVING COUNT(*) > 1")
+    add("mpn", "厂家料号相同",
+        "SELECT GROUP_CONCAT(id) AS ids, TRIM(mpn) AS k " + base.format(col="mpn"),
+        lambda r: r["k"])
+    add("name", "名称完全相同",
+        "SELECT GROUP_CONCAT(id) AS ids, TRIM(name) AS k " + base.format(col="name"),
+        lambda r: r["k"])
+    add("vf", "值 + 封装相同",
+        "SELECT GROUP_CONCAT(id) AS ids, "
+        "       COALESCE(value,'') || ' / ' || COALESCE(package,'') AS k "
+        "FROM component WHERE merged_into IS NULL "
+        "AND COALESCE(value,'') <> '' AND COALESCE(package,'') <> '' "
+        "GROUP BY UPPER(TRIM(COALESCE(value,'')) || '|' || TRIM(COALESCE(package,'')) "
+        "        || '|' || TRIM(COALESCE(category,''))) HAVING COUNT(*) > 1",
+        lambda r: r["k"])
+
+    order = {k: i for i, (k, _t, _h) in enumerate(DUP_RULES)}
+    groups.sort(key=lambda g: (order.get(g["reason"], 9), g["key"]))
+    return 200, {"groups": groups, "count": len(groups),
+                 "extra": sum(len(g["items"]) - 1 for g in groups)}
+
+
+@route("POST", r"/api/components/merge")
+def merge_components(ctx: Ctx, m):
+    """把几个重复元件并成一个。
+
+    body: {"keep": 保留哪个 id, "drop": [要并掉的 id, ...]}
+
+    **被并掉的不删,只标 merged_into**。理由是:它名下挂着真实的收发货流水,
+    而 movement.component_id 是 ON DELETE CASCADE —— 直接删元件会把那些历史
+    一起带走,账就再也重建不出来了。标一下既能让列表干净,又能保住来龙去脉,
+    万一合错了还能查回原样。
+    """
+    keep = ctx.bi("keep")
+    drop = [int(x) for x in (ctx.b("drop") or [])]
+    if not keep:
+        raise ApiError(400, "要指定保留哪一个元件")
+    if not drop:
+        raise ApiError(400, "要指定并入哪些元件")
+    drop = [d for d in dict.fromkeys(drop) if d != keep]
+    if not drop:
+        raise ApiError(400, "并入的不能就是保留的那一个")
+
+    con = ctx.con
+    keeper = con.execute("SELECT * FROM component WHERE id=?", (keep,)).fetchone()
+    if not keeper:
+        raise ApiError(404, f"要保留的元件 {keep} 不存在")
+    if keeper["merged_into"]:
+        raise ApiError(409, "要保留的这个本身已经被合并过了")
+    kname = keeper["name"]
+
+    moved_bom = moved_po = moved_stock = 0
+    for did in drop:
+        d = con.execute("SELECT * FROM component WHERE id=?", (did,)).fetchone()
+        if not d:
+            raise ApiError(404, f"元件 {did} 不存在")
+        if d["merged_into"]:
+            raise ApiError(409, f"「{d['name']}」已经被合并过了")
+
+        # 1) 身份字段:保留的那条缺什么就补什么。
+        #    lcsc_pn 上有 UNIQUE 约束,想把它挪过来就必须先把被并的那条清掉,
+        #    否则两条会同时占着同一个编号,SQLite 直接拒。mpn 没这个约束,
+        #    就留着不清 —— 它在「已合并」列表里还能告诉你这条原来是什么料。
+        if d["lcsc_pn"] and not keeper["lcsc_pn"]:
+            con.execute("UPDATE component SET lcsc_pn=? WHERE id=?", (d["lcsc_pn"], keep))
+            con.execute("UPDATE component SET lcsc_pn=NULL WHERE id=?", (did,))
+            keeper = con.execute("SELECT * FROM component WHERE id=?", (keep,)).fetchone()
+        fill, args = [], []
+        for col in ("mpn", "manufacturer", "package", "value", "marking",
+                    "datasheet_url", "product_url", "supplier", "default_loc_id",
+                    "category", "note"):
+            kval = con.execute(f"SELECT {col} AS v FROM component WHERE id=?",
+                               (keep,)).fetchone()["v"]
+            if not kval and d[col]:
+                fill.append(f"{col}=?")
+                args.append(d[col])
+        if fill:
+            con.execute(f"UPDATE component SET {', '.join(fill)} WHERE id=?",
+                        args + [keep])
+            keeper = con.execute("SELECT * FROM component WHERE id=?", (keep,)).fetchone()
+        # 合并前把数值列重算一遍:补进来的 value 可能来自被并的那条
+        db.set_value_num(con, keep, keeper["value"])
+
+        # 2) 库存:同一仓位相加,不同仓位直接把行改成保留的那条
+        for s in con.execute("SELECT location_id, qty FROM stock WHERE component_id=?",
+                             (did,)).fetchall():
+            have = con.execute("SELECT qty FROM stock WHERE component_id=? AND location_id=?",
+                               (keep, s["location_id"])).fetchone()
+            if have:
+                con.execute("UPDATE stock SET qty=qty+? WHERE component_id=? AND location_id=?",
+                            (s["qty"], keep, s["location_id"]))
+                con.execute("DELETE FROM stock WHERE component_id=? AND location_id=?",
+                            (did, s["location_id"]))
+            else:
+                con.execute("UPDATE stock SET component_id=? WHERE component_id=? AND location_id=?",
+                            (keep, did, s["location_id"]))
+            moved_stock += 1
+
+        # 3) BOM 行:同一个项目里两边都有这一行的话,把两行并成一行(用量相加、
+        #    位号拼起来)。不能直接改 component_id,那会撞上 (project_id, component_id)
+        #    的唯一性,或者留下两行同料。
+        for line in con.execute("SELECT * FROM project_bom WHERE component_id=?",
+                                (did,)).fetchall():
+            twin = con.execute(
+                "SELECT * FROM project_bom WHERE project_id=? AND component_id=?",
+                (line["project_id"], keep)).fetchone()
+            if twin:
+                con.execute(
+                    """UPDATE project_bom
+                       SET required_qty = required_qty + ?, placed_qty = placed_qty + ?,
+                           designators = TRIM(COALESCE(designators,'') || ' ' ||
+                                              COALESCE(?, '')),
+                           optional = MAX(optional, ?), consumable = MAX(consumable, ?)
+                       WHERE id=?""",
+                    (line["required_qty"], line["placed_qty"], line["designators"],
+                     line["optional"], line["consumable"], twin["id"]))
+                con.execute("DELETE FROM project_bom WHERE id=?", (line["id"],))
+            else:
+                con.execute("UPDATE project_bom SET component_id=? WHERE id=?",
+                            (keep, line["id"]))
+            moved_bom += 1
+
+        # 4) 替代料:撞上同一行同一个替代料就直接删掉多余的
+        for sub in con.execute("SELECT * FROM bom_substitute WHERE component_id=?",
+                               (did,)).fetchall():
+            if con.execute("SELECT 1 FROM bom_substitute WHERE bom_id=? AND component_id=?",
+                           (sub["bom_id"], keep)).fetchone():
+                con.execute("DELETE FROM bom_substitute WHERE id=?", (sub["id"],))
+            else:
+                con.execute("UPDATE bom_substitute SET component_id=? WHERE id=?",
+                            (keep, sub["id"]))
+        moved_po += con.execute("SELECT COUNT(*) AS n FROM purchase WHERE component_id=?",
+                                (did,)).fetchone()["n"]
+        con.execute("UPDATE purchase SET component_id=? WHERE component_id=?", (keep, did))
+
+        # 5) 流水**不动** —— 那是真实发生过的收发货,改了就不是历史了。
+        #    靠 merged_into 指向保留的那条,查的时候能追过去。
+        con.execute("UPDATE component SET merged_into=?, updated_at=? WHERE id=?",
+                    (keep, db.now(), did))
+
+    con.commit()
+    row = con.execute(COMPONENT_SELECT + " WHERE c.id=?", (keep,)).fetchone()
+    return 200, {"ok": True, "keep": component_row(row), "dropped": drop,
+                 "moved_bom_lines": moved_bom, "moved_stock_rows": moved_stock,
+                 "moved_purchases": moved_po, "name": kname}
+
+
+@route("GET", r"/api/components/merged")
+def merged_components(ctx: Ctx, m):
+    """已经并掉的元件(想看「当初并到哪儿去了」时用)。"""
+    rows = ctx.con.execute(
+        """SELECT c.id, c.name, c.mpn, c.lcsc_pn, c.merged_into,
+                  k.name AS keep_name, c.updated_at
+           FROM component c LEFT JOIN component k ON k.id = c.merged_into
+           WHERE c.merged_into IS NOT NULL ORDER BY c.updated_at DESC LIMIT 300""")
+    return 200, {"items": [db.row_to_dict(r) for r in rows]}
 
 
 @route("GET", r"/api/health")
@@ -1071,22 +1401,19 @@ def pick_for_project(ctx: Ctx, m):
                     if need <= 0:
                         break
                     take = min(need, int(s["qty"]))
+                    was = _qty_at(ctx.con, cid, s["location_id"])
                     _bump(ctx.con, cid, s["location_id"], -take)
-                    ctx.con.execute(
-                        """INSERT INTO movement(kind, component_id, location_id, qty,
-                                                project_id, ref, operator, note)
-                           VALUES('OUT',?,?,?,?,?,?,?)""",
-                        (cid, s["location_id"], take, pid, ctx.b("ref"),
-                         ctx.b("operator") or "本地用户", f"项目领料({proj['name']})"))
+                    _log_move(ctx.con, "OUT", cid, s["location_id"], take,
+                              project_id=pid, ref=ctx.b("ref"),
+                              operator=ctx.b("operator"), qty_before=was,
+                              note=f"项目领料({proj['name']})")
                     need -= take
                 avail = need
+            was = _qty_at(ctx.con, cid, loc_id)
             _bump(ctx.con, cid, loc_id, -avail)
-            ctx.con.execute(
-                """INSERT INTO movement(kind, component_id, location_id, qty, project_id,
-                                        ref, operator, note)
-                   VALUES('OUT',?,?,?,?,?,?,?)""",
-                (cid, loc_id, avail, pid, ctx.b("ref"), ctx.b("operator") or "本地用户",
-                 f"项目领料({proj['name']})"))
+            _log_move(ctx.con, "OUT", cid, loc_id, avail, project_id=pid,
+                      ref=ctx.b("ref"), operator=ctx.b("operator"), qty_before=was,
+                      note=f"项目领料({proj['name']})")
             ctx.con.execute(
                 """UPDATE project_bom SET placed_qty = placed_qty + ?
                    WHERE project_id=? AND component_id=?""", (qty, pid, cid))
@@ -1363,6 +1690,7 @@ def receive_purchase(ctx: Ctx, m):
         loc = comp["default_loc_id"] if comp and comp["default_loc_id"] else "未分类"
     loc_id = _get_location_id(ctx.con, loc)
 
+    was = _qty_at(ctx.con, row["component_id"], loc_id)
     _bump(ctx.con, row["component_id"], loc_id, qty)
     got = int(row["received"]) + qty
     done = got >= int(row["qty"])
@@ -1370,13 +1698,11 @@ def receive_purchase(ctx: Ctx, m):
         "UPDATE purchase SET received=?, status=?, arrived_at=? WHERE id=?",
         (got, "arrived" if done else "ordered",
          (row["arrived_at"] or db.now()) if done else None, pid))
-    ctx.con.execute(
-        """INSERT INTO movement(kind, component_id, location_id, qty, project_id,
-                                purchase_id, ref, operator, note)
-           VALUES('IN',?,?,?,?,?,?,?,?)""",
-        (row["component_id"], loc_id, qty, row["project_id"], pid,
-         ctx.b("ref") or f"PO-{pid}", ctx.b("operator") or "本地用户",
-         f"采购到货({row['supplier'] or '未填供应商'})"))
+    _log_move(ctx.con, "IN", row["component_id"], loc_id, qty,
+              project_id=row["project_id"], purchase_id=pid,
+              ref=ctx.b("ref") or f"PO-{pid}", operator=ctx.b("operator"),
+              qty_before=was,
+              note=f"采购到货({row['supplier'] or '未填供应商'})")
     db.touch_component(ctx.con, row["component_id"])
     ctx.con.commit()
     return 200, {"ok": True, "received": got, "outstanding": int(row["qty"]) - got,

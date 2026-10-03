@@ -169,6 +169,15 @@ def main() -> int:
         app.update()
         check_cards(app.tab_comp, "库存首页卡片")
 
+        # 首页右上角那排按钮越加越多,得看住搜索框别被挤没了 ——
+        # 搜索是这套东西的主入口,它被挤扁等于主要功能废掉
+        app.update_idletasks()
+        ew = app.tab_comp.ent_q.winfo_width()
+        if ew < 120:
+            bad(f"库存首页的搜索框只剩 {ew}px —— 被右上角那排按钮挤扁了(至少要 120)")
+        else:
+            p(f"  [OK ] 库存首页搜索框还有 {ew}px,没被按钮挤扁")
+
         # 二级页面的表在首页状态下没被 pack,不特意点进去就查不到 —— 那正是
         # 列最多、最容易溢出的那张表。开发库里可能一件库存都没有,所以有货的
         # 大类优先,没有就随便点一个,总之要把这张表显示出来。
@@ -202,6 +211,7 @@ def main() -> int:
     makers = [("快速入库", lambda: gui.QuickInDialog(app, app)),
               ("批量入库", lambda: gui.BatchInDialog(app, app)),
               ("新增元件", lambda: gui.ComponentDialog(app, app, None)),
+              ("查重与合并", lambda: gui.DedupeDialog(app, app)),
               ("选一个元件", lambda: gui.ComponentPicker(app, app))]
     row = app.con.execute(
         "SELECT id FROM location WHERE structural=0 ORDER BY id LIMIT 1").fetchone()
