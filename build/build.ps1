@@ -166,7 +166,7 @@ if (-not $selfPy) {
     Write-Host '  找不到可用的 Python,跳过自检(建议先手动跑一遍)' -ForegroundColor Yellow
 } else {
     foreach ($t in @('test_api.py', 'test_gui.py', 'check_layout.py',
-                     'cache\migrate_probe.py')) {
+                     'checks\migrate_probe.py')) {
         & $selfPy (Join-Path $Build $t) $Root | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "自检没过:build\$t —— 报告在 build\cache\ 里,先看清楚再发包"

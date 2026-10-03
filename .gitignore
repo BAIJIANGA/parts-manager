@@ -18,7 +18,20 @@ data/*.err
 *.log
 
 # 构建中间产物(内嵌 Python、编译出的启动器、自检输出)
+#
+# 注意:这一条把 build/cache/ 整个排除了,所以**放在里面的脚本也进不了版本库** ——
+# 而 .gitignore 不允许「只放行被排除目录里的某几个文件」。自检和探针脚本要进库,
+# 就得放在 build/checks/(见下),不能放在这里。
 build/cache/
+
+# 改代码前留的对照备份,只是干活时的临时东西
+app/*_before_*.py
+
+# 探针跑起来会复制一份数据库在边上,跑完自己会删;万一没删掉也别进库
+build/checks/*.db
+build/checks/*.db-wal
+build/checks/*.db-shm
+build/checks/_*.db
 
 # dist\ 里放的是可以直接双击运行的成品,本身就是产物,整个目录不进版本库
 #

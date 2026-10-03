@@ -1724,6 +1724,7 @@ class BomPaneBase(ttk.Frame):
         self.tree.bind("<Button-1>", self.on_click)
         self.tree.bind("<space>", self.on_space)
         self.tree.bind("<Double-1>", self.on_double)
+        self.setup_tree()
 
         foot = ttk.Frame(self)
         foot.pack(fill="x", pady=(4, 0))
@@ -1745,6 +1746,13 @@ class BomPaneBase(ttk.Frame):
 
     def extra_tools(self, bar):
         """子类往工具栏上再加自己的按钮。"""
+
+    def setup_tree(self):
+        """表格建好、默认绑定都装好之后,子类再挂自己的东西(右键菜单之类)。
+
+        放在这里而不是 __init__ 里的原因:子类要拿到 self.tree 才能挂,
+        而 self.tree 是 build_tree() 建出来的。
+        """
 
     def build_tree(self):
         raise NotImplementedError
@@ -1832,6 +1840,7 @@ class BomReceivePane(BomPaneBase):
     """
 
     SUBMIT = "✓ 勾选的全部入库"
+    ONE = "✓ 只入库选中这一行"
 
     COLS = [
         ("pick", "选", 34, "center", False),
@@ -1845,11 +1854,78 @@ class BomReceivePane(BomPaneBase):
         ("qty", "本次入库", 66, "e", False),
     ]
 
+    def extra_tools(self, bar):
+        # 批量按钮的字面意思是「全部」,而货常常只到了一部分。给一个字面意思就是
+        # 「只有这一行」的入口,人就不用靠「先清干净别的勾」来求安心了。
+        self.btn_one = ttk.Button(bar, text=self.ONE, command=self.receive_selected)
+        self.btn_one.pack(side="left", padx=(6, 0))
+
     def build_tree(self):
         f, t = make_tree(self, self.COLS, height=13)
         t.tag_configure("done", foreground="#1e7a34")
         t.tag_configure("short", background="#fff8e6")
         return f, t
+
+    def setup_tree(self):
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<Button-3>", self.on_right_click)
+        self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label=self.ONE, command=self.receive_selected)
+        self.menu.add_command(label="改本次入库数量…", command=self.edit_selected)
+        self.menu.add_separator()
+        self.menu.add_command(label="勾选这一行", command=lambda: self.set_checked(True))
+        self.menu.add_command(label="取消勾选", command=lambda: self.set_checked(False))
+
+    def on_select(self, _event=None):
+        """选中的是哪一行,直接写在按钮上 —— 免得点下去才发现选的是隔壁那行。"""
+        bid = self.selected_bid()
+        l = self._idx.get(bid) if bid is not None else None
+        if not l:
+            self.btn_one.configure(text=self.ONE)
+        else:
+            nm = str(l.get("name") or "")[:12]
+            pkg = str(l.get("package") or "")
+            self.btn_one.configure(text=f"✓ 只入库「{nm}{' ' + pkg if pkg else ''}」")
+
+    def on_right_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if row and self.is_checkable(row):
+            self.tree.selection_set(row)
+            self.menu.tk_popup(event.x_root, event.y_root)
+            self.menu.grab_release()
+        return "break"
+
+    def selected_bid(self):
+        """当前选中的那一行对应的 bom_id;没选、或选中的不是数据行就是 None。"""
+        sel = self.tree.selection()
+        if not sel or not self.is_checkable(sel[0]):
+            return None
+        return int(sel[0])
+
+    def edit_selected(self):
+        bid = self.selected_bid()
+        if bid is not None:
+            self.edit_qty(str(bid))
+
+    def set_checked(self, on):
+        bid = self.selected_bid()
+        if bid is None:
+            return
+        if on:
+            self.picked.add(bid)
+        else:
+            self.picked.discard(bid)
+        self.render()
+
+    def receive_selected(self):
+        bid = self.selected_bid()
+        if bid is None:
+            messagebox.showinfo(
+                "提示", "先在表里点一行 —— 「只入库这一行」得知道是哪一行。\n"
+                        "(要一次收多行,就在「选」那一列把它们勾上,再点右下角那个按钮。)",
+                parent=self)
+            return
+        self.move_rows([bid], single=True)
 
     def reload(self):
         data = call(self.con, server.project_bom, match=(str(self.project_id),),
@@ -1869,6 +1945,10 @@ class BomReceivePane(BomPaneBase):
         self.render()
 
     def render(self):
+        # 重画会清掉选中行,所以先记住。render() 大多是被「勾选一行」「改数量」
+        # 触发的 —— 不接回来的话,刚勾完选中就没了,接着点「只入库这一行」
+        # 会被问「先在表里点一行」,看起来像上一步操作把界面弄坏了。
+        keep = self.tree.selection()
         clear_tree(self.tree)
         self._idx = {}
         kw = self.q.get().strip().lower()
@@ -1889,6 +1969,12 @@ class BomReceivePane(BomPaneBase):
                 l.get("need") or 0, l.get("on_hand") or 0,
                 self.qty.get(bid, 0)),
                 tags=("done" if l.get("gap") == 0 else "short",))
+        # 把选中接回来(只接还在的),并让按钮上的字跟着更新
+        for iid in keep:
+            if self.tree.exists(str(iid)):
+                self.tree.selection_set(str(iid))
+                break
+        self.on_select()
         n = len(self.picked)
         total = sum(int(self.qty.get(b, 0) or 0) for b in self.picked)
         self.hint.set(f"显示 {shown} / {len(self.lines)} 行;" + self.moved_text(n, total))
@@ -1936,25 +2022,49 @@ class BomReceivePane(BomPaneBase):
         self.render()
 
     def submit(self):
+        """批量:把勾上的行一起收进来。"""
         if not self.project_id:
             messagebox.showinfo("提示", "先在左边选一个项目。", parent=self)
             return
-        items = [{"component_id": self._idx[b]["component_id"], "qty": int(q),
-                  "bom_id": b, "note": self.note.get().strip()}
-                 for b, q in self.qty.items()
-                 if b in self.picked and int(q or 0) > 0 and b in self._idx]
-        if not items:
-            messagebox.showinfo(
-                "提示", "还没有勾选要入库的行。\n"
-                        "在「选」那一列点一下就能勾上;数量默认是 BOM 需求,\n"
-                        "双击一行可以改。", parent=self)
+        self.move_rows([b for b in self.qty if b in self.picked])
+
+    def move_rows(self, bids, single=False):
+        """把这几行按「本次入库」收进来。批量入库和单个入库**共用这一条路**。
+
+        必须共用:两条路要是各写一份确认和落库,迟早只有一条记得挡「数量是 0」
+        「没选仓位」「这个项目还没选」,而这种分叉恰恰会在收料的时候出事。
+        差别只在措辞(「这一行」还是「勾选的 N 行」)。
+        """
+        if not self.project_id:
+            messagebox.showinfo("提示", "先在左边选一个项目。", parent=self)
             return
+        rows = [b for b in bids if b in self._idx and int(self.qty.get(b, 0) or 0) > 0]
+        if not rows:
+            messagebox.showinfo(
+                "提示",
+                "这一行的「本次入库」是 0,没什么可收的。\n双击那一行可以改数量。"
+                if single else
+                "还没有勾选要入库的行。\n"
+                "在「选」那一列点一下就能勾上;数量默认是 BOM 需求,\n"
+                "双击一行可以改。想在哪儿收哪一行,就选中它用「只入库这一行」。",
+                parent=self)
+            return
+        # 名字撞车是常态(100nF 0603 和 100nF 0805 都叫 100nF),确认框里带上封装,
+        # 否则人看到两行一模一样的「100nF」根本分不清自己收的是哪颗
+        def label(b):
+            l = self._idx[b]
+            pkg = str(l.get("package") or "")
+            return f"{l.get('name') or ''}{' ' + pkg if pkg else ''}"
+
+        items = [{"component_id": self._idx[b]["component_id"],
+                  "qty": int(self.qty.get(b, 0) or 0),
+                  "bom_id": b, "note": self.note.get().strip()} for b in rows]
         total = sum(i["qty"] for i in items)
+        what = "这一行" if single else f"勾选的 {len(items)} 行"
         if not messagebox.askyesno(
                 "确认入库",
-                f"要把勾选的 {len(items)} 行、共 {total} 个收进来吗?\n\n"
-                + "\n".join(f"  {self._idx[i['bom_id']].get('name')}  ×{i['qty']}"
-                            for i in items[:10])
+                f"要把{what}、共 {total} 个收进来吗?\n\n"
+                + "\n".join(f"  {label(i['bom_id'])}  ×{i['qty']}" for i in items[:10])
                 + ("\n  …" if len(items) > 10 else ""), parent=self):
             return
         res = call(self.con, server.stock_batch,
@@ -1966,7 +2076,10 @@ class BomReceivePane(BomPaneBase):
         if res is None:
             return
         got, bad = len(res.get("done") or []), res.get("failed") or []
-        self.picked.clear()
+        # 只清掉这次真收了的行。原来是一把全清 —— 单个入库时那会把别的勾也抹掉,
+        # 正要接着收第二行的人得重新勾一遍
+        for b in rows:
+            self.picked.discard(b)
         self.note.set("")
         if bad:
             messagebox.showwarning(
@@ -2072,6 +2185,13 @@ class BomPickPane(BomPaneBase):
         self._idx = {}
         kw = self.q.get().strip().lower()
         shown = 0
+        # 显示名现在只放值,所以同值的两条需求(100nF 0603 / 100nF 0805)在这棵树里
+        # 会长得一模一样 —— 它们本来是不同的两条。只在真撞车时才把封装补进树列:
+        # 平时封装已经单独占一列,不必重复。补的是显示层的兜底,不参与任何匹配。
+        dup = {}
+        for l in self.lines:
+            nm = str(l.get("name") or "")
+            dup[nm] = dup.get(nm, 0) + 1
         for l in self.lines:
             bid = l["bom_id"]
             if kw and kw not in " ".join(
@@ -2082,7 +2202,11 @@ class BomPickPane(BomPaneBase):
             rem, used = self.remain(bid), self.used(bid)
             need = int(l.get("need") or 0)
             mark = "✓ 齐了" if rem == 0 else f"还差 {rem}"
-            text = f"{l.get('name') or ''}  ×{need}   [{mark}]"
+            nm = str(l.get("name") or "")
+            pkg = str(l.get("package") or "").strip()
+            # 只在同名出现不止一次时补封装,而且是补在树列上当作区分用的后缀
+            text = f"{nm}{' ' + pkg if pkg and dup.get(nm, 0) > 1 else ''}" \
+                   f"  ×{need}   [{mark}]"
             tags = ["line"]
             if rem == 0 and need:
                 tags.append("covered")
@@ -2615,6 +2739,162 @@ class StockTab(ttk.Frame):
 
 # --------------------------------------------------------------------- 项目 BOM
 
+class LineDetail(ttk.Frame):
+    """BOM 明细右边那块详情面板:点一行就看它。
+
+    为什么是一块常驻面板,而不是再开一个弹窗:BOM 明细本身就是「一行一行核对」的
+    界面,核对时反复要看的正是「这颗料库里到底是什么、还剩多少」。弹窗会盖住那张表,
+    关掉又得重新找回到哪一行了 —— 常驻面板才对得上这个动作。
+
+    品类做成**可编辑**下拉(不是只读),因为品类本来就靠人判断:光耦、传感器模块
+    这类东西推不出来,只能自己填。只给一个固定清单的话,用户只能挑一个最接近的
+    凑合,等于把「它猜错了」换成「我被迫选了个不准确的」。
+    """
+
+    #: 需求那一段的字段:界面标签 → build_report() 里 line 的键
+    NEED_FIELDS = [
+        ("单块用量", "per_board"), ("损耗", "attrition"), ("固定损耗", "setup_qty"),
+        ("需求", "need"), ("已发料", "placed_qty"), ("还需要", "remaining"),
+        ("现有", "on_hand"), ("替代", "sub_qty"), ("缺口", "gap"),
+    ]
+
+    def __init__(self, parent, app: App):
+        super().__init__(parent, padding=(8, 0, 0, 0))
+        self.app = app
+        self.con = app.con
+        self.line = None
+        self.comp = None
+        self._cats = []
+
+        req = ttk.LabelFrame(self, text="这条需求", padding=5)
+        req.pack(fill="x")
+        # 一行两对,不是三对 —— 三对时这个框请求 248px,是整个右侧最宽的一个,
+        # 会被 Panedwindow 拿去当最小宽度,把左边的项目列表一起挤窄。
+        # 一行两对只请求约 174px,九个字段排五行,反而更好读。
+        self.v = {}
+        for i, (label, key) in enumerate(self.NEED_FIELDS):
+            row, col = divmod(i, 2)
+            ttk.Label(req, text=label, style="Dim.TLabel").grid(
+                row=row, column=col * 2, sticky="e", padx=(0, 3), pady=1)
+            var = tk.StringVar(value="—")
+            self.v[key] = var
+            ttk.Label(req, textvariable=var).grid(
+                row=row, column=col * 2 + 1, sticky="w", padx=(0, 14), pady=1)
+
+        box = ttk.LabelFrame(self, text="这颗元件", padding=5)
+        box.pack(fill="x", pady=(8, 0))
+        self.v2 = {}
+        rows = [("值", "value"), ("封装", "package"), ("立创编号", "lcsc_pn"),
+                ("厂家料号", "mpn"), ("现有库存", "on_hand_total"), ("所在仓位", "locs")]
+        for i, (label, key) in enumerate(rows):
+            ttk.Label(box, text=label, style="Dim.TLabel").grid(
+                row=i, column=0, sticky="e", padx=(0, 4), pady=1)
+            var = tk.StringVar(value="—")
+            self.v2[key] = var
+            # wraplength 直接决定这块面板的请求宽度 —— 它就是被 Panedwindow
+            # 拿去算最小宽度的那一项,调大会把左边两张表一起挤窄
+            ttk.Label(box, textvariable=var, wraplength=132, justify="left").grid(
+                row=i, column=1, sticky="w", pady=1)
+
+        # 品类:能下拉挑,也能直接打字
+        r = len(rows)
+        ttk.Label(box, text="品类", style="Dim.TLabel").grid(
+            row=r, column=0, sticky="e", padx=(0, 4), pady=(4, 1))
+        self.cat = tk.StringVar()
+        self.cb_cat = ttk.Combobox(box, textvariable=self.cat, width=13)
+        self.cb_cat.grid(row=r, column=1, sticky="w", pady=(4, 1))
+        self.cb_cat.bind("<<ComboboxSelected>>", lambda _e: self.save_category())
+        self.cb_cat.bind("<Return>", lambda _e: self.save_category())
+        ttk.Button(box, text="保存品类", command=self.save_category).grid(
+            row=r + 1, column=1, sticky="w", pady=(3, 0))
+        box.columnconfigure(1, weight=1)
+
+        self.tip = tk.StringVar()
+        ttk.Label(self, textvariable=self.tip, style="Dim.TLabel",
+                  wraplength=170, justify="left").pack(fill="x", pady=(6, 0))
+        self.clear()
+
+    # ------------------------------------------------------------ 取值
+
+    def category_options(self):
+        """品类候选 = 内置清单 + 库里已经在用的(和导入复核窗口同一份)。"""
+        if not self._cats:
+            meta = call(self.con, server.meta, quiet=True) or {}
+            self._cats = list(meta.get("categories") or [])
+        return self._cats
+
+    def clear(self):
+        self.line = None
+        self.comp = None
+        for var in self.v.values():
+            var.set("—")
+        for var in self.v2.values():
+            var.set("—")
+        self.cat.set("")
+        self.cb_cat.configure(values=[])
+        self.cb_cat.state(["!disabled"])
+        self.tip.set("先在左边点一行物料,这里就显示它的属性。")
+
+    def show(self, line):
+        """把一行物料摊开在这块面板上。line 就是 project_bom 报告里的一行。"""
+        if not line:
+            self.clear()
+            return
+        self.line = line
+        for key, var in self.v.items():
+            raw = line.get(key)
+            if key == "attrition":
+                var.set(f"{float(raw or 0):g}%")
+            elif raw is None or raw == "":
+                var.set("—")
+            else:
+                var.set(str(raw))
+        # 这颗料从库里取全 —— 报告里只有「这个项目要用的那几个数」,
+        # 库存分布、料号这些得看元件本身
+        cid = line.get("component_id")
+        comp = call(self.con, server.get_component, match=(str(cid),), quiet=True) if cid else None
+        self.comp = comp or {}
+        for key in ("value", "package", "lcsc_pn", "mpn"):
+            self.v2[key].set(str(self.comp.get(key) or "—"))
+        stock = self.comp.get("stock_by_location") or []
+        unit = self.comp.get("unit") or "个"
+        total = sum(int(s.get("qty") or 0) for s in stock)
+        self.v2["on_hand_total"].set(f"{total} {unit}" if total else f"0 {unit}")
+        self.v2["locs"].set("  ".join(f"{s.get('code')}:{s.get('qty')}" for s in stock)
+                            or "库里一颗都没有")
+        self.cb_cat.configure(values=self.category_options())
+        self.cat.set(str(self.comp.get("category") or ""))
+        self.tip.set("品类可以直接改,改完按回车或点「保存品类」。")
+
+    # ------------------------------------------------------------ 存
+
+    def save_category(self):
+        if not self.comp:
+            messagebox.showinfo("提示", "先在左边点一行物料。", parent=self)
+            return
+        want = (self.cat.get() or "").strip()
+        if not want:
+            messagebox.showinfo(
+                "提示", "品类不能是空的。\n认不出来的话,填一个最接近的也比空着强 —— "
+                        "空着以后搜不到它。", parent=self)
+            return
+        if want == (self.comp.get("category") or ""):
+            self.app.set_status("品类没变,不用保存")
+            return
+        res = call(self.con, server.update_component,
+                   match=(str(self.comp["id"]),), body={"category": want}, parent=self)
+        if res is None:
+            return
+        old = self.comp.get("category") or "未分类"
+        self.comp["category"] = want
+        if self.line is not None:
+            self.line["category"] = want
+        self.app.set_status(
+            f"「{self.comp.get('name') or ''}」的品类:{old} → {want}", 6)
+        # 品类会出现在 BOM 明细、入库清单、出库分配树上,三处都得跟着走
+        self.app.refresh_all()
+
+
 class ProjectsTab(ttk.Frame):
     def __init__(self, parent, app: App):
         super().__init__(parent, padding=8)
@@ -2682,23 +2962,39 @@ class ProjectsTab(ttk.Frame):
         ttk.Label(tools, text="双击一行可直接改用量/损耗/可选/免点。",
                   style="Dim.TLabel").pack(side="left", padx=8)
 
-        f2, self.t_bom = make_tree(detail, [
-            ("name", "名称", 150, "w", True),
-            ("lcsc_pn", "立创编号", 80, "center"),
-            ("value", "值", 62, "w"),
-            ("package", "封装", 80, "w"),
-            ("per_board", "单块", 42, "e"),
-            ("attrition", "损耗", 44, "e"),
-            ("need", "需求", 48, "e"),
-            ("on_hand", "现有", 48, "e"),
-            ("sub_qty", "替代", 44, "e"),
-            ("gap", "缺口", 48, "e"),
-            ("flag", "标记", 56, "center"),
-            ("designators", "位号", 140, "w", True)], height=16)
+        # 树 + 右侧详情面板。分栏只加在这一个子页签内部,三个子页签的整体结构不动 ——
+        # 那三页的可用宽度是逐个量过的(check_layout.py),整体改结构会把它们挤坏
+        split = ttk.Panedwindow(detail, orient="horizontal")
+        split.pack(fill="both", expand=True)
+
+        bom_side = ttk.Frame(split)
+        # 列宽合计 640:这一页右边多了详情面板,原本 842 的账放不下了。
+        # 让出来的是「名称」和「位号」这两个拉伸列 —— 它们本来就会吃掉剩余空间,
+        # 收窄它们的基准宽度不损失信息;详情面板里能看到完整的名字。
+        f2, self.t_bom = make_tree(bom_side, [
+            ("name", "名称", 104, "w", True),
+            ("lcsc_pn", "立创编号", 62, "center"),
+            ("value", "值", 50, "w"),
+            ("package", "封装", 58, "w"),
+            ("per_board", "单块", 36, "e"),
+            ("attrition", "损耗", 36, "e"),
+            ("need", "需求", 40, "e"),
+            ("on_hand", "现有", 38, "e"),
+            ("sub_qty", "替代", 36, "e"),
+            ("gap", "缺口", 40, "e"),
+            ("flag", "标记", 40, "center"),
+            ("designators", "位号", 100, "w", True)], height=16)
         f2.pack(fill="both", expand=True)
         self.t_bom.tag_configure("short", background="#ffe3e3")
         self.t_bom.tag_configure("done", foreground="#888")
         self.t_bom.bind("<Double-1>", lambda _e: self.edit_line())
+        # 单击就出详情。BOM 明细的动作本来就是「一行一行看过去」,
+        # 要求双击才给看等于把最常做的事藏起来
+        self.t_bom.bind("<<TreeviewSelect>>", self._on_bom_select)
+        split.add(bom_side, weight=3)
+
+        self.detail = LineDetail(split, app)
+        split.add(self.detail, weight=2)
         self.sub.add(detail, text="  BOM 明细  ")
 
         self.pane_in = MovePane(self.sub, app, "IN")
@@ -2766,6 +3062,14 @@ class ProjectsTab(ttk.Frame):
         self._pid = int(sel[0])
         self.load_bom()
         self._sync_panes()
+
+    def _on_bom_select(self, _event=None):
+        """BOM 明细里换了一行 → 右边详情跟着换。"""
+        sel = self.t_bom.selection()
+        if not sel:
+            self.detail.clear()
+            return
+        self.detail.show(self._lines.get(int(sel[0])))
 
     def similar_for_line(self):
         """拿 BOM 明细里选中那一行的值+封装,去库存里找相似。"""
@@ -2839,11 +3143,18 @@ class ProjectsTab(ttk.Frame):
     def load_bom(self):
         if not self._pid:
             return
+        # 重画之前先记住选中的是哪条需求 —— 品类一改就会全量刷新,
+        # 不记住的话面板会跳回「先在左边点一行物料」,人要重新找一遍刚才那行
+        keep = None
+        sel = self.t_bom.selection()
+        if sel and str(sel[0]).isdigit():
+            keep = int(sel[0])
         rep = call(self.con, server.project_bom, match=(self._pid,), quiet=True)
         clear_tree(self.t_bom)
         self._lines = {}
         self.report = rep or {}
         if not rep:
+            self.detail.clear()
             return
         proj = rep.get("project") or {}
         self.title.set(f"{proj.get('name') or ''}   计划 {rep['boards']} 块   "
@@ -2866,6 +3177,13 @@ class ProjectsTab(ttk.Frame):
                 line.get("sub_qty") or "", line.get("gap") or "",
                 " ".join(flags), line.get("designators") or ""),
                 tags=("short",) if line.get("gap") else ("done",))
+
+        # 把选中和详情面板接回来
+        if keep is not None and self.t_bom.exists(str(keep)):
+            self.t_bom.selection_set(str(keep))
+            self.detail.show(self._lines.get(keep))
+        else:
+            self.detail.clear()
 
         parts = []
         if rep["shortage_lines"]:

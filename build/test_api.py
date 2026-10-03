@@ -434,7 +434,10 @@ semi = write_csv("semi_bom.csv",
 _s, rep = call(server.bom_import, body={"project_name": "分号板"},
                upload=upload_of(semi))
 check("分号分隔的 CSV 也认得", rep["bom_lines"], 1)
-check("分号版的值读对了", rep["rows"][0]["name"], "LED 红 0805")
+check("分号版的值读对了", rep["rows"][0]["name"], "LED 红")
+check("名字里不再拼封装(封装有自己的一列,拼进去是重复的)",
+      CON.execute("SELECT package FROM component WHERE value='LED 红'"
+                  ).fetchone()[0], "0805")
 p("  ↑ 分隔符是按第一行里出现最多的那个猜的,不用手工改")
 
 # 预览接口对 CSV 不该去找 sheet
@@ -906,12 +909,18 @@ _s, rep = call(server.bom_import,
 check("人工改过的品类按行号落库", rep["rows"][0]["category"], "金属膜电阻")
 check("同一个值+封装,但行号没改的那行仍用推断结果",
       rep["rows"][1]["category"], "电容")
+# 这里必须按 component_id 查,**不能按 name**:这块板里 10k/F1 和 10k/F3 值相同、
+# 封装不同,名字都是 10k —— 名字本来就不唯一,拿它当键查会查到另一条去。
+# 这恰好就是 issue #1 的成因:名字以前被当成身份用。
+def cat_of(comp_id):
+    row = CON.execute("SELECT category FROM component WHERE id=?", (comp_id,)).fetchone()
+    return row[0] if row else None
+
+
 check("元件表里存的也确实是改过的那个词",
-      CON.execute("SELECT category FROM component WHERE name=?",
-                  (rep["rows"][0]["name"],)).fetchone()[0], "金属膜电阻")
+      cat_of(rep["rows"][0]["component_id"]), "金属膜电阻")
 check("人工改过之后不再显示成「认不出」",
-      CON.execute("SELECT category FROM component WHERE name=?",
-                  (rep["rows"][2]["name"],)).fetchone()[0], "其他")
+      cat_of(rep["rows"][2]["component_id"]), "其他")
 
 # 不改的时候行为不变:不传 categories 就全用推断结果
 _s, rep2 = call(server.bom_import, body={"project_name": "不做复核板"},
@@ -928,11 +937,22 @@ again = write_csv("review_again.csv",
 _s, pa = call(server.bom_preview, upload=upload_of(again))
 nm = pa["lines"][0]["name"]
 r_a = pa["lines"][0]["source_row"]
-cat_before = CON.execute("SELECT category FROM component WHERE name=?", (nm,)).fetchone()[0]
+check("名字就是值本身,后面不再跟封装", nm, "10k")
+# 按身份键定位这一条 —— 库里叫 10k 的不止一条(F1 / F3 两个封装)
+cid10k = CON.execute("SELECT id FROM component WHERE identity_key=?",
+                     (bom.identity_key("10k", "F1", None, None),)).fetchone()[0]
+
+
+def cat10k():
+    return CON.execute("SELECT category FROM component WHERE id=?",
+                       (cid10k,)).fetchone()[0]
+
+
+cat_before = cat10k()
 _s, _r = call(server.bom_import,
               body={"project_name": "人工复核板", "categories": {str(r_a): "合金电阻"}},
               upload=upload_of(again))
-cat_after = CON.execute("SELECT category FROM component WHERE name=?", (nm,)).fetchone()[0]
+cat_after = cat10k()
 check("元件已存在时,人工改的品类照样写进去了", cat_after, "合金电阻")
 check("而且确实和改之前不一样(说明真的写下去了)", cat_before != cat_after, True)
 check("导入报告里显示的也是人工指定的那个",
@@ -942,19 +962,15 @@ check("导入报告里显示的也是人工指定的那个",
 _s, pb = call(server.bom_preview, upload=upload_of(again))
 _s, _r2 = call(server.bom_import, body={"project_name": "人工复核板"},
                upload=upload_of(again))
-check("没有人工复核时,推断结果不会覆盖已有的品类",
-      CON.execute("SELECT category FROM component WHERE name=?", (nm,)).fetchone()[0],
-      "合金电阻")
+check("没有人工复核时,推断结果不会覆盖已有的品类", cat10k(), "合金电阻")
 check("推断出来的确实是另一个品类(电阻),它没被写进去",
       pb["lines"][0]["category"], "电阻")
 
 # 但空着的品类还是该由推断补上 —— 老元件当初没填品类,不能一直空着
-CON.execute("UPDATE component SET category='' WHERE name=?", (nm,))
+CON.execute("UPDATE component SET category='' WHERE id=?", (cid10k,))
 _s, _r3 = call(server.bom_import, body={"project_name": "人工复核板"},
                upload=upload_of(again))
-check("原来品类是空的,推断结果会补上",
-      CON.execute("SELECT category FROM component WHERE name=?", (nm,)).fetchone()[0],
-      "电阻")
+check("原来品类是空的,推断结果会补上", cat10k(), "电阻")
 
 # ---------------------------------------------------------------- 【28】
 p("\n【28】出库找料:按「值 + 封装」算相似,由人确认")
@@ -1166,6 +1182,114 @@ check("撤销一笔出库,已发料跟着退回去",
 check("撤销补的反向流水也记着那条需求",
       CON.execute("SELECT COUNT(*) FROM movement WHERE bom_id=?", (B30,)
                   ).fetchone()[0] >= 4, True)
+
+# ---------------------------------------------------------------- 【31】
+p("\n【31】元件身份和显示名拆开了:名字只是名字,匹配另有一套")
+# 以前显示名是「值 + 空格 + 封装」,而 find_component() 在没有立创编号 / 厂家料号时
+# **就是拿这个名字找同一颗料的** —— 名字同时兼任身份键和显示名。于是「100nF 就是
+# 100nF,别带封装」这种纯粹的显示要求,一改就会连带改掉匹配行为:100nF 0603 和
+# 100nF 0805 算成同一个名字,下次导入把两颗不同的料静默并成一条,BOM 需求和库存
+# 全错,而且不报错、界面上看不出来。这一节就是把这件事钉住。
+
+# ---- 身份键本身
+check("同一个值 + 同一个封装 → 同一个键",
+      bom.identity_key("100nF", "0603", None, None),
+      bom.identity_key("100nF", "0603", None, None))
+check("★ 值相同但封装不同 → 必须是两个键(整件事的核心)",
+      bom.identity_key("100nF", "0603", None, None)
+      != bom.identity_key("100nF", "0805", None, None), True)
+check("封装写法不同但归一化后一样 → 还是同一个键",
+      bom.identity_key("100nF", "C-0603", None, None),
+      bom.identity_key("100nF", "c0603", None, None))
+check("立创编号优先,且大小写不敏感",
+      bom.identity_key("100nF", "0603", None, "c12345"),
+      bom.identity_key("999uF", "9999", None, "C12345"))
+check("没有立创编号时厂家料号顶上",
+      bom.identity_key("100nF", "0603", "MPN-X", None),
+      bom.identity_key("999uF", "9999", "MPN-X", None))
+check("值和封装都没有,才退回按名字",
+      bom.identity_key(None, None, None, None, "手写的名字"), "nm:手写的名字")
+check("什么都判断不出来时给空串 —— 宁可多一条重复,也不要乱并",
+      bom.identity_key(None, None, None, None), "")
+
+# ---- 显示名只放值
+check("显示名就是值本身,不带封装", bom.build_name("1uF", "MPN1", "C1", "电容"), "1uF")
+check("值为空才退回厂家料号", bom.build_name(None, "MPN1", "C1", "电容"), "MPN1")
+check("料号也没有就退回立创编号", bom.build_name(None, None, "C1", "电容"), "C1")
+check("都没有就退回品类(名字不能为空,name 是 NOT NULL)",
+      bom.build_name(None, None, None, "电容"), "电容")
+
+# ---- 同一颗料、两个封装:反复导入必须始终是两条
+ident = write_csv("ident_bom.csv",
+                  "Designator,Quantity,Value,Footprint\n"
+                  "C1,10,9.09k,SELFTEST-A\n"
+                  "C2,2,9.09k,SELFTEST-B\n")
+_s, ri = call(server.bom_import, body={"project_name": "身份键板"},
+              upload=upload_of(ident))
+check("两个封装不同的 9.09k 是两条 BOM 行", ri["bom_lines"], 2)
+check("值相同、封装不同 → 两条元件,没有并成一条",
+      CON.execute("SELECT COUNT(*) FROM component WHERE value='9.09k'"
+                  " AND package IN ('SELFTEST-A','SELFTEST-B')").fetchone()[0], 2)
+check("两条的名字都是 9.09k(名字只放值)",
+      sorted(r[0] for r in CON.execute(
+          "SELECT name FROM component WHERE value='9.09k'"
+          " AND package IN ('SELFTEST-A','SELFTEST-B')")), ["9.09k", "9.09k"])
+check("封装各自留着,靠它区分",
+      sorted(r[0] for r in CON.execute(
+          "SELECT package FROM component WHERE value='9.09k'"
+          " AND package IN ('SELFTEST-A','SELFTEST-B')")),
+      ["SELFTEST-A", "SELFTEST-B"])
+
+# ★ 再导一遍 —— 这才是真会出事的地方:老代码在这里把 B 并进 A
+_s, ri2 = call(server.bom_import, body={"project_name": "身份键板"},
+               upload=upload_of(ident))
+check("★ 同一份 BOM 再导一遍,仍然只有两条元件(没被静默合并)",
+      CON.execute("SELECT COUNT(*) FROM component WHERE value='9.09k'").fetchone()[0], 2)
+check("再导一遍,两条 BOM 行都还在", ri2["bom_lines"], 2)
+check("两条需求各自挂在自己的元件上,没有指到同一个",
+      CON.execute("SELECT COUNT(DISTINCT component_id) FROM project_bom b"
+                  " JOIN component c ON c.id = b.component_id"
+                  " WHERE c.value='9.09k'").fetchone()[0], 2)
+
+# ---- 老数据迁移:只改能确定是自动生成的名字
+old_id = CON.execute(
+    "INSERT INTO component(name, category, value, package) VALUES(?,?,?,?)",
+    ("8.08k 0603", "电阻", "8.08k", "0603")).lastrowid
+CON.commit()
+db.backfill_identity(CON)
+check("迁移给没算过键的老行补上了身份键",
+      CON.execute("SELECT identity_key FROM component WHERE id=?",
+                  (old_id,)).fetchone()[0],
+      bom.identity_key("8.08k", "0603", None, None))
+check("「值 封装」式的旧名字被修成只有值",
+      CON.execute("SELECT name FROM component WHERE id=?", (old_id,)).fetchone()[0],
+      "8.08k")
+
+hand_id = CON.execute(
+    "INSERT INTO component(name, category, value, package) VALUES(?,?,?,?)",
+    ("我自己起的名", "电阻", "7.07k", "0603")).lastrowid
+CON.commit()
+db.backfill_identity(CON)
+check("人手起的名字一律不动 —— 猜错等于把人家的命名默默抹掉",
+      CON.execute("SELECT name FROM component WHERE id=?", (hand_id,)).fetchone()[0],
+      "我自己起的名")
+check("但它的身份键照样补上", CON.execute(
+    "SELECT identity_key FROM component WHERE id=?", (hand_id,)).fetchone()[0],
+    bom.identity_key("7.07k", "0603", None, None))
+
+# ---- 迁移是幂等的:再跑一遍不该再动任何东西
+again_keys, again_names = db.backfill_identity(CON)
+check("迁移跑第二遍不再改动任何东西(幂等)", (again_keys, again_names), (0, 0))
+
+# ---- 改了身份字段,键必须立刻跟着变
+call(server.update_component, match=(old_id,), body={"package": "0805"})
+check("改了封装,身份键立刻跟着变(否则下次导入又认不出它)",
+      CON.execute("SELECT identity_key FROM component WHERE id=?",
+                  (old_id,)).fetchone()[0],
+      bom.identity_key("8.08k", "0805", None, None))
+check("改完再导一次同一颗料,不会多长一条",
+      CON.execute("SELECT COUNT(*) FROM component WHERE value='8.08k'").fetchone()[0], 1)
+
 
 CON.close()
 p("\n" + "=" * 62)

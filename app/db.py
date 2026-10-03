@@ -24,7 +24,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 TABLES = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -158,6 +158,7 @@ CREATE INDEX IF NOT EXISTS idx_component_cat ON component(category);
 CREATE INDEX IF NOT EXISTS idx_component_pkg ON component(package);
 CREATE INDEX IF NOT EXISTS idx_component_val ON component(value);
 CREATE INDEX IF NOT EXISTS idx_component_valnum ON component(value_num);
+CREATE INDEX IF NOT EXISTS idx_component_ident ON component(identity_key);
 CREATE INDEX IF NOT EXISTS idx_location_parent ON location(parent_id);
 CREATE INDEX IF NOT EXISTS idx_movement_comp ON movement(component_id);
 CREATE INDEX IF NOT EXISTS idx_movement_time ON movement(created_at);
@@ -189,6 +190,11 @@ ADDED_COLUMNS = {
         # 那些流水是真实发生过的收发货,删了历史就断了,而且没法后悔。
         # 标成 merged_into 之后:列表里不再出现,但流水、单据、BOM 都还查得到。
         "merged_into": "INTEGER REFERENCES component(id)",
+        # 元件的「身份键」—— 判断两次导入的是不是同一颗料,就靠它。
+        # 以前这件事是拿 name 兼职的,于是「改显示规则」=「偷偷改匹配行为」:
+        # 把名字从 100nF 0603 改成 100nF,两个不同封装的 100nF 就会并成一条。
+        # 拆开之后名字怎么改都不影响匹配。留 NULL 表示还没算过(启动时补)。
+        "identity_key": "TEXT",
     },
     "location": {
         "parent_id": "INTEGER REFERENCES location(id) ON DELETE CASCADE",
@@ -265,6 +271,9 @@ def init_db(con: sqlite3.Connection) -> list:
 
     for code in LOCATIONS_SEED:
         con.execute("INSERT OR IGNORE INTO location(code, name) VALUES(?, ?)", (code, code))
+    # 补列之后、用之前,把老数据的身份键补上 —— 否则老元件一条都匹配不上,
+    # 重新导入 BOM 会把整块板重复长一遍。
+    backfill_identity(con)
     con.commit()
     return upgraded
 
@@ -335,6 +344,38 @@ def set_value_num(con: sqlite3.Connection, component_id: int, value) -> None:
     num, unit = values.parse_value(value)
     con.execute("UPDATE component SET value_num=?, value_unit=? WHERE id=?",
                 (num, unit, component_id))
+
+
+def backfill_identity(con: sqlite3.Connection) -> tuple:
+    """给老数据补身份键,并按新规则修掉「值 封装」式的旧名字。返回 (补了几条, 改了几个名)。
+
+    **名字只改能确定是自动生成的那些**(name 正好等于 f"{value} {package}")。
+    用户自己改过的名字一律不动 —— 猜错的代价是把人家的命名默默抹掉,
+    那比名字里多带一个封装难查得多。
+
+    改名字不会伤到任何关联:BOM、流水、单据引用的都是 component.id,不是 name。
+    """
+    import bom
+    rows = con.execute(
+        "SELECT id, name, value, package, mpn, lcsc_pn, category, identity_key"
+        " FROM component").fetchall()
+    keys = names = 0
+    for r in rows:
+        key = bom.identity_key(r["value"], r["package"], r["mpn"], r["lcsc_pn"], r["name"])
+        if (r["identity_key"] or "") != key:
+            con.execute("UPDATE component SET identity_key=? WHERE id=?", (key, r["id"]))
+            keys += 1
+        old = (r["name"] or "").strip()
+        auto = bool(r["value"]) and bool(r["package"]) and \
+            old == f"{r['value']} {r['package']}".strip()
+        if auto:
+            new = bom.build_name(r["value"], r["mpn"], r["lcsc_pn"], r["category"] or "其他")
+            if new and new != r["name"]:
+                con.execute("UPDATE component SET name=? WHERE id=?", (new, r["id"]))
+                names += 1
+    if keys or names:
+        con.commit()
+    return keys, names
 
 
 def backfill_values(con: sqlite3.Connection) -> int:

@@ -1802,6 +1802,215 @@ def main() -> int:
         pr.pane_out.show_bom()
         app.update()
 
+        # ==================================================== 收料的单个入库
+        p("\n【29】收料:除了一键全部入库,还要能只入库这一行")
+        pid29 = API(server.create_project, body={"name": "SELFTEST-单收", "qty": 1})["id"]
+        # 名字取短的:工具栏按钮只显示名字的前 12 个字,
+        # 名字太长的话「按钮上写着选的是哪一行」这条断言就变成断言截断了
+        c29a = API(server.create_component, body={
+            "name": "SELFTEST-A", "category": "电容",
+            "value": "470nF", "package": "0603"})["id"]
+        c29b = API(server.create_component, body={
+            "name": "SELFTEST-B", "category": "电阻",
+            "value": "22k\u03a9", "package": "0603"})["id"]
+        b29a = API(server.add_bom_line, match=(pid29,),
+                   body={"component_id": c29a, "required_qty": 6})["id"]
+        b29b = API(server.add_bom_line, match=(pid29,),
+                   body={"component_id": c29b, "required_qty": 3})["id"]
+
+        app.refresh_all()
+        app.update()
+        pr.t_proj.selection_set(str(pid29))
+        app.nb.select(app.tab_proj)
+        pr.sub.select(pr.pane_in)
+        pr.pane_in.show_bom()
+        app.update()
+        rp29 = pr.pane_in.bom_form
+        rp29.set_project(pid29)
+        app.update()
+
+        check("收料区有「只入库这一行」这个入口", hasattr(rp29, "btn_one"), True)
+        check("按钮上写着它是干什么的", rp29.ONE in rp29.btn_one.cget("text"), True)
+        check("没选中任何行时,不知道要收哪一行", rp29.selected_bid(), None)
+
+        def stock29(cid):
+            return app_con.execute(
+                "SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?",
+                (cid,)).fetchone()[0]
+
+        _mb29 = gui.messagebox
+        box29 = FakeBox()
+        gui.messagebox = box29
+        try:
+            # 一行都没选就点:要说清楚,而且**什么都不能动**
+            rp29.receive_selected()
+            app.update()
+        finally:
+            gui.messagebox = _mb29
+        check("没选中就点,会解释而不是默默什么都不做", len(box29.infos) >= 1, True)
+        check("而且没有误收任何东西", (stock29(c29a), stock29(c29b)), (0, 0))
+
+        rp29.tree.selection_set(str(b29a))
+        app.update()
+        check("选中之后按钮上写着选的是哪一行(免得点下去才发现选错行)",
+              "SELFTEST-A" in rp29.btn_one.cget("text"), True)
+
+        # 先勾上另一行,再单收选中那一行 —— 别的勾绝不能被顺手清掉
+        rp29.picked.add(b29b)
+        rp29.render()
+        app.update()
+        box29b = FakeBox()
+        _mb29b = gui.messagebox
+        gui.messagebox = box29b
+        try:
+            rp29.receive_selected()
+            app.update()
+        finally:
+            gui.messagebox = _mb29b
+        check("单收之前先把要收的东西念了一遍", bool(box29b.asks), True)
+        check("单个入库只收了选中那一行", stock29(c29a), 6)
+        check("另一行一颗都没动", stock29(c29b), 0)
+        check("别的勾没被顺手清掉(否则接着收第二行得重新勾一遍)",
+              b29b in rp29.picked, True)
+        check("收过的那行自己取消了勾(免得再点一次又收一遍)",
+              b29a in rp29.picked, False)
+
+        # 右键菜单:同一个动作要有第二条入口
+        items29 = [rp29.menu.entrycget(i, "label")
+                   for i in range(rp29.menu.index("end") + 1)
+                   if rp29.menu.type(i) == "command"]
+        check("右键菜单里有「只入库这一行」", rp29.ONE in items29, True)
+        check("也有「改本次入库数量」", any("改本次入库数量" in x for x in items29), True)
+        check("也有勾选 / 取消勾选",
+              any("勾选这一行" in x for x in items29)
+              and any("取消勾选" in x for x in items29), True)
+
+        rp29.tree.selection_set(str(b29b))
+        app.update()
+        rp29.set_checked(True)
+        app.update()
+        check("右键菜单那个「勾选这一行」真的勾上了", b29b in rp29.picked, True)
+
+        # 批量那条路照旧能用,而且和单收共用同一条 move_rows
+        box29c = FakeBox()
+        _mb29c = gui.messagebox
+        gui.messagebox = box29c
+        try:
+            rp29.submit()
+            app.update()
+        finally:
+            gui.messagebox = _mb29c
+        check("批量入库还能用,收的是剩下那一行", stock29(c29b), 3)
+        check("批量也照样先确认一遍", bool(box29c.asks), True)
+        check("批量走的就是单收那条路(同一个函数)",
+              "move_rows" in type(rp29).submit.__code__.co_names
+              or "move_rows" in type(rp29).__dict__.keys(), True)
+
+        # 名字撞车时确认框里必须还分得清 —— 这一条把 #1 和 #2 接上了
+        c29d = API(server.create_component, body={
+            "name": "877nF", "category": "电容",
+            "value": "877nF", "package": "0603"})["id"]
+        c29e = API(server.create_component, body={
+            "name": "877nF", "category": "电容",
+            "value": "877nF", "package": "0805"})["id"]
+        b29d = API(server.add_bom_line, match=(pid29,),
+                   body={"component_id": c29d, "required_qty": 1})["id"]
+        b29e = API(server.add_bom_line, match=(pid29,),
+                   body={"component_id": c29e, "required_qty": 1})["id"]
+        rp29.set_project(pid29)
+        app.update()
+        rp29.tree.selection_set(str(b29d))
+        app.update()
+        box29d = FakeBox()
+        _mb29d = gui.messagebox
+        gui.messagebox = box29d
+        try:
+            rp29.receive_selected()
+            app.update()
+        finally:
+            gui.messagebox = _mb29d
+        ask29 = box29d.asks[0][1] if box29d.asks else ""
+        check("名字撞车时,确认框里连封装一起写出来(否则分不清收的是哪颗)",
+              "0603" in ask29, True)
+
+        # ==================================================== BOM 明细详情面板
+        p("\n【30】点 BOM 明细的一行,右边出详情,品类能直接下拉改")
+        pr.sub.select(0)
+        app.update()
+        d30 = pr.detail
+        check("BOM 明细右边真有一块详情面板", isinstance(d30, gui.LineDetail), True)
+        check("还没选行时面板明说「先在左边点一行物料」",
+              "先在左边点一行" in d30.tip.get(), True)
+
+        pr.t_bom.selection_set(str(b29a))
+        app.update()
+        check("选中一行之后,面板记下了是哪条需求", d30.line.get("bom_id"), b29a)
+        check("面板上写着这颗料的值", d30.v2["value"].get(), "470nF")
+        check("写着封装", d30.v2["package"].get(), "0603")
+        check("写着这一条需求的单块用量", d30.v["per_board"].get(), "6")
+
+        # 品类:可编辑下拉
+        check("品类那个下拉能直接打字(认不出的品类必须能自己填)",
+              "readonly" not in d30.cb_cat.state(), True)
+        check("下拉里带着库里已经在用的品类", "电容" in d30.category_options(), True)
+        check("也带着内置清单(库里还没有的那些)", len(d30.category_options()) > 3, True)
+        check("当前显示的就是这颗料的品类", d30.cat.get(), "电容")
+
+        d30.cat.set("SELFTEST-新品类")
+        d30.save_category()
+        app.update()
+        check("改完立刻落库",
+              app_con.execute("SELECT category FROM component WHERE id=?",
+                              (c29a,)).fetchone()[0], "SELFTEST-新品类")
+        check("面板自己也跟着变了", d30.comp.get("category"), "SELFTEST-新品类")
+        check("BOM 明细那一行跟着变了",
+              app_con.execute("SELECT c.category FROM project_bom b"
+                              " JOIN component c ON c.id=b.component_id"
+                              " WHERE b.id=?", (b29a,)).fetchone()[0], "SELFTEST-新品类")
+        check("全量刷新之后面板还停在这条需求上(没跳回空白)",
+              d30.line.get("bom_id"), b29a)
+
+        box30 = FakeBox()
+        _mb30 = gui.messagebox
+        gui.messagebox = box30
+        try:
+            d30.cat.set("   ")
+            d30.save_category()
+            app.update()
+        finally:
+            gui.messagebox = _mb30
+        check("品类不让填空(空着以后搜不到它)", len(box30.infos) >= 1, True)
+        check("而且没真写进去",
+              app_con.execute("SELECT category FROM component WHERE id=?",
+                              (c29a,)).fetchone()[0], "SELFTEST-新品类")
+
+        check("面板上写着现在有多少", "个" in d30.v2["on_hand_total"].get(), True)
+        locs30 = d30.v2["locs"].get()
+        check("写着分布在哪儿,没有就明说「库里一颗都没有」",
+              (":" in locs30) or ("一颗都没有" in locs30), True)
+
+        # ============================================ 同值不同封装要分得清
+        p("\n【31】同值不同封装的两条需求,在分配树里不能长得一模一样")
+        pr.sub.select(pr.pane_out)
+        pr.pane_out.show_bom()
+        app.update()
+        po31 = pr.pane_out.bom_form
+        po31.set_project(pid29)
+        app.update()
+        texts31 = [po31.tree.item(i, "text") for i in po31.tree.get_children()]
+        same31 = [t for t in texts31 if "877nF" in t]
+        check("两条 877nF 的需求都在树里", len(same31), 2)
+        check("它们不是同一条文案(撞车时必须把封装补进树列,否则扫一眼分不清)",
+              len(set(same31)), 2)
+        check("补进去的正是封装",
+              any("0603" in x for x in same31)
+              and any("0805" in x for x in same31), True)
+        # 不撞车的那种不能也被补上 —— 否则等于把封装又加回名字了
+        # (SELFTEST-A 的值是 470nF,但显示名是它自己那个名字)
+        solo31 = [t for t in texts31 if "SELFTEST-A" in t]
+        check("没撞车的那条不带封装(封装有单独的列,不重复)",
+              bool(solo31) and "0603" not in solo31[0], True)
+
         app.refresh_all()
         app.update()
         p("  [OK ] 全量刷新")

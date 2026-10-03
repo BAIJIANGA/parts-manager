@@ -275,12 +275,72 @@ def _to_int(val: Any) -> int | None:
         return None
 
 
-def build_name(value: str | None, package: str | None, mpn: str | None,
+# 「身份」和「显示名」是两件事。以前它们挤在 name 一个字段里,后来出了个很难查的 bug:
+# 显示名是 `值 + 空格 + 封装`(1uF 0805),而 find_component() 在没有立创编号 / 厂家
+# 料号时**就是拿这个名字找同一颗料的**。也就是说,只要动了显示规则,匹配行为跟着变 ——
+# 有人要求「100nF 就是 100nF,别带封装」,一改,100nF 0603 和 100nF 0805 就算成同一个
+# 名字,下次导入把两颗不同的料静默并成一条,BOM 需求和库存全错,而且不报错、看不出来。
+#
+# 所以身份单独一个键,按优先级取:立创编号 > 厂家料号 > 值 + 封装。名字随便怎么改都
+# 不影响匹配。
+
+
+def norm_package(text) -> str:
+    """封装归一化:C0805 / c0805 / C-0805 归成同一个键。
+
+    这个函数原来只在 server.py 里(给相似度打分用的)。身份键也得用同一套规则 ——
+    两处各写一份迟早会漂移,所以挪到这里当成唯一的实现,server 那边改成转发。
+    """
+    return re.sub(r"[\s\-_/]+", "", str(text or "").upper())
+
+
+def _ident_part(text) -> str:
+    """归一化身份键里的一段:去首尾空白、内部连续空白压成一个、统一大写。"""
+    if text is None:
+        return ""
+    return re.sub(r"\s+", " ", str(text).strip()).upper()
+
+
+def identity_key(value: str | None, package: str | None, mpn: str | None,
+                 lcsc: str | None, name: str | None = None) -> str:
+    """算一颗料的匹配键。同一颗料反复导入必须算出同一个键。
+
+    优先级不能随手换 —— 立创编号是唯一的,厂家料号次之,两者都没有才退回「值 + 封装」:
+
+    - 立创编号 / 厂家料号:单独就足够定性,和封装无关(同一个编号只对应一种封装)
+    - 值和封装都进键:少任何一个,100nF 0603 和 100nF 0805 就会撞车
+    - 连值和封装都没有(手填的、只有名字的元件):退回按名字 —— 这时候名字就是它
+      唯一的身份,只能用它
+
+    返回空串表示「什么都判断不出来」,调用方会退化成不匹配(宁可多一条重复,
+    也不要乱并)。
+    """
+    if lcsc and str(lcsc).strip():
+        return "lcsc:" + str(lcsc).strip().upper()
+    if mpn and str(mpn).strip():
+        return "mpn:" + str(mpn).strip()
+    val = _ident_part(value)
+    pkg = norm_package(package)
+    if val or pkg:
+        return f"vp:{val}|{pkg}"
+    nm = _ident_part(name)
+    if nm:
+        return "nm:" + nm
+    # 什么信息都没有。这里**必须**返回空串,不能返回 "nm:" 这种光秃秃的前缀 ——
+    # 那会让所有「什么都没有」的元件共用一个键,一导入就整批并成一条,
+    # 正是拆出身份键要避免的事。空串会让调用方退化成不匹配(宁可多一条重复)。
+    return ""
+
+
+def build_name(value: str | None, mpn: str | None,
                lcsc: str | None, category: str) -> str:
-    """拼一个人能读的显示名,例如 '1uF 0805' / '10kΩ 0603'。"""
-    parts = [p for p in (value, package) if p]
-    if parts:
-        return " ".join(parts)
+    """拼一个人能读的显示名。**只放值,不带封装。**
+
+    封装有自己单独一列,再拼进名字里是重复的,列表看着也脏。
+    值为空时退回厂家料号 / 立创编号 / 品类,保证名字永远不为空(name 是 NOT NULL)。
+    """
+    if value and str(value).strip():
+        return str(value).strip()
     return mpn or lcsc or category
 
 
@@ -409,7 +469,6 @@ def rows_to_items(rows: list[list[Any]]) -> tuple[list[dict], list[str]]:
             "mpn": mpn,
             "manufacturer": _cell(row, cols, "manufacturer"),
             "name": build_name(str(value) if value else None,
-                               str(footprint) if footprint else None,
                                mpn, lcsc, category),
             "category": category,
             "category_confidence": cat_conf,
@@ -426,32 +485,30 @@ def rows_to_items(rows: list[list[Any]]) -> tuple[list[dict], list[str]]:
     return items, warnings
 
 
-def find_component(con, lcsc_pn: str | None, mpn: str | None, name: str | None = None):
-    """按立创编号优先、厂家料号其次找已有元件。
+def find_component(con, item: dict):
+    """找这颗料在库里对应的行,没有就返回 None。
 
-    两者都没有时(纯 Value + Footprint 的 KiCad / EasyEDA BOM)退回按元件名找。
-    名字本来就是由值、封装、料号推出来的,所以同一个元件反复导入不会变成两条。
+    按 identity_key 找,**不再按 name 找**。名字是给人看的,用户随时可能要求改显示
+    规则;拿它当键用,等于改一次显示就偷偷改一次匹配行为(见 identity_key 上面的注释)。
 
     始终跳过 merged_into 不为空的行:那些是合并掉的重复料,已经不在列表里了,
     再往它们身上挂 BOM 行等于把刚合掉的重复又长回来。
     """
-    if lcsc_pn:
-        row = con.execute("SELECT * FROM component WHERE lcsc_pn=? AND merged_into IS NULL",
-                          (lcsc_pn,)).fetchone()
-        if row:
-            return row
-    if mpn:
-        row = con.execute("SELECT * FROM component WHERE mpn=? AND merged_into IS NULL",
-                          (mpn,)).fetchone()
-        if row:
-            return row
-    if not lcsc_pn and not mpn and name:
+    key = identity_key(item.get("value"), item.get("package"),
+                       item.get("mpn"), item.get("lcsc_pn"), item.get("name"))
+    if key:
         row = con.execute(
-            "SELECT * FROM component WHERE name=? AND merged_into IS NULL"
-            " AND (lcsc_pn IS NULL OR lcsc_pn='')"
-            " AND (mpn IS NULL OR mpn='')", (name,)).fetchone()
+            "SELECT * FROM component WHERE identity_key=? AND merged_into IS NULL"
+            " ORDER BY id LIMIT 1", (key,)).fetchone()
         if row:
             return row
+    # 兜底:老库里可能还留着没算过键的行(迁移没跑完就不该发生,但真发生的话
+    # lcsc_pn 上的 UNIQUE 约束会让 INSERT 直接报错,比多查一次严重得多)。
+    lcsc = item.get("lcsc_pn")
+    if lcsc:
+        return con.execute(
+            "SELECT * FROM component WHERE lcsc_pn=? AND merged_into IS NULL",
+            (lcsc,)).fetchone()
     return None
 
 
@@ -466,7 +523,7 @@ def upsert_component(con, item: dict) -> tuple[int, bool]:
     重新导入同一块板的改版 BOM 时必然踩到这条:元件早就在库里了,
     不复核前改的品类等于白改。
     """
-    existing = find_component(con, item.get("lcsc_pn"), item.get("mpn"), item.get("name"))
+    existing = find_component(con, item)
     human = item.get("category_confidence") == CONF_HUMAN
     if existing:
         cid = existing["id"]
@@ -485,16 +542,26 @@ def upsert_component(con, item: dict) -> tuple[int, bool]:
             updates.append("updated_at=?")
             args.extend([db.now(), cid])
             con.execute(f"UPDATE component SET {', '.join(updates)} WHERE id=?", args)
+            # 身份字段可能刚被补上(比如原来没厂家料号,这次导进来了),键得跟着重算 ——
+            # 否则下次导入拿新料号找不到这一条,会再长出一颗重复的。
+            fresh = con.execute("SELECT * FROM component WHERE id=?", (cid,)).fetchone()
+            con.execute(
+                "UPDATE component SET identity_key=? WHERE id=?",
+                (identity_key(fresh["value"], fresh["package"], fresh["mpn"],
+                              fresh["lcsc_pn"], fresh["name"]), cid))
         # 导入时就得把数值列算出来。以前靠下次启动的 backfill 补,
         # 结果「刚导完就按阻值排序 / 筛区间」是不准的。
         db.set_value_num(con, cid, item.get("value"))
         return cid, False
 
     cur = con.execute(
-        """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, value, package)
-           VALUES(?,?,?,?,?,?,?)""",
+        """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, value, package,
+                                identity_key)
+           VALUES(?,?,?,?,?,?,?,?)""",
         (item.get("lcsc_pn"), item.get("mpn"), item.get("manufacturer"),
-         item["name"], item["category"], item.get("value"), item.get("package")),
+         item["name"], item["category"], item.get("value"), item.get("package"),
+         identity_key(item.get("value"), item.get("package"),
+                      item.get("mpn"), item.get("lcsc_pn"), item.get("name"))),
     )
     cid = int(cur.lastrowid)
     db.set_value_num(con, cid, item.get("value"))

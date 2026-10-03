@@ -242,11 +242,14 @@ def component_row(row) -> dict:
 
 
 # 封装名归一化:去掉分隔符和空格再比,好让 C0805 / c-0805 / 0805 这些写法能对上
+# 封装归一化的实现已经挪到 bom.py(身份键要用同一套规则,两处各写一份迟早漂移),
+# 这里保留同名入口,server 内部和自检里的调用都不用改。
 _PKG_SEP_RE = re.compile(r"[\s\-_/]+")
 
 
 def norm_package(text) -> str:
-    return _PKG_SEP_RE.sub("", str(text or "").upper())
+    """封装归一化。实现见 bom.norm_package(身份键和相似度打分必须用同一套规则)。"""
+    return bom.norm_package(text)
 
 
 def similar_components(con, *, value="", package="", category="", limit=8,
@@ -531,8 +534,9 @@ def create_component(ctx: Ctx, m):
     cur = ctx.con.execute(
         """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, value, package,
                                 marking, params, datasheet_url, product_url, unit, min_stock,
-                                reorder_qty, supplier, unit_price, default_loc_id, note)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                reorder_qty, supplier, unit_price, default_loc_id, note,
+                                identity_key)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ctx.b("lcsc_pn"), ctx.b("mpn"), ctx.b("manufacturer"), name,
          ctx.b("category") or "其他", ctx.b("value"), ctx.b("package"),
          ctx.b("marking"), db.dump_params(ctx.b("params")),
@@ -540,7 +544,9 @@ def create_component(ctx: Ctx, m):
          ctx.b("unit") or "个", ctx.bi("min_stock", 0) or 0,
          ctx.bi("reorder_qty", 0) or 0, ctx.b("supplier"),
          _as_float(ctx.b("unit_price")), ctx.bi("default_loc_id", 0) or None,
-         ctx.b("note")),
+         ctx.b("note"),
+         bom.identity_key(ctx.b("value"), ctx.b("package"),
+                          ctx.b("mpn"), ctx.b("lcsc_pn"), name)),
     )
     db.set_value_num(ctx.con, int(cur.lastrowid), ctx.b("value"))
     ctx.con.commit()
@@ -597,6 +603,14 @@ def update_component(ctx: Ctx, m):
     # value 变了就重算数值列,否则排序/筛选会跟显示对不上
     if any(s.startswith("value=") for s in sets):
         db.set_value_num(ctx.con, cid, ctx.b("value"))
+    # 身份字段(编号/料号/值/封装)一变,身份键就得跟着变 —— 不改的话,这次改完
+    # 下次导入还按老键匹配,等于这次修改对导入不可见,又会多出一颗重复的。
+    if any(s.split("=", 1)[0] in ("lcsc_pn", "mpn", "value", "package") for s in sets):
+        fresh = ctx.con.execute("SELECT * FROM component WHERE id=?", (cid,)).fetchone()
+        ctx.con.execute(
+            "UPDATE component SET identity_key=? WHERE id=?",
+            (bom.identity_key(fresh["value"], fresh["package"], fresh["mpn"],
+                              fresh["lcsc_pn"], fresh["name"]), cid))
     ctx.con.commit()
     return 200, {"ok": True}
 
@@ -1410,6 +1424,12 @@ def merge_components(ctx: Ctx, m):
             keeper = con.execute("SELECT * FROM component WHERE id=?", (keep,)).fetchone()
         # 合并前把数值列重算一遍:补进来的 value 可能来自被并的那条
         db.set_value_num(con, keep, keeper["value"])
+        # 身份键同理:上面刚把被并那条的 lcsc_pn / mpn / value / package 补了进来,
+        # 不重算的话保留的这条会顶着一个过期的键,下次导入认不出它。
+        con.execute(
+            "UPDATE component SET identity_key=? WHERE id=?",
+            (bom.identity_key(keeper["value"], keeper["package"], keeper["mpn"],
+                              keeper["lcsc_pn"], keeper["name"]), keep))
 
         # 2) 库存:同一仓位相加,不同仓位直接把行改成保留的那条
         for s in con.execute("SELECT location_id, qty FROM stock WHERE component_id=?",
