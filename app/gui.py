@@ -681,6 +681,7 @@ class ComponentsTab(ttk.Frame):
         self.crumb = []            # [{"kind":"cat","id":..,"name":..}, {"kind":"pkg",...}]
         self._cat_flat = {}        # 品类 id -> 节点(带 children / own / total / path)
         self._pick_items = []      # 中间页当前列出的子类
+        self._own_only = False     # 列表只显示「直接挂在这一级」的元件(中间页那张「本级」)
         self.pkg_chips = {}        # 封装芯片,自检要数它们
 
         self._build_home()
@@ -739,8 +740,9 @@ class ComponentsTab(ttk.Frame):
     def _build_cat(self):
         head = ttk.Frame(self.page_cat)
         head.pack(fill="x", pady=(0, 8))
-        ttk.Button(head, text="← 返回", command=self.go_home, width=9).pack(side="left",
-                                                                         padx=(0, 10))
+        # 上一层而不是直接回首页:人在第三层的时候,想退的是第二层
+        ttk.Button(head, text="← 上一层", command=self.go_back, width=9).pack(
+            side="left", padx=(0, 10))
         self.cat_badge = tk.Label(head, text="", bg="#7f8c8d", fg="white", width=4,
                                   font=("Microsoft YaHei UI", 10, "bold"))
         self.cat_badge.pack(side="left", padx=(0, 8))
@@ -907,6 +909,8 @@ class ComponentsTab(ttk.Frame):
 
     def crumb_to(self, i):
         self.crumb = self.crumb[:i + 1]
+        # 「本级」那一格被点掉了,就真的回到上一级去,不能还停在「只看本级」的列表里
+        self._own_only = any(c["kind"] == "own" for c in self.crumb)
         if not any(c["kind"] == "pkg" for c in self.crumb):
             self.f_pkg.set(self.ALL)
         self._descend()
@@ -918,10 +922,22 @@ class ComponentsTab(ttk.Frame):
         self.crumb_to(len(self.crumb) - 2)
 
     def _pick_one(self, key):
+        """点中间页的一张卡片。key 是品类 id;特殊的 "self" 是那张「本级」。"""
+        if key == "self":
+            # 本级:这一级已经在路径里了,所以只把列表切成「只要挂在这一个节点上的」
+            self._own_only = True
+            self.load_category()
+            return
         node = self._cat_flat.get(int(key))
         if node is None:
             self.reload()
             return
+        if (self.crumb and self.crumb[-1]["kind"] == "cat"
+                and self.crumb[-1].get("id") == node["id"]):
+            # 同一个节点已经站在路径末尾了,再点一次不该又加一段
+            self._descend()
+            return
+        self._own_only = False
         self.crumb.append({"kind": "cat", "id": node["id"], "name": node["name"],
                            "path": node["path"]})
         self._descend()
@@ -938,14 +954,26 @@ class ComponentsTab(ttk.Frame):
         self.view = "pick"
         self._pick_items = list(node.get("children") or [])
         specs = []
+        # 「本级」:大类下面既有细分出来的子类、又有还没细分的料,是很常见的摆法。
+        # 少了这张卡片,那些料就永远进不去 —— 点一个「有子类的品类」只会看到子类。
+        own = int(node.get("own_stocked") or 0)
+        if own:
+            glyph, color = CATEGORY_STYLE.get(node["name"], DEFAULT_CAT_STYLE)
+            specs.append(("self", "本级(挂在这里的)", glyph, color,
+                          f"{own} 种在库", False))
+        stocked = 0
         for ch in self._pick_items:
             glyph, color = CATEGORY_STYLE.get(ch["name"], DEFAULT_CAT_STYLE)
-            n = int(ch.get("total") or 0)
+            # 只数**有库存**的:卡片写的数字必须和点进去看到的一致,
+            # 不然零库存的品类也喊「N 种在库」,点进去一行都没有(虚假库存)
+            n = int(ch.get("total_stocked") or 0)
+            stocked += n
             specs.append((str(ch["id"]), ch["name"], glyph, color,
                           f"{n} 种在库" if n else "暂无库存", not n))
         self.pick_title.set(node["name"])
-        total = sum(int(c.get("total") or 0) for c in self._pick_items)
-        self.pick_count.set(f"{len(specs)} 个子类" + (f",共 {total} 种在库" if total else ""))
+        total = stocked + own
+        self.pick_count.set(f"{len(self._pick_items)} 个子类"
+                            + (f",共 {total} 种在库" if total else ""))
         self.pick_board.render(specs, empty_text="这个品类下面还没有子类。")
         self._render_crumb()
         self._swap(self.page_pick)
@@ -967,14 +995,23 @@ class ComponentsTab(ttk.Frame):
     # ------------------------------------------------------ 页面切换
 
     def _swap(self, page):
-        self.page_home.pack_forget()
-        self.page_cat.pack_forget()
+        """三个页面**只能有一个**留在屏幕上。
+
+        这里原来只收起了 home 和 cat,漏了 page_pick —— 于是从「选子类」那一页进到
+        列表页时,两页同时铺着、上下各占一块(用户说的「上下分页」);而且 pick 页
+        还在屏幕上,里面的卡片照样能点,一点面包屑就多一段(「C0805 › C0805 › C0805」);
+        「返回」也只是改了路径、页面还是叠着,看着像没反应。
+        三个症状同一个根因,就是这一行。
+        """
+        for p in (self.page_home, self.page_cat, self.page_pick):
+            p.pack_forget()
         page.pack(fill="both", expand=True)
 
     def go_home(self):
         self.view = "home"
         self.current_category = None
         self.crumb = []
+        self._own_only = False
         self._render_crumb()
         self._swap(self.page_home)
 
@@ -988,6 +1025,7 @@ class ComponentsTab(ttk.Frame):
                 node = n
                 break
         self.view = "cat"
+        self._own_only = False
         self.clear_filters(redraw=False)
         if node is None:
             # 品类表里没有这个大类。理论上不该发生(卡片就是从树上来的),
@@ -1182,7 +1220,9 @@ class ComponentsTab(ttk.Frame):
         # 面包屑里的「封装」这一级要和实际筛选一致:点芯片和直接改下拉框是两条路,
         # 但走过的路必须是同一条 —— 否则面包屑会写着 0603、表里却是全部
         pkg_now = self._facet_value(self.f_pkg)
-        self.crumb = [c for c in self.crumb if c["kind"] != "pkg"]
+        self.crumb = [c for c in self.crumb if c["kind"] not in ("pkg", "own")]
+        if self._own_only:
+            self.crumb.append({"kind": "own", "name": "本级"})
         if pkg_now:
             self.crumb.append({"kind": "pkg", "name": pkg_now})
         # 按 category_id 筛**整棵子树**:挂在子类下的元件文本仍然写着大类名,
@@ -1192,6 +1232,9 @@ class ComponentsTab(ttk.Frame):
             query["category"] = name
         else:
             query["category_id"] = str(node["id"])
+            if self._own_only:
+                # 只要直接挂在这一个节点上的,不含子孙
+                query["own"] = "1"
         pkg, unit = self._facet_value(self.f_pkg), self._facet_value(self.f_unit)
         if pkg:
             query["package"] = pkg

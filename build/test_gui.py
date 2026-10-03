@@ -2616,6 +2616,65 @@ def main() -> int:
               sorted(k for k in tab36.pkg_chips if k), ["0603", "0805"])
         check("「全部」那个按钮还在", "" in tab36.pkg_chips, True)
 
+        p("\n【37】钻取:三个页面互斥、面包屑不重复、有子类的品类能进本级")
+        tab37 = app.tab_comp
+        app.nb.select(tab37)
+        app.update()
+
+        def _npages(t):
+            return len([1 for w in (t.page_home, t.page_cat, t.page_pick)
+                        if w.winfo_ismapped()])
+
+        def _crumb(t):
+            return [c["name"] for c in t.crumb]
+
+        # 测试库里不一定正好有「有子类、本级又有货」的品类 —— 自己造一个。
+        # 不造的话下面几条会被跳过,跳过的断言等于没测。
+        _host37 = next((n for n in tab37._cat_flat.values()
+                        if n["parent_id"] is None
+                        and int(n.get("own_stocked") or 0) > 0), None)
+        if _host37 is None:
+            p("  [!!] 测试库里没有「本级有货」的顶层品类,【37】没法测 —— 这不该发生")
+        else:
+            app.con.execute("INSERT INTO category(name, parent_id, sort) VALUES (?,?,?)",
+                            ("测试子类", _host37["id"], 99))
+            app.con.commit()
+            tab37._load_cat_tree()
+            tab37.open_category(_host37["name"])
+            app.update()
+            check("点进有子类的品类,屏幕上只有一页(以前会和列表页上下叠着)",
+                  _npages(tab37), 1)
+            check("有子类又有本级的品类,中间页给出了「本级」入口",
+                  "self" in tab37.pick_board.cards, True)
+            _kid = [k for k in tab37.pick_board.cards
+                    if k.isdigit()
+                    and (tab37._cat_flat.get(int(k)) or {}).get("name") == "测试子类"]
+            check("刚造出来的子类出现在这一页上", len(_kid), 1)
+            tab37._pick_one(_kid[0])
+            app.update()
+            _want = _crumb(tab37)          # 第一次点本来就该往下走一层
+            check("点进子类,面包屑多了一层", len(_want) >= 2, True)
+            for _ in range(3):
+                tab37._pick_one(_kid[0])
+                app.update()
+            check("连点同一张卡片,面包屑不会越点越长", _crumb(tab37), _want)
+            check("连点之后屏幕上仍然只有一页", _npages(tab37), 1)
+            tab37.go_back()
+            app.update()
+            check("从子类退回上一层就回到中间页",
+                  (_npages(tab37), "self" in tab37.pick_board.cards), (1, True))
+            tab37._pick_one("self")
+            app.update()
+            check("进本级后面包屑多一格「本级」", _crumb(tab37)[-1:], ["本级"])
+            check("本级是列表页,而且屏幕上只有一页", _npages(tab37), 1)
+            _rows37 = [str(tab37.tree.item(i, "values"))
+                       for i in tab37.tree.get_children()]
+            check("本级列表里只有挂在这一级的料(不含子类里的)",
+                  len(_rows37), int(_host37.get("own_stocked") or 0))
+        tab37.go_home()
+        app.update()
+        check("回到首页后面包屑清空", _crumb(tab37), [])
+
         app.refresh_all()
         app.update()
         p("  [OK ] 全量刷新")

@@ -1589,6 +1589,52 @@ check("整支的节点都还在(只是层级变了)",
       CON.execute("SELECT COUNT(*) AS n FROM category WHERE id IN (?,?,?)",
                   (T4["top"], T4["mid"], T4["leaf"])).fetchone()["n"], 2)
 
+p("\n【35】本级入口 + 「在库」口径:卡片写的数字必须和点进去看到的一致")
+
+# ---- own=1:只要**直接挂在这一个节点上**的元件,不含子孙。
+# 大类下面既有细分出来的子类、又有还没细分的料,是很常见的摆法 ——
+# 少了这个入口,那些料永远看不到(用户报的「电容里一颗电容没看到」)。
+_s, _t35 = call(server.list_categories)
+_cap35 = [n for n in _t35["flat"] if n["name"] == "电容" and n["parent_id"] is None]
+check("库里有顶层「电容」", len(_cap35), 1)
+_c35 = _cap35[0]
+_s, _sub35 = call(server.list_components,
+                  query={"category_id": str(_c35["id"]), "limit": "0"})
+_s, _own35 = call(server.list_components,
+                  query={"category_id": str(_c35["id"]), "own": "1", "limit": "0"})
+check("本级列表里确实有料(否则这个入口就是白加的)", len(_own35["items"]) > 0, True)
+check("own=1 不含子孙:每一行的 category_id 就是这一个节点",
+      all(it["category_id"] == _c35["id"] for it in _own35["items"]), True)
+check("own=1 是整棵子树的子集",
+      len(_own35["items"]) <= len(_sub35["items"]), True)
+
+# ---- 「N 种在库」必须和点进去看到的一致:只数有库存的。
+# 原来卡片数的是元件条数、列表按 stocked=1 过滤,于是零库存的品类也喊「在库」,
+# 点进去一行都没有(用户报的「虚假库存」)。
+check("每个节点都带一套「有库存」口径",
+      all(("own_stocked" in n and "total_stocked" in n) for n in _t35["flat"]), True)
+check("有库存的数不会超过元件总数",
+      all(n["own_stocked"] <= n["own"] and n["total_stocked"] <= n["total"]
+          for n in _t35["flat"]), True)
+check("本级「在库」的数字 = 本级里真有库存的条数",
+      _c35["own_stocked"],
+      len([i for i in _own35["items"] if (i.get("on_hand") or 0) > 0]))
+check("子树「在库」也不少于本级的",
+      _c35["total_stocked"] >= _c35["own_stocked"], True)
+
+# ---- 封装压过 BOM 文件里抄错的「分类」列(用户报的「电阻被分到电容里」)
+check("文件写「电容」但封装是 R0603 → 按封装算成电阻",
+      bom.classify(["R8"], "R0603", "0Ω", "电容")[0], "电阻")
+check("理由要写明是以封装为准",
+      "以封装为准" in bom.classify(["R8"], "R0603", "0Ω", "电容")[2], True)
+check("本来就一致的不能被误伤",
+      bom.classify(["C1"], "C0805", "100nF", "电容")[0], "电容")
+check("子类名和封装同族也算一致(贴片陶瓷电容 ⊃ 电容)",
+      bom.classify(["C2"], "C0805", "1uF", "贴片陶瓷电容")[0], "贴片陶瓷电容")
+check("兜底的「其他」不推翻", bom.classify(["R1"], "R0603", "1kΩ", "其他")[0], "其他")
+check("封装认不出类别时不推翻",
+      bom.classify(["U1"], "SOT-23-5", "", "电容")[0], "电容")
+
 # ---- 全库扫描:文本和树上顶层名字必须处处一致
 _mism = 0
 for _r in CON.execute("SELECT id, category, category_id FROM component "

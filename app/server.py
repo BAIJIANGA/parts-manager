@@ -443,6 +443,12 @@ def list_components(ctx: Ctx, m):
     # category_id:按**整棵子树**筛。菜单上点「电容」该看到它底下所有子类的料,
     # 点「无极性陶瓷电容」则只看那一支。文本列做不到这件事 —— 挂在子类下的元件,
     # 文本仍然写着「电容」,光看文本分不出是挂在子类还是直接挂在顶层。
+    # own=1:只要**直接挂在这一个节点上**的元件,不含子孙。
+    # 「大类下面既有细分出来的子类、又有还没细分的料」是很常见的摆法,
+    # 那些料必须有自己的入口,否则它们永远看不到(见 issue #12)。
+    if ctx.q("own") and ctx.q("category_id"):
+        base_where.append("c.category_id = ?")
+        base_args.append(ctx.qi("category_id", 0) or 0)
     if ctx.q("category_id"):
         _sub = _category_subtree(ctx, ctx.qi("category_id", 0) or 0)
         if _sub:
@@ -796,12 +802,25 @@ def list_categories(ctx: Ctx, m):
         r["children"] = []
         r["own"] = 0
         r["total"] = 0
+        r["own_stocked"] = 0
+        r["total_stocked"] = 0
     for r in ctx.con.execute(
             "SELECT category_id AS cid, COUNT(*) AS n FROM component "
             "WHERE category_id IS NOT NULL AND merged_into IS NULL "
             "GROUP BY category_id"):
         if r["cid"] in by_id:
             by_id[r["cid"]]["own"] = int(r["n"])
+    # 另一套口径:**有库存的**有多少种。库存菜单上的卡片写「N 种在库」,而点进去的
+    # 列表走 list_components(stocked=1) —— 两者必须同源,否则零库存的品类也会喊
+    # 「在库」,用户点进去是空的(他管这个叫虚假库存)。
+    # own/total 仍旧数全部元件:品类管理窗口里那个「直接挂 / 含子类」是整理分类用的。
+    for r in ctx.con.execute(
+            "SELECT c.category_id AS cid, COUNT(*) AS n FROM component c "
+            "WHERE c.category_id IS NOT NULL AND c.merged_into IS NULL "
+            "AND COALESCE((SELECT SUM(s.qty) FROM stock s WHERE s.component_id = c.id), 0) > 0 "
+            "GROUP BY c.category_id"):
+        if r["cid"] in by_id:
+            by_id[r["cid"]]["own_stocked"] = int(r["n"])
     roots = []
     for r in rows:
         pid = r["parent_id"]
@@ -812,7 +831,14 @@ def list_categories(ctx: Ctx, m):
 
     def roll(node):
         node["total"] = node["own"] + sum(roll(c) for c in node["children"])
+        node["total_stocked"] = node["own_stocked"] + sum(
+            roll_stocked(c) for c in node["children"])
         return node["total"]
+
+    def roll_stocked(node):
+        node["total_stocked"] = node["own_stocked"] + sum(
+            roll_stocked(c) for c in node["children"])
+        return node["total_stocked"]
 
     for r in roots:
         roll(r)

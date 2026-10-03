@@ -172,10 +172,22 @@ def classify(designators: Iterable[str] | None = None, footprint: Any = "",
     votes: list[tuple[int, str, str]] = []      # (优先级, 品类, 理由)
 
     text_hint = str(hint or "").strip()
-    if text_hint:
+    fp = str(footprint or "").upper()
+    # 文件里那一列「分类」和封装打架时,以封装为准 —— 封装和位号是从原理图来的
+    # 物理事实,而导出 BOM 里这一列常常是手填/工具生成的,抄错很常见。
+    # 实测:两颗 R0603 的 0Ω / 20kΩ 被文件写成「电容」,于是电阻住进了电容的子树。
+    # 只在**明显不是一类**时才推翻:字符串互相包含就算一致(「贴片陶瓷电容」⊃「电容」),
+    # 「其他 / 未分类」这种兜底品类不动,封装认不出类别时也不动。
+    fp_kind = fprint.category(fp)
+    if (text_hint and fp_kind and fprint.kind(fp)
+            and text_hint not in ("其他", "未分类")
+            and fp_kind not in text_hint and text_hint not in fp_kind):
+        votes.append((0, fp_kind,
+                      f"BOM 里写着「{text_hint}」,但封装 {footprint} 是{fp_kind}"
+                      f" —— 以封装为准"))
+    elif text_hint:
         votes.append((0, text_hint, f"BOM 里本来就写着品类「{text_hint}」"))
 
-    fp = str(footprint or "").upper()
     for keys, cat in CATEGORY_BY_FOOTPRINT:
         if any(k in fp for k in keys):
             votes.append((1, cat, f"封装 {footprint} 里的关键词是{cat}的特征"))
