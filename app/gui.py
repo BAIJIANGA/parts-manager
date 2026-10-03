@@ -459,7 +459,7 @@ class App(tk.Tk):
             initialfile="元器件清单.csv", filetypes=[("CSV", "*.csv")])
         if not path:
             return
-        cols = [("name", "名称"), ("lcsc_pn", "立创编号"), ("mpn", "厂家料号"),
+        cols = [("name", "名称"), ("lcsc_pn", "商品编号"), ("mpn", "厂家料号"),
                 ("manufacturer", "厂家"), ("category", "品类"), ("package", "封装"),
                 ("value", "值"), ("on_hand", "库存"), ("min_stock", "最低库存"),
                 ("unit", "单位"), ("note", "备注")]
@@ -709,9 +709,10 @@ class ComponentsTab(ttk.Frame):
         self._build_pick()
         self._load_cols()          # 上次勾的列设置,得在建第一屏之前读到
         self.go_home()
-        # 属性列:None = 自动挑(这一页真有值的属性),列表 = 用户自己勾的
-        self._want_attrs = None
-        self._attr_cols = []
+        # 列设置:None = 默认(基础列 + 自动挑两个属性);列表 = 用户自己安排好的
+        # 顺序,元素形如 "value" 或 "@耐压"
+        self._want_cols = None
+        self._slot_attr = {}       # a1..a12 -> 属性名
 
     # ---- 给自检用的快捷入口
     @property
@@ -753,7 +754,7 @@ class ComponentsTab(ttk.Frame):
         self.ent_q.pack(side="left")
         self.ent_q.bind("<Return>", lambda _e: self.open_search())
         ttk.Button(sbox, text="搜索", command=self.open_search).pack(side="left", padx=6)
-        ttk.Label(sbox, text="名称 / 立创编号 / 料号 / 封装 / 值 / 丝印 / 参数 / 备注",
+        ttk.Label(sbox, text="名称 / 商品编号 / 料号 / 封装 / 值 / 丝印 / 参数 / 备注",
                   style="Dim.TLabel").pack(side="left", padx=6)
 
         self.board = CardBoard(self.page_home, self.open_category, self._cat_menu)
@@ -762,6 +763,9 @@ class ComponentsTab(ttk.Frame):
     # ------------------------------------------------------ 页面:某个大类
 
     def _build_cat(self):
+        # 显示零库存:默认开。刚加的料库存是 0,不显示的话用户会以为没加进去(#22)。
+        # 必须在这里建:__init__ 是先调 _build_cat、后设其余状态位的
+        self.zero_stock = tk.BooleanVar(value=True)
         head = ttk.Frame(self.page_cat)
         head.pack(fill="x", pady=(0, 8))
         # 上一层而不是直接回首页:人在第三层的时候,想退的是第二层
@@ -793,6 +797,9 @@ class ComponentsTab(ttk.Frame):
         # 比如「0805 的电阻里有没有 1k~10k 的」。比的是解析出来的数值,不是字符串。
         bar = ttk.Frame(self.page_cat)
         bar.pack(fill="x", pady=(0, 6))
+        # 默认勾上:加完料一眼就能看见它(库存 0 也一样);只看有货的可以自己取消
+        ttk.Checkbutton(bar, text="显示零库存", variable=self.zero_stock,
+                        command=self.reload).pack(side="right")
         ttk.Label(bar, text="值").pack(side="left")
         self.f_min = tk.StringVar()
         self.f_max = tk.StringVar()
@@ -826,7 +833,7 @@ class ComponentsTab(ttk.Frame):
         # 这里是平表,不是树 —— 没有 #0 列,也就没有展开三角
         frame, self.tree = make_tree(top, [
             ("name", "名称", 190, "w", True),
-            ("lcsc_pn", "立创编号", 88, "center"),
+            ("lcsc_pn", "商品编号", 88, "center"),
             ("mpn", "厂家料号", 112, "w", True),
             # 厂家换成丝印:按「哪些字段真会被填」的统计,厂家只有 4/8 的表会记,
             # 而丝印是拆机料唯一能用来找回身份的东西,应该一眼看得到
@@ -836,10 +843,20 @@ class ComponentsTab(ttk.Frame):
             # 属性槽:标题在 _apply_attr_cols() 里按这一页实际有的属性动态填。
             # 定义 4 个空槽、靠 displaycolumns 决定露几个 —— 换列不用重建整张表,
             # 属性名是用户自己起的(耐压、精度、Vgs…),列根本没法写死。
+            # 属性槽:定义 12 个空槽,靠 displaycolumns 决定露哪几个、按什么顺序 ——
+            # 用户要「想显示什么就显示什么、顺序能调、数量还能加」,写死几列满足不了。
             ("a1", "", 74, "center"),
             ("a2", "", 74, "center"),
             ("a3", "", 74, "center"),
             ("a4", "", 74, "center"),
+            ("a5", "", 74, "center"),
+            ("a6", "", 74, "center"),
+            ("a7", "", 74, "center"),
+            ("a8", "", 74, "center"),
+            ("a9", "", 74, "center"),
+            ("a10", "", 74, "center"),
+            ("a11", "", 74, "center"),
+            ("a12", "", 74, "center"),
             ("on_hand", "现有", 55, "e"),
             ("min_stock", "安全", 50, "e"),
             # 需求/缺口/在途/该买 是**项目 BOM 的缺料口径**,不是库存本身的事,
@@ -1327,7 +1344,11 @@ class ComponentsTab(ttk.Frame):
             self.crumb.append({"kind": "pkg", "name": pkg_now})
         # 按 category_id 筛**整棵子树**:挂在子类下的元件文本仍然写着大类名,
         # 只按文本筛的话,「挂在子类」和「直接挂在顶层」根本分不出来
-        query = {"stocked": "1", "limit": "0", "sort": "value"}
+        # 「显示零库存」开着就**不传** stocked —— 传了新加的料(库存 0)会被 SQL
+        # 直接滤掉:加成功了却看不见,比报错还让人困惑(issue #22)
+        query = {"limit": "0", "sort": "value"}
+        if not self.zero_stock.get():
+            query["stocked"] = "1"
         if node["id"] is None:
             query["category"] = name
         else:
@@ -1432,7 +1453,7 @@ class ComponentsTab(ttk.Frame):
 
     def _fill(self, rows):
         # 属性列要按这一页**真有值**的属性来定,所以必须在插行之前算出来
-        self._apply_attr_cols(rows)
+        self._apply_cols(rows)
         clear_tree(self.tree)
         self._rows = {}
         for it in rows:
@@ -1448,6 +1469,9 @@ class ComponentsTab(ttk.Frame):
         keep = self.selected_id()
         # stocked=1:库存为 0 的元件在 SQL 层就被滤掉,二级页面自然只剩有货的
         data = call(self.con, server.list_components,
+                    # 总览 / 二级页**永远**只看有货的:导入 BOM 会留下一堆库存 0 的料,
+                    # 放开就会把真正到货的那些淹掉。要「看得见零库存」去叶子列表页
+                    # (那里默认开着,见 load_category)
                     query={"stocked": "1", "sort": "category"}, quiet=True)
         if data is None:
             return
@@ -1534,9 +1558,10 @@ class ComponentsTab(ttk.Frame):
             it.get("name") or "", it.get("lcsc_pn") or "", it.get("mpn") or "",
             it.get("marking") or "", it.get("package") or "",
             it.get("value") or "",
-            # 空格子补 "",保证位置和列定义一直对齐(这里是位置参数)
-            *[attrs.clean(it.get("params")).get(n, "")
-              for n in (list(self._attr_cols) + [""] * 4)[:4]],
+            # 每个槽按 _slot_attr 找自己那一列是哪个属性;元件没填这个属性就留空。
+            # 空槽也要补 "",位置参数一个都不能少
+            *[attrs.clean(it.get("params")).get(self._slot_attr.get(s, ""), "")
+              for s in self.ATTR_SLOTS],
             it.get("on_hand") or 0, it.get("min_stock") or 0,
             STATE_LABEL.get(it.get("stock_state"), ""), it.get("note") or ""),
             tags=(it.get("stock_state") or "",))
@@ -1582,21 +1607,47 @@ class ComponentsTab(ttk.Frame):
         ranked = sorted(seen, key=lambda n: (order.get(n, 999), -seen[n], n))
         return ranked[:2]
 
-    def _apply_attr_cols(self, rows):
-        """把这一页要露的属性列摆好(标题 + 显示哪些列)。"""
-        names = self._want_attrs
-        if names is None:
-            names = self._auto_attr_cols(rows)
-        self._attr_cols = list(names)[:4]
-        try:
-            all_cols = [str(c) for c in self.tree["columns"]]
-        except tk.TclError:
-            return
-        base = [c for c in all_cols if c not in ("a1", "a2", "a3", "a4")]
-        shown = base + [f"a{i + 1}" for i in range(len(self._attr_cols))]
-        for i in range(4):
-            key = f"a{i + 1}"
-            self.tree.heading(key, text=self._attr_cols[i] if i < len(self._attr_cols) else "")
+    # ------------------------------------------------------------ 列管理
+
+    # 属性列的槽位。定义 12 个空槽、靠 displaycolumns 决定露哪几个、按什么顺序。
+    ATTR_SLOTS = ["a%d" % _i for _i in range(1, 13)]
+
+    def _base_cols(self):
+        """表格里除属性槽以外的基础列(按定义顺序)。"""
+        return [c for c in (str(x) for x in self.tree["columns"])
+                if c not in self.ATTR_SLOTS]
+
+    def _base_labels(self):
+        """基础列的显示名 —— 直接取表头,省得再维护一份对照表。"""
+        return {c: str(self.tree.heading(c, "text")) for c in self._base_cols()}
+
+    def _default_cols(self, rows):
+        """默认列:基础列按原顺序,再接上自动挑出来的属性列。"""
+        return list(self._base_cols()) + ["@" + n for n in self._auto_attr_cols(rows)]
+
+    def _apply_cols(self, rows):
+        """摆好这一页要显示的列:**显示哪些、按什么顺序**都听用户的。"""
+        specs = self._want_cols
+        if specs is None:
+            specs = self._default_cols(rows)
+        base = self._base_cols()
+        self._slot_attr = {}
+        shown, slot_i = [], 0
+        for spec in specs:
+            spec = str(spec)
+            key = spec[1:] if spec.startswith("@") else spec
+            if key in base:
+                shown.append(key)
+            elif slot_i < len(self.ATTR_SLOTS):
+                slot = self.ATTR_SLOTS[slot_i]
+                self.tree.heading(slot, text=key)
+                self._slot_attr[slot] = key
+                shown.append(slot)
+                slot_i += 1
+        for slot in self.ATTR_SLOTS[slot_i:]:
+            self.tree.heading(slot, text="")
+        if not shown:                    # 一列都不勾,别给他一张空表
+            shown = base[:1]
         try:
             self.tree.configure(displaycolumns=shown)
         except tk.TclError:
@@ -1612,7 +1663,7 @@ class ComponentsTab(ttk.Frame):
             for name, val in attrs.clean(it.get("params")).items():
                 if val and name not in names:
                     names.append(name)
-        return names[:16]
+        return names[:20]
 
     def _col_cfg_path(self):
         """列设置存哪。放在**数据库文件旁边** —— 那个目录一定可写(程序就在那儿跑),
@@ -1632,7 +1683,8 @@ class ComponentsTab(ttk.Frame):
             return
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(db.dump_params({"attrs": self._want_attrs}))
+                f.write(db.dump_params({"cols": self._want_cols,
+                                        "zero_stock": bool(self.zero_stock.get())}))
         except OSError:
             pass              # 存不下就只影响"下次记住",不该弹错误打断人
 
@@ -1645,8 +1697,16 @@ class ComponentsTab(ttk.Frame):
                 cfg = db.parse_params(f.read())
         except OSError:
             return
-        want = cfg.get("attrs")
-        self._want_attrs = list(want) if isinstance(want, list) else None
+        if "zero_stock" in cfg:
+            self.zero_stock.set(bool(cfg.get("zero_stock")))
+        want = cfg.get("cols")
+        if isinstance(want, list):
+            self._want_cols = [str(x) for x in want]
+            return
+        # 兼容上一版存下来的 {"attrs": ["耐压", ...]}
+        old = cfg.get("attrs")
+        if isinstance(old, list):
+            self._want_cols = ["@" + str(n) for n in old]
 
     def pick_columns(self):
         """自己勾要显示哪几个属性列(一个都不勾 = 恢复自动挑)。"""
@@ -1658,11 +1718,15 @@ class ComponentsTab(ttk.Frame):
                 "在元件编辑窗口的「其他属性」里加上「耐压」「精度」这类名字,"
                 "它们就会出现在这个列表里。", parent=self)
             return
-        dlg = ColumnPickDialog(self, self._want_attrs, pool)
+        base = self._base_labels()
+        cur = self._want_cols
+        if cur is None:
+            cur = self._default_cols(list(self._rows.values()))
+        dlg = ColumnPickDialog(self, cur, pool, base, self._default_cols([]))
         self.wait_window(dlg)
         if not dlg.done:
             return
-        self._want_attrs = dlg.result
+        self._want_cols = dlg.result
         self._save_cols()
         self.reload()
         self.app.set_status("列设置已保存,下次打开还是这样", 5)
@@ -1741,6 +1805,20 @@ class ComponentsTab(ttk.Frame):
         self.app.wait_window(dlg)
         if dlg.done:
             self.app.refresh_all()
+            # 加完就把人送到那颗料上:开关关着就替他打开,否则他面对的还是一张
+            # 看不见新料的表(issue #22)
+            new_id = getattr(dlg, "new_id", None)
+            if new_id:
+                if not self.zero_stock.get():
+                    self.zero_stock.set(True)
+                    self._save_cols()
+                self.reload()
+                self._restore_selection(new_id)
+                try:
+                    self.tree.see(str(new_id))
+                except tk.TclError:
+                    pass
+                self.app.set_status("已加好,并定位到刚新增的这一颗", 6)
 
     def quick_in(self):
         dlg = QuickInDialog(self, self.app)
@@ -1797,54 +1875,170 @@ def category_options(con):
 
 
 class ColumnPickDialog(tk.Toplevel):
-    """勾选元件列表要显示哪些属性列。
+    """列管理:显示哪些列、按什么顺序。
 
-    一个都不勾 = 交给程序自动挑(这一页真有值的常用参数)。属性名是用户自己起的,
-    所以这里列的不是固定几项,而是「常用建议 + 库里真出现过的」。
+    用户的原话:「重要的东西显示在前面,不要的就用户自己隐藏掉」「显示的顺序也要
+    可调,我想把耐压放在前面我就放在前面」。所以这里是一张**能勾、能上下挪**的清单,
+    而不是一排写死的复选框。
     """
 
-    def __init__(self, parent, current, pool):
+    def __init__(self, parent, current, pool, base, default):
         super().__init__(parent)
-        self.title("显示哪些参数列")
+        self.title("显示哪些列、按什么顺序")
         self.transient(parent)
         self.resizable(False, False)
         self.done = False
         self.result = None
+        self._base = dict(base)
+        self._default = list(default)
+        self._shown = [str(s) for s in current]
 
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="勾上想直接看到的参数(不勾 = 自动挑常用的两个):",
-                  style="Dim.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(body,
+                  text="双击一行 = 显示 / 隐藏;选一行用 ↑ ↓ 调顺序(越靠上,表格里越靠左):",
+                  style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
 
-        self.vars = {}
-        cur = set(current or [])
-        grid = ttk.Frame(body)
-        grid.pack(fill="both", expand=True)
-        for i, name in enumerate(pool):
-            var = tk.BooleanVar(value=name in cur)
-            self.vars[name] = var
-            ttk.Checkbutton(grid, text=name, variable=var).grid(
-                row=i // 3, column=i % 3, sticky="w", padx=(0, 16), pady=2)
+        wrap = ttk.Frame(body)
+        wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(wrap, columns=("mark", "name", "where"),
+                                 show="headings", height=14, selectmode="browse")
+        for key, title, wdt, anc in (("mark", "显示", 46, "center"),
+                                     ("name", "列名", 170, "w"),
+                                     ("where", "来源", 70, "center")):
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=wdt, anchor=anc, stretch=(key == "name"))
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        self.tree.bind("<Double-1>", self._toggle)
+        self.tree.bind("<space>", self._toggle)
 
-        bar = ttk.Frame(self, padding=(12, 0, 12, 12))
-        bar.pack(fill="x")
-        ttk.Button(bar, text="自动", command=self._auto).pack(side="left")
-        ttk.Button(bar, text="确定", command=self._ok).pack(side="right")
-        ttk.Button(bar, text="取消", command=self.destroy).pack(side="right", padx=6)
-        self.bind("<Return>", lambda _e: self._ok())
+        # 清单 = 已显示的(按用户顺序)在前,其余基础列 / 属性列排后面
+        rest = self._default + ["@" + n for n in pool]
+        self.items = []
+        for spec in self._shown + [s for s in rest if s not in self._shown]:
+            if spec not in self.items:
+                self.items.append(spec)
+        self._refresh()
+
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(8, 0))
+        ttk.Button(bar, text="↑ 上移", command=lambda: self._move(-1)).pack(side="left")
+        ttk.Button(bar, text="↓ 下移", command=lambda: self._move(1)).pack(side="left", padx=4)
+        ttk.Button(bar, text="全选", command=lambda: self._all(True)).pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="全不选", command=lambda: self._all(False)).pack(side="left", padx=4)
+        ttk.Button(bar, text="恢复默认", command=self._reset).pack(side="left", padx=(12, 0))
+
+        add = ttk.Frame(body)
+        add.pack(fill="x", pady=(8, 0))
+        ttk.Label(add, text="再加一列属性:").pack(side="left")
+        self.v_new = tk.StringVar()
+        ent = ttk.Entry(add, textvariable=self.v_new, width=16)
+        ent.pack(side="left", padx=6)
+        ent.bind("<Return>", lambda _e: self._add())
+        ttk.Button(add, text="加进去", command=self._add).pack(side="left")
+        ttk.Label(add, text="(元件没填这个属性,那一格就是空的)",
+                  style="Dim.TLabel").pack(side="left", padx=8)
+
+        foot = ttk.Frame(self, padding=(12, 0, 12, 12))
+        foot.pack(fill="x")
+        ttk.Button(foot, text="确定", command=self._ok).pack(side="right")
+        ttk.Button(foot, text="取消", command=self.destroy).pack(side="right", padx=6)
         self.bind("<Escape>", lambda _e: self.destroy())
+        self.tree.focus_set()
 
-    def _auto(self):
-        self.result = None
-        self.done = True
-        self.destroy()
+    # ---------------------------------------------------------- 内部
+    def _label(self, spec):
+        spec = str(spec)
+        if spec.startswith("@"):
+            return spec[1:]
+        return self._base.get(spec) or spec
+
+    def _refresh(self):
+        keep = self.tree.selection()
+        keep = keep[0] if keep else None
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
+        for i, spec in enumerate(self.items):
+            self.tree.insert("", "end", iid=str(i), values=(
+                "✔" if spec in self._shown else "",
+                self._label(spec),
+                "属性" if str(spec).startswith("@") else "元件字段"))
+        kids = self.tree.get_children()
+        if keep and self.tree.exists(keep):
+            self.tree.selection_set(keep)
+            self.tree.see(keep)
+        elif kids:
+            self.tree.selection_set(kids[0])
+
+    def _sel(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _toggle(self, _event=None):
+        i = self._sel()
+        if i is None:
+            return
+        spec = self.items[i]
+        if spec in self._shown:
+            self._shown.remove(spec)
+        else:
+            self._shown.append(spec)
+        self._refresh()
+
+    def _move(self, d):
+        i = self._sel()
+        if i is None:
+            return
+        j = i + d
+        if not 0 <= j < len(self.items):
+            return
+        self.items[i], self.items[j] = self.items[j], self.items[i]
+        self._refresh()
+        self.tree.selection_set(str(j))
+        self.tree.see(str(j))
+
+    def _all(self, state):
+        self._shown = list(self.items) if state else []
+        self._refresh()
+
+    def _reset(self):
+        self._shown = list(self._default)
+        rest = self._default + [s for s in self.items if s not in self._default]
+        self.items = []
+        for spec in rest:
+            if spec not in self.items:
+                self.items.append(spec)
+        self._refresh()
+
+    def _add(self):
+        name = attrs.norm(self.v_new.get())
+        if not name:
+            return
+        spec = "@" + name
+        if spec not in self.items:
+            self.items.append(spec)
+        if spec not in self._shown:
+            self._shown.append(spec)
+        self.v_new.set("")
+        self._refresh()
+        self.tree.selection_set(str(self.items.index(spec)))
+        self.tree.see(str(self.items.index(spec)))
 
     def _ok(self):
-        picked = [n for n, v in self.vars.items() if v.get()]
-        self.result = picked or None      # 一个都不勾 = 自动
+        picked = [s for s in self.items if s in self._shown]
+        self.result = picked or None      # 一列都不勾 = 恢复默认
         self.done = True
         self.destroy()
-
 
 class CategoryStepBox(ttk.Frame):
     """一级一个框的品类选择器:选完上一级才出下一级,没有了就停。
@@ -2175,7 +2369,7 @@ class BomReviewDialog(tk.Toplevel):
     COLS = [
         ("row", "行", 42, "e"),
         ("name", "名称", 148, "w", True),
-        ("lcsc_pn", "立创编号", 82, "center"),
+        ("lcsc_pn", "商品编号", 82, "center"),
         ("value", "值", 68, "w"),
         ("package", "封装", 78, "w"),
         ("designators", "位号", 108, "w", True),
@@ -2348,7 +2542,7 @@ class SimilarDialog(tk.Toplevel):
 
     COLS = [
         ("name", "元件", 186, "w", True),
-        ("lcsc_pn", "立创编号", 86, "center"),
+        ("lcsc_pn", "商品编号", 86, "center"),
         ("value", "值", 74, "w"),
         ("package", "封装", 82, "w"),
         ("category", "品类", 78, "w"),
@@ -2515,7 +2709,7 @@ class MoveForm(ttk.Frame):
 
         f, self.tree = make_tree(left, [
             ("name", "名称", 175, "w", True),
-            ("lcsc_pn", "立创编号", 86, "center"),
+            ("lcsc_pn", "商品编号", 86, "center"),
             ("package", "封装", 88, "w"),
             ("on_hand", "库存", 54, "e"),
             ("state", "状态", 54, "center")], height=10)
@@ -3652,7 +3846,7 @@ class MovePane(ttk.Frame):
         f, self.t_rec = make_tree(box, [
             ("created_at", "时间", 140, "center"),
             ("component_name", "元件", 170, "w", True),
-            ("lcsc_pn", "立创编号", 86, "center"),
+            ("lcsc_pn", "商品编号", 86, "center"),
             ("qty", "数量", 52, "e"),
             ("location_code", "仓位", 84, "w"),
             ("operator", "操作人", 76, "center"),
@@ -3834,7 +4028,7 @@ class StockTab(ttk.Frame):
             ("created_at", "时间", 145, "center"),
             ("kind", "动作", 96, "center"),
             ("component_name", "元件", 190, "w", True),
-            ("lcsc_pn", "立创编号", 88, "center"),
+            ("lcsc_pn", "商品编号", 88, "center"),
             ("qty", "数量", 52, "e"),
             ("location_code", "仓位", 86, "w"),
             ("project_name", "项目", 130, "w", True),
@@ -3975,7 +4169,7 @@ class LineDetail(ttk.Frame):
         box = ttk.LabelFrame(self, text="这颗元件", padding=5)
         box.pack(fill="x", pady=(8, 0))
         self.v2 = {}
-        rows = [("值", "value"), ("封装", "package"), ("立创编号", "lcsc_pn"),
+        rows = [("值", "value"), ("封装", "package"), ("商品编号", "lcsc_pn"),
                 ("厂家料号", "mpn"),
                 # 用户自定义的属性(耐压 / 精度 / 功率 …)。收料清单那一列只放得下
                 # 值,完整的名=值在这里看 —— 属性填了总得有地方看全。
@@ -4220,7 +4414,7 @@ class ProjectsTab(ttk.Frame):
         # 收窄它们的基准宽度不损失信息;详情面板里能看到完整的名字。
         f2, self.t_bom = make_tree(bom_side, [
             ("name", "名称", 104, "w", True),
-            ("lcsc_pn", "立创编号", 62, "center"),
+            ("lcsc_pn", "商品编号", 62, "center"),
             ("value", "值", 50, "w"),
             ("package", "封装", 58, "w"),
             ("per_board", "单块", 36, "e"),
@@ -4348,7 +4542,7 @@ class ProjectsTab(ttk.Frame):
             return
         bid = int(sel[0])          # BOM 明细的 iid 就是 bom_id
         vals = self.t_bom.item(sel[0], "values")
-        # 列序:名称 / 立创编号 / 值 / 封装 / 单块 / 损耗 / 需求 / 现有 / 替代 / 缺口 / 标记 / 位号
+        # 列序:名称 / 商品编号 / 值 / 封装 / 单块 / 损耗 / 需求 / 现有 / 替代 / 缺口 / 标记 / 位号
         value, package = str(vals[2] or ""), str(vals[3] or "")
         if not (value or package):
             messagebox.showinfo(
@@ -4679,7 +4873,7 @@ class ProjectsTab(ttk.Frame):
             initialfile=f"缺料_{self.title.get()}.csv", filetypes=[("CSV", "*.csv")])
         if not path:
             return
-        cols = [("name", "名称"), ("lcsc_pn", "立创编号"), ("mpn", "厂家料号"),
+        cols = [("name", "名称"), ("lcsc_pn", "商品编号"), ("mpn", "厂家料号"),
                 ("manufacturer", "厂家"), ("package", "封装"), ("value", "值"),
                 ("required_qty", "需求"), ("placed_qty", "已领"), ("on_hand", "库存"),
                 ("gap", "缺口"), ("designators", "位号")]
@@ -4746,7 +4940,7 @@ class MovementsTab(ttk.Frame):
             ("created_at", "时间", 145, "center"),
             ("kind", "动作", 100, "center"),
             ("component_name", "元件", 175, "w"),
-            ("lcsc_pn", "立创编号", 88, "center"),
+            ("lcsc_pn", "商品编号", 88, "center"),
             ("qty", "数量", 55, "e"),
             ("location_code", "仓位", 90, "w"),
             ("to_location_code", "移到", 90, "w"),
@@ -4864,7 +5058,7 @@ class LocationsTab(ttk.Frame):
         ttk.Label(right, textvariable=self.summary, foreground="#666").pack(anchor="w", pady=(2, 6))
         f2, self.t_contents = make_tree(right, [
             ("name", "名称", 180, "w", True),
-            ("lcsc_pn", "立创编号", 90, "center"),
+            ("lcsc_pn", "商品编号", 90, "center"),
             ("value", "值", 75, "w"),
             ("package", "封装", 95, "w"),
             ("qty", "数量", 60, "e"),
@@ -5124,7 +5318,7 @@ class StocktakeDialog(tk.Toplevel):
 
         frame, self.tree = make_tree(body, [
             ("name", "名称", 205, "w", True),
-            ("lcsc_pn", "立创编号", 92, "center"),
+            ("lcsc_pn", "商品编号", 92, "center"),
             ("value", "值", 68, "w"),
             ("package", "封装", 82, "w"),
             ("was", "账面", 58, "e"),
@@ -5568,7 +5762,7 @@ class BatchInDialog(tk.Toplevel):
 class DedupeDialog(tk.Toplevel):
     """查重与合并 —— 收拾反复导入 BOM 长出来的重复料。
 
-    重复料是这类工具最难躲开的数据腐烂:同一颗电阻,一期 BOM 带着立创编号,
+    重复料是这类工具最难躲开的数据腐烂:同一颗电阻,一期 BOM 带着商品编号,
     另一期只有值和封装,于是库里长出两条,库存还分散记在两处。它不会自己好,
     只会越来越难收拾 —— 所以得有个地方能定期扫一遍。
 
@@ -5616,7 +5810,7 @@ class DedupeDialog(tk.Toplevel):
         ttk.Label(right, text="点一行选中「要保留的那条」,再把其余的并过来").pack(anchor="w")
         f2, self.t_items = make_tree(right, [
             ("name", "名称", 165, "w", True),
-            ("lcsc_pn", "立创编号", 86, "center"),
+            ("lcsc_pn", "商品编号", 86, "center"),
             ("mpn", "厂家料号", 108, "w"),
             ("value", "值", 60, "w"),
             ("package", "封装", 70, "w"),
@@ -6205,7 +6399,7 @@ class SubstituteDialog(tk.Toplevel):
 
         f, self.tree = make_tree(body, [
             ("name", "名称", 190, "w", True),
-            ("lcsc_pn", "立创编号", 95, "center"),
+            ("lcsc_pn", "商品编号", 95, "center"),
             ("value", "值", 75, "w"),
             ("package", "封装", 95, "w"),
             ("on_hand", "现有", 60, "e")], height=12)
@@ -6249,7 +6443,7 @@ class SubstituteDialog(tk.Toplevel):
 
 
 class ComponentPicker(tk.Toplevel):
-    """从库里挑一个元件。搜索支持名称 / 立创编号 / 厂家料号 / 值 / 封装。"""
+    """从库里挑一个元件。搜索支持名称 / 商品编号 / 厂家料号 / 值 / 封装。"""
 
     def __init__(self, parent, app: App, title="选一个元件", initial=None):
         super().__init__(parent)
@@ -6274,7 +6468,7 @@ class ComponentPicker(tk.Toplevel):
 
         f, self.tree = make_tree(body, [
             ("name", "名称", 210, "w", True),
-            ("lcsc_pn", "立创编号", 95, "center"),
+            ("lcsc_pn", "商品编号", 95, "center"),
             ("value", "值", 75, "w"),
             ("package", "封装", 100, "w"),
             ("on_hand", "现有", 60, "e"),
@@ -6342,7 +6536,7 @@ class QuickInDialog(tk.Toplevel):
         body.pack(fill="both", expand=True)
 
         ttk.Label(body, text="快速入库", style="Big.TLabel").pack(anchor="w")
-        ttk.Label(body, text="搜名称 / 立创编号 / 厂家料号 / 值 / 封装 / 丝印;"
+        ttk.Label(body, text="搜名称 / 商品编号 / 厂家料号 / 值 / 封装 / 丝印;"
                              "搜不到就直接回车新建。",
                   style="Dim.TLabel").pack(anchor="w", pady=(0, 8))
 
@@ -6379,7 +6573,7 @@ class QuickInDialog(tk.Toplevel):
 
         f, self.tree = make_tree(body, [
             ("name", "名称", 215, "w", True),
-            ("lcsc_pn", "立创编号", 88, "center"),
+            ("lcsc_pn", "商品编号", 88, "center"),
             ("value", "值", 68, "w"),
             ("package", "封装", 88, "w"),
             ("marking", "丝印", 70, "center"),
@@ -6491,7 +6685,7 @@ class ComponentDialog(tk.Toplevel):
     NO_LOC = "(不指定)"
     FIELDS = [
         ("name", "名称 *", None),
-        ("lcsc_pn", "立创编号", None),
+        ("lcsc_pn", "商品编号", None),
         ("mpn", "厂家料号", None),
         ("manufacturer", "厂家", None),
         ("category", "品类", "category"),
@@ -6639,7 +6833,7 @@ class ComponentDialog(tk.Toplevel):
         self.note.grid(row=r + 2, column=1, sticky="w", pady=3)
         self.note.insert("1.0", existing.get("note") or "")
 
-        ttk.Label(body, text="立创编号是识别主键;留空则用厂家料号。",
+        ttk.Label(body, text="商品编号、厂家料号都可以留空 —— 系统按「值 + 封装」自己认。",
                   style="Dim.TLabel").grid(row=r + 3, column=1, sticky="w", pady=(0, 6))
 
         btns = ttk.Frame(body)
@@ -6777,6 +6971,8 @@ class ComponentDialog(tk.Toplevel):
             res = call(self.con, server.create_component, body=body, parent=self)
         if res is None:
             return
+        # 记住这颗料的 id,好让列表页刷完直接选中它(issue #22)
+        self.new_id = self.cid or (res or {}).get("id")
         self.done = True
         self.destroy()
 

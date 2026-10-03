@@ -7,7 +7,7 @@ xlsx 和 csv 只差「怎么把文件变成二维表格」这一步,后面完全
 所以两种格式的识别规则、告警、品类推断不会各走各的。
 
 表头兼容 Altium / KiCad / EasyEDA / 立创 的常见写法,不区分大小写、忽略多余空格。
-没有立创编号时回退用厂家料号(MPN)作为识别键。
+没有商品编号时回退用厂家料号(MPN)作为识别键。
 """
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ HEADER_ALIASES: dict[str, list[str]] = {
     # 故意不收 "type"/"kind":那两列常常写的是 SMD / 直插 / 贴片,不是品类。
     "category": ["category", "品类", "分类", "类别", "元件类别", "component category"],
     "supplier_pn": ["supplier part", "supplier part number", "supplier part no",
-                    "supplier part #", "供应商料号", "供应商编号", "立创编号",
+                    "supplier part #", "供应商料号", "供应商编号", "商品编号",
                     "立创料号", "商品编号", "lcsc", "lcsc part", "lcsc part number",
                     "lcsc part no", "lcsc part #", "lcsc part number/商品编号"],
     "supplier": ["supplier", "供应商", "供货商", "vendor"],
@@ -296,12 +296,12 @@ def _to_int(val: Any) -> int | None:
 
 
 # 「身份」和「显示名」是两件事。以前它们挤在 name 一个字段里,后来出了个很难查的 bug:
-# 显示名是 `值 + 空格 + 封装`(1uF 0805),而 find_component() 在没有立创编号 / 厂家
+# 显示名是 `值 + 空格 + 封装`(1uF 0805),而 find_component() 在没有商品编号 / 厂家
 # 料号时**就是拿这个名字找同一颗料的**。也就是说,只要动了显示规则,匹配行为跟着变 ——
 # 有人要求「100nF 就是 100nF,别带封装」,一改,100nF 0603 和 100nF 0805 就算成同一个
 # 名字,下次导入把两颗不同的料静默并成一条,BOM 需求和库存全错,而且不报错、看不出来。
 #
-# 所以身份单独一个键,按优先级取:立创编号 > 厂家料号 > 值 + 封装。名字随便怎么改都
+# 所以身份单独一个键,按优先级取:商品编号 > 厂家料号 > 值 + 封装。名字随便怎么改都
 # 不影响匹配。
 
 
@@ -330,9 +330,9 @@ def identity_key(value: str | None, package: str | None, mpn: str | None,
                  lcsc: str | None, name: str | None = None) -> str:
     """算一颗料的匹配键。同一颗料反复导入必须算出同一个键。
 
-    优先级不能随手换 —— 立创编号是唯一的,厂家料号次之,两者都没有才退回「值 + 封装」:
+    优先级不能随手换 —— 商品编号是唯一的,厂家料号次之,两者都没有才退回「值 + 封装」:
 
-    - 立创编号 / 厂家料号:单独就足够定性,和封装无关(同一个编号只对应一种封装)
+    - 商品编号 / 厂家料号:单独就足够定性,和封装无关(同一个编号只对应一种封装)
     - 值和封装都进键:少任何一个,100nF 0603 和 100nF 0805 就会撞车
     - 连值和封装都没有(手填的、只有名字的元件):退回按名字 —— 这时候名字就是它
       唯一的身份,只能用它
@@ -366,7 +366,7 @@ def build_name(value: str | None, mpn: str | None,
     """拼一个人能读的显示名。**只放值,不带封装。**
 
     封装有自己单独一列,再拼进名字里是重复的,列表看着也脏。
-    值为空时退回厂家料号 / 立创编号 / 品类,保证名字永远不为空(name 是 NOT NULL)。
+    值为空时退回厂家料号 / 商品编号 / 品类,保证名字永远不为空(name 是 NOT NULL)。
     """
     if value and str(value).strip():
         return str(value).strip()
@@ -466,7 +466,7 @@ def rows_to_items(rows: list[list[Any]]) -> tuple[list[dict], list[str]]:
         value = _cell(row, cols, "value") or comment
         footprint = _cell(row, cols, "footprint")
 
-        # 识别键:立创编号 > 厂家料号 > 值+封装。
+        # 识别键:商品编号 > 厂家料号 > 值+封装。
         # 不能因为「没有料号」就把整行丢掉 —— KiCad 和 EasyEDA 的默认导出
         # 常常只有 Value + Footprint,这种行照样是能导进来的。
         if lcsc:
@@ -583,11 +583,15 @@ def upsert_component(con, item: dict) -> tuple[int, bool]:
         db.set_value_num(con, cid, item.get("value"))
         return cid, False
 
+    # 空串一律按 NULL 落库:`lcsc_pn` 是 UNIQUE 列,而 SQLite 里 NULL 之间不算冲突、
+    # `''` 和 `''` 算冲突 —— 直接传空串会 IntegrityError。server._nn 已经做了这一步,
+    # 这里以前漏了(当前调用方都先在解析阶段归一过,所以属于隐患而不是现网故障)。
     cur = con.execute(
         """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, value, package,
                                 identity_key)
            VALUES(?,?,?,?,?,?,?,?)""",
-        (item.get("lcsc_pn"), item.get("mpn"), item.get("manufacturer"),
+        (item.get("lcsc_pn") or None, item.get("mpn") or None,
+         item.get("manufacturer") or None,
          item["name"], item["category"], item.get("value"), item.get("package"),
          identity_key(item.get("value"), item.get("package"),
                       item.get("mpn"), item.get("lcsc_pn"), item.get("name"))),

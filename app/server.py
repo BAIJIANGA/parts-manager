@@ -426,7 +426,7 @@ def list_components(ctx: Ctx, m):
     if keyword:
         like = f"%{keyword}%"
         # 搜索是主入口,不是分类的补充 —— 所以凡是用户可能记得的碎片都要命中:
-        # 名称、立创编号、厂家料号、厂家、值、封装、**丝印**、**参数 JSON**、备注、品类。
+        # 名称、商品编号、厂家料号、厂家、值、封装、**丝印**、**参数 JSON**、备注、品类。
         # 丝印那一条是给拆机料用的:SOT-23 上只印着三个字母,查不到就等于没存。
         # 最后那一条是封装索引键:搜「C0805」要能搜到写成「0805」的那颗,
         # 搜「1005」也要能搜到 0402 —— 立创导出写 C0805、手写常常就是 0805,
@@ -552,7 +552,7 @@ def _one_component(ctx: Ctx, where: str, args: list):
 def resolve_component(ctx: Ctx, m):
     """把一句「人话」对上库里的一条元件 —— 批量粘贴入库时用。
 
-    规则按可靠程度排:立创编号 / 厂家料号 / 完全同名 的精确命中优先;
+    规则按可靠程度排:商品编号 / 厂家料号 / 完全同名 的精确命中优先;
     没有精确命中时,只有模糊搜索**唯一**命中一条才认,否则返回候选让人自己挑。
 
     宁可让人多看一眼,也不能猜错 —— 批量入库猜错一次就是几十个料进错地方,
@@ -616,17 +616,17 @@ def get_component(ctx: Ctx, m):
     return 200, out
 
 
-@route("POST", r"/api/components")
 def _nn(v):
     """空字符串一律按 NULL 落库。
 
     `lcsc_pn` 是 UNIQUE 列,而 SQLite 里 NULL 之间不算冲突、`''` 和 `''` 算冲突 ——
-    不填立创编号的新料,以前会报「数据冲突」,一颗都加不进去。
+    不填商品编号的新料,以前会报「数据冲突」,一颗都加不进去。
     update_component 那边本来就有这一步,create_component 漏了。
     """
     return v if not isinstance(v, str) or v.strip() else None
 
 
+@route("POST", r"/api/components")
 def create_component(ctx: Ctx, m):
     name = ctx.require("name")
     # 品类可以给 id(树上具体那个节点)或名字。给名字时顺带把品类行建出来 ——

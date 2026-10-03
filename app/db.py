@@ -2,7 +2,7 @@
 """数据库层:SQLite 建表、连接与通用工具。
 
 设计要点(参考 InvenTree 的建模,砍掉单机用不上的部分):
-  * 元件以「立创编号 LCSC C-号」为自然键,缺失时回退厂家料号(MPN)。
+  * 元件以「商品编号 LCSC C-号」为自然键,缺失时回退厂家料号(MPN)。
   * **库存余额(stock)与流水(movement)分离**:流水只增不改,余额可随时重算校验。
   * **仓位是层级的**(柜 → 层 → 格)。真实的料柜就是层级结构,平铺一层根本
     表达不了「A柜第 2 层左边那格」。structural=1 的仓位只用来分层,自己不装东西。
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS category (
 -- 元件主数据
 CREATE TABLE IF NOT EXISTS component (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  lcsc_pn       TEXT UNIQUE,                    -- 立创编号 C22367837
+  lcsc_pn       TEXT UNIQUE,                    -- 商品编号 C22367837
   mpn           TEXT,                           -- 厂家料号
   manufacturer  TEXT,                           -- 厂家
   name          TEXT NOT NULL,                  -- 显示名

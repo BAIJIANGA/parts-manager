@@ -105,7 +105,7 @@ async function renderComponents() {
   $('#view').innerHTML = `
     <div class="card">
       <div class="toolbar">
-        <input type="search" id="f-q" class="grow" placeholder="搜索:名称 / 立创编号 / 厂家料号 / 厂家 / 封装 / 值" value="${esc(f.q)}">
+        <input type="search" id="f-q" class="grow" placeholder="搜索:名称 / 商品编号 / 厂家料号 / 厂家 / 封装 / 值" value="${esc(f.q)}">
         <select id="f-cat">${categoryOptions(f.category)}</select>
         <select id="f-state">
           <option value="">全部状态</option>
@@ -118,7 +118,7 @@ async function renderComponents() {
           <option value="qty"${f.sort === 'qty' ? ' selected' : ''}>库存从少到多</option>
           <option value="qty_desc"${f.sort === 'qty_desc' ? ' selected' : ''}>库存从多到少</option>
           <option value="value"${f.sort === 'value' ? ' selected' : ''}>按值排序</option>
-          <option value="lcsc"${f.sort === 'lcsc' ? ' selected' : ''}>按立创编号</option>
+          <option value="lcsc"${f.sort === 'lcsc' ? ' selected' : ''}>按商品编号</option>
           <option value="updated"${f.sort === 'updated' ? ' selected' : ''}>最近修改</option>
         </select>
         <button class="primary" id="btn-new">＋ 新建元件</button>
@@ -160,7 +160,7 @@ async function loadComponents() {
     <div class="muted" style="margin-bottom:6px">共 <b>${data.total}</b> 条</div>
     <table>
       <thead><tr>
-        <th>名称</th><th>立创编号</th><th>封装</th><th>值</th><th>品类</th><th>厂家</th>
+        <th>名称</th><th>商品编号</th><th>封装</th><th>值</th><th>品类</th><th>厂家</th>
         <th class="num">库存</th><th>状态</th><th class="nowrap">操作</th>
       </tr></thead>
       <tbody>${data.items.map(rowHtml).join('')}</tbody>
@@ -225,7 +225,7 @@ async function componentDetail(id) {
         <span>现有库存 <b>${num(c.on_hand)}</b></span>
         <span>安全库存 <b>${num(c.min_stock)}</b></span>
         <span>品类 <b>${esc(c.category || '其他')}</b></span>
-        ${c.lcsc_pn ? `<span>立创 <b class="mono">${esc(c.lcsc_pn)}</b></span>` : ''}
+        ${c.lcsc_pn ? `<span>商品编号 <b class="mono">${esc(c.lcsc_pn)}</b></span>` : ''}
       </div>
       <div class="grid">
         <div><label>厂家料号</label><div class="mono">${esc(c.mpn || '—')}</div></div>
@@ -260,7 +260,7 @@ function componentForm(c) {
     <div class="modal-body">
       <div class="grid">
         <div class="full"><label>名称 *</label><input id="c-name" value="${esc(c.name || '')}" placeholder="例如 10kΩ 0603"></div>
-        <div><label>立创编号(LCSC C-号)</label><input id="c-lcsc" class="mono" value="${esc(c.lcsc_pn || '')}" placeholder="C2907002"></div>
+        <div><label>商品编号(厂家/商城编号,可留空)</label><input id="c-lcsc" class="mono" value="${esc(c.lcsc_pn || '')}" placeholder="C2907002"></div>
         <div><label>厂家料号 MPN</label><input id="c-mpn" value="${esc(c.mpn || '')}"></div>
         <div><label>厂家</label><input id="c-mfr" value="${esc(c.manufacturer || '')}"></div>
         <div><label>品类</label><select id="c-cat">${cats.map((x) => `<option${x === (c.category || '其他') ? ' selected' : ''}>${esc(x)}</option>`).join('')}</select></div>
@@ -325,7 +325,7 @@ async function moveForm(c, kind) {
     <div class="modal-body">
       <div class="grid">
         <div class="full"><label>元件 *</label>
-          <input id="m-pick" class="grow" placeholder="输入名称或立创编号搜索" value="${c ? esc(c.name) : ''}">
+          <input id="m-pick" class="grow" placeholder="输入名称或商品编号搜索" value="${c ? esc(c.name) : ''}">
           <div id="m-results"></div>
           <input type="hidden" id="m-cid" value="${c ? c.id : ''}">
         </div>
@@ -422,7 +422,7 @@ async function renderStock() {
     <div class="card">
       <h2>低库存 / 缺货预警 <span class="tag">${low.items.length}</span></h2>
       <div id="low-table">${low.items.length ? `
-        <table><thead><tr><th>名称</th><th>立创编号</th><th>封装</th>
+        <table><thead><tr><th>名称</th><th>商品编号</th><th>封装</th>
           <th class="num">库存</th><th class="num">安全库存</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>${low.items.map((c) => `<tr>
           <td><b>${esc(c.name)}</b></td><td class="mono">${esc(c.lcsc_pn || '—')}</td>
@@ -583,7 +583,7 @@ async function projectDetail(pid) {
 }
 
 function exportCsv(projectName, lines) {
-  const head = ['立创编号', '厂家料号', '名称', '品类', '封装', '需求', '现有', '缺口', '位号'];
+  const head = ['商品编号', '厂家料号', '名称', '品类', '封装', '需求', '现有', '缺口', '位号'];
   const esc2 = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const body = lines.map((l) => [l.lcsc_pn, l.mpn, l.name, l.category, l.package,
     l.required_qty, l.on_hand, l.gap, l.designators].map(esc2).join(','));

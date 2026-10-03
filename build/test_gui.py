@@ -303,6 +303,10 @@ def main() -> int:
         # ---- 点卡片 -> 独立的二级页面(不是树形展开)
         cat0, first = chosen[0]
         n0 = len(tab._cat_data[cat0])
+        # 二级页的表格和首页卡片是同一个列表控件;卡片数的是**有货的**,
+        # 所以这里先关掉「显示零库存」,让两者的口径一致(#22 把这个开关
+        # 交给了用户,默认开着是为了「加完料就看得见」)
+        tab.zero_stock.set(False)
         tab.open_category(cat0)
         app.update()
         check("点卡片后切到二级页面", tab.view, "cat")
@@ -2678,6 +2682,9 @@ def main() -> int:
             app.update()
             check("从子类退回上一层就回到中间页",
                   (_npages(tab37), "self" in tab37.pick_board.cards), (1, True))
+            # 「显示零库存」默认开着,而 own_stocked 数的是**有货**的元件;
+            # 这一条要保持它原本「只看有货」的语义,先把开关关掉(#22)
+            tab37.zero_stock.set(False)
             tab37._pick_one("self")
             app.update()
             check("进本级后面包屑多一格「本级」", _crumb(tab37)[-1:], ["本级"])
@@ -2703,34 +2710,115 @@ def main() -> int:
         check("一个属性都没填时,一列都不占",
               t39._auto_attr_cols([{"params": {}}, {"params": None}]), [])
         
-        t39._want_attrs = ["耐压", "精度"]
-        t39._apply_attr_cols([])
+        # 默认值要在**干净**环境里看:上一轮自检留下的 ui_columns.json 会把
+        # 开关带过来,那测的就不是默认值了
+        _cfg39clean = t39._col_cfg_path()
+        if _cfg39clean and os.path.exists(_cfg39clean):
+            os.remove(_cfg39clean)
+        _t39fresh = gui.ComponentsTab(app.nb, app)
+        check("新开的列表页默认就显示零库存(加完料一眼看得见)",
+              _t39fresh.zero_stock.get(), True)
+        _t39fresh.destroy()
+
+        t39._want_cols = ["@耐压", "@精度"]
+        t39._apply_cols([])
         _heads39 = [str(t39.tree.heading("a%d" % k, "text")) for k in (1, 2, 3, 4)]
         check("勾上的属性变成了列表的列标题", _heads39[:2], ["耐压", "精度"])
         _shown39 = [str(c) for c in t39.tree["displaycolumns"]]
         check("显示的是那两个槽", _shown39[-2:], ["a1", "a2"])
         check("没勾的空槽不显示", "a3" in _shown39, False)
-        
-        # 值要真的落到那一行上
-        t39._attr_cols = ["耐压", "精度"]
+
+        # 顺序可调 —— 用户原话「我想把耐压放在前面我就放在前面」
+        t39._want_cols = ["@耐压", "name"]
+        t39._apply_cols([])
+        check("耐压能被摆到最前面",
+              [str(c) for c in t39.tree["displaycolumns"]][:2], ["a1", "name"])
+        check("摆到前面那格的标题就是耐压", t39.tree.heading("a1", "text"), "耐压")
+
+        # 数量可加:不止两个
+        t39._want_cols = ["@耐压", "@精度", "@容差", "name"]
+        t39._apply_cols([])
+        check("属性列能加到三个",
+              [str(c) for c in t39.tree["displaycolumns"]][:3], ["a1", "a2", "a3"])
+
+        # 不重要的列能藏掉
+        t39._want_cols = ["name", "on_hand"]
+        t39._apply_cols([])
+        check("安全/状态/备注这些列能被用户藏掉",
+              [c for c in ("state", "note") if c in t39.tree["displaycolumns"]], [])
+
+        # 值要真的落到那一行上;没填的属性留空(不串位、也不是 None)
+        t39._want_cols = ["@耐压", "@精度", "@容差"]
+        t39._apply_cols([])
         t39._insert_component({"id": 990739, "name": "自检用", "package": "C0805",
                                "value": "100nF",
                                "params": {"耐压": "50V", "精度": "±5%"}})
         _vals39 = [str(v) for v in t39.tree.item("990739", "values")]
         check("行里带着耐压的值", "50V" in _vals39, True)
         check("行里带着精度的值", "±5%" in _vals39, True)
+        check("元件没填的属性那一格就是空的", _vals39[2], "")
         t39.tree.delete("990739")
-        
-        # 设置要能记住(存在数据库旁边的 ui_columns.json)
+
+        # 设置要能记住(存在数据库旁边的 ui_columns.json,顺序和开关一起)
         _cfg39 = t39._col_cfg_path()
+        t39._want_cols = ["@耐压", "name"]
+        t39.zero_stock.set(False)
         t39._save_cols()
         check("列设置写到了数据库旁边", bool(_cfg39) and os.path.exists(_cfg39), True)
-        t39._want_attrs = None
+        t39._want_cols = None
+        t39.zero_stock.set(True)
         t39._load_cols()
-        check("下次打开能读回来", t39._want_attrs, ["耐压", "精度"])
-        t39._want_attrs = None          # 恢复出厂:自动挑
+        check("下次打开能原样读回来(含顺序)", t39._want_cols, ["@耐压", "name"])
+        check("「显示零库存」也跟着记住", t39.zero_stock.get(), False)
+
+        # 列管理窗口本身:能勾、能调序、能加属性
+        _dlg39 = gui.ColumnPickDialog(t39, ["name", "on_hand"], t39._attr_pool(),
+                                      t39._base_labels(), t39._default_cols([]))
+        app.update()
+        check("列管理窗口列出了候选列", len(_dlg39.items) >= 2, True)
+        check("取消一列", (_dlg39._shown.remove("name") or True)
+              if "name" in _dlg39._shown else False, True)
+        _dlg39._shown.append("name")
+        _first39 = _dlg39.items[0]
+        _dlg39._sel = lambda: 0                    # 选中第一行再往下挪
+        _dlg39._move(1)
+        check("↓ 能把一列往下挪", _dlg39.items[1], _first39)
+        _dlg39.v_new.set("容差")
+        _dlg39._add()
+        check("能自己加一列属性名", "@容差" in _dlg39._shown, True)
+        _dlg39.destroy()
+
+        # #22 的原始场景:库存为 0 的新料确实存在(以前在 SQL 层就被滤掉)
+        _dlg22 = gui.ComponentDialog(t39, app, None)
+        _dlg22.vars["name"].set("自检-零库存新料")
+        _dlg22.save()
+        app.update()
+        check("新增弹窗回传了新料的 id", bool(getattr(_dlg22, "new_id", None)), True)
+        check("新料真的落库了",
+              int(app.con.execute("SELECT COUNT(*) FROM component WHERE name=?",
+                                  ("自检-零库存新料",)).fetchone()[0]), 1)
+        check("新料库存是 0(所以「只看有货」时它根本不会出现)",
+              float(app.con.execute(
+                  "SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?",
+                  (_dlg22.new_id,)).fetchone()[0]), 0.0)
+
+        # 开关真的在管 SQL:同一级,开着比关着多出「零库存」的那些
+        _node39 = t39._last_cat()
+        if _node39:
+            t39.zero_stock.set(True)
+            t39.load_category(_node39)
+            _on39 = len(t39.tree.get_children())
+            t39.zero_stock.set(False)
+            t39.load_category(_node39)
+            _off39 = len(t39.tree.get_children())
+            check("开关开着时能多看到零库存的料(以前在 SQL 层就被滤掉)",
+                  _on39 > _off39, True)
+            p("  这一级:开着 %d 条 / 关掉 %d 条" % (_on39, _off39))
+
+        t39._want_cols = None          # 恢复出厂:自动挑
+        t39.zero_stock.set(True)
         t39._save_cols()
-        t39._apply_attr_cols([])
+        t39._apply_cols([])
         
         p("\n【38】刷新不能把选中和「最近流水」刷没")
         
