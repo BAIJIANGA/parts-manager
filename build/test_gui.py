@@ -315,9 +315,19 @@ def main() -> int:
         check("二级表里每行库存都 > 0",
               all(float(tab.tree.item(k, "values")[k_qty]) > 0
                   for k in tab.tree.get_children()), True)
-        # 这五列是这次重做的核心:我有什么 / 要多少 / 缺多少 / 在路上多少 / 该买多少
-        for col in ("现有", "安全", "需求", "缺口", "在途", "该买"):
+        # 库存页只讲库存:我有多少 / 安全线是多少
+        for col in ("现有", "安全"):
             check(f"二级表有「{col}」列", col in cols, True)
+        # 需求/缺口/在途/该买是**项目 BOM 的缺料口径**,摆在库存页会让人以为"我缺料了"。
+        # 项目页和 BOM 复核里都有,这里整列去掉(用户明确要求)。
+        for col in ("需求", "缺口", "在途", "该买"):
+            check(f"二级表没有「{col}」列(缺料信息属于项目页)", col in cols, False)
+        check("元件表格是多选的(批量挪品类靠它)",
+              "extended" in str(tab.tree.cget("selectmode")), True)
+        check("列表页有就地加子类的方法",
+              callable(getattr(tab, "add_sub_here", None)), True)
+        check("列表页有批量挪品类的方法",
+              callable(getattr(tab, "move_to_category", None)), True)
         show = str(tab.tree.cget("show"))
         check("二级是平表,没有展开三角",
               "headings" in show and "tree" not in show, True)
@@ -2676,6 +2686,33 @@ def main() -> int:
         check("回到首页后面包屑清空", _crumb(tab37), [])
 
         app.refresh_all()
+        p("\n【38】刷新不能把选中和「最近流水」刷没")
+        
+        # 重建表格会让 Tk 发 <<TreeviewSelect>>,那一刻 selected_id() 是空的,
+        # _on_select 于是把右下角「仓位分布 / 最近流水」清空 —— 用户看到的
+        # 「出入库流水没显示」就是这么来的(流水其实写进去了)。
+        t38 = app.tab_comp
+        app.nb.select(t38)
+        app.update()
+        _kids38 = t38.tree.get_children()
+        if _kids38:
+            t38.tree.selection_set(_kids38[0])
+            app.update()
+            _hist38 = len(t38.t_hist.get_children())
+            _stock38 = len(t38.t_stock.get_children())
+            check("选中的行确实填了流水/仓位",
+                  _hist38 > 0 or _stock38 > 0, True)
+            t38.reload()
+            app.update()
+            check("reload 之后选中还在",
+                  tuple(t38.tree.selection()), (_kids38[0],))
+            check("reload 之后「最近流水」没被清空",
+                  len(t38.t_hist.get_children()), _hist38)
+            check("reload 之后「仓位分布」没被清空",
+                  len(t38.t_stock.get_children()), _stock38)
+        else:
+            p("  (这一页没有行,跳过)")
+        
         app.update()
         p("  [OK ] 全量刷新")
         app.destroy()

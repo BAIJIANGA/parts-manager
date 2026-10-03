@@ -617,6 +617,16 @@ def get_component(ctx: Ctx, m):
 
 
 @route("POST", r"/api/components")
+def _nn(v):
+    """空字符串一律按 NULL 落库。
+
+    `lcsc_pn` 是 UNIQUE 列,而 SQLite 里 NULL 之间不算冲突、`''` 和 `''` 算冲突 ——
+    不填立创编号的新料,以前会报「数据冲突」,一颗都加不进去。
+    update_component 那边本来就有这一步,create_component 漏了。
+    """
+    return v if not isinstance(v, str) or v.strip() else None
+
+
 def create_component(ctx: Ctx, m):
     name = ctx.require("name")
     # 品类可以给 id(树上具体那个节点)或名字。给名字时顺带把品类行建出来 ——
@@ -628,7 +638,7 @@ def create_component(ctx: Ctx, m):
                                 product_url, unit, min_stock, reorder_qty, supplier,
                                 unit_price, default_loc_id, note, identity_key)
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (ctx.b("lcsc_pn"), ctx.b("mpn"), ctx.b("manufacturer"), name,
+        (_nn(ctx.b("lcsc_pn")), _nn(ctx.b("mpn")), _nn(ctx.b("manufacturer")), name,
          cat_text, cat_id, ctx.b("value"), ctx.b("package"),
          footprint.canon(ctx.b("package")),
          ctx.b("marking"), db.dump_params(ctx.b("params")),
@@ -1293,10 +1303,30 @@ def _log_move(con, kind, component_id, location_id, qty, *, to_location_id=None,
 
 
 def _get_location_id(con, code_or_id) -> int:
-    """接受仓位 id 或编码。"""
+    """接受仓位 id、编码,或者**路径**(「A柜 / 01层 / 02格」)。
+
+    快速入库 / 批量入库的下拉给的是路径,以前这里只认 id/code,认不出来就静默
+    `INSERT INTO location(code)` —— 货会记进一个凭空冒出来的顶层仓位,仓位表跟着
+    被污染,别处的仓位下拉里也就多出这条怪名字。
+    """
     if code_or_id in (None, ""):
         raise ApiError(400, "缺少仓位")
     s = str(code_or_id)
+    if "/" in s:
+        # 按路径找真身。找不到不报错,继续往下走老路(手打新仓位名要能用)
+        try:
+            hit = con.execute(
+                """WITH RECURSIVE up(id, path) AS (
+                       SELECT id, code FROM location WHERE parent_id IS NULL
+                       UNION ALL
+                       SELECT l.id, up.path || ' / ' || l.code
+                         FROM location l JOIN up ON l.parent_id = up.id)
+                   SELECT id FROM up WHERE path = ? LIMIT 1""",
+                (s.strip(),)).fetchone()
+        except Exception:
+            hit = None
+        if hit:
+            return int(hit["id"])
     if s.isdigit():
         row = con.execute("SELECT id FROM location WHERE id=?", (int(s),)).fetchone()
         if row:

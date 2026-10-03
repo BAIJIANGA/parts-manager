@@ -1636,6 +1636,90 @@ check("封装认不出类别时不推翻",
       bom.classify(["U1"], "SOT-23-5", "", "电容")[0], "电容")
 
 # ---- 全库扫描:文本和树上顶层名字必须处处一致
+
+p("\n【37】按仓位**路径**入库,不能新建幽灵仓位")
+
+# 快速入库/批量入库的下拉给的是路径(「A柜 / 01层 / 02格」)。后端以前只认 id/code,
+# 认不出来就 INSERT 一个新顶层仓位 —— 货记到那儿去了,仓位表也被污染。
+# 测试库可能是上次跑剩的:同名仓位先清掉,免得撞 location.code 的唯一约束
+CON.execute("DELETE FROM location WHERE code IN ('测试柜R7', '01层R7', '02格R7')")
+CON.commit()
+_root37 = CON.execute(
+    "INSERT INTO location(code, parent_id) VALUES('测试柜R7', NULL)").lastrowid
+_mid37 = CON.execute(
+    "INSERT INTO location(code, parent_id) VALUES('01层R7', ?)",
+    (_root37,)).lastrowid
+_leaf37 = CON.execute(
+    "INSERT INTO location(code, parent_id) VALUES('02格R7', ?)",
+    (_mid37,)).lastrowid
+CON.commit()
+_n_before37 = CON.execute("SELECT COUNT(*) AS n FROM location").fetchone()["n"]
+_cid37 = call(server.list_components, query={"limit": "1"})[1]["items"][0]["id"]
+_s37, _r37 = call(server.stock_move,
+                  body={"kind": "IN", "component_id": _cid37, "qty": 1,
+                        "location": "测试柜R7 / 01层R7 / 02格R7"})
+check("按路径入库成功", _s37, 200)
+check("流水落在真正的那个仓位 id 上",
+      CON.execute("SELECT location_id AS l FROM movement WHERE id=?",
+                  (_r37["movement_id"],)).fetchone()["l"], _leaf37)
+check("仓位表没有多出任何一行(没造出幽灵仓位)",
+      CON.execute("SELECT COUNT(*) AS n FROM location").fetchone()["n"],
+      _n_before37)
+# 手打一个真没有的仓位名,仍旧要能新建(这条路必须留着)
+_n_before37b = CON.execute("SELECT COUNT(*) AS n FROM location").fetchone()["n"]
+_s37b, _r37b = call(server.stock_move,
+                    body={"kind": "IN", "component_id": _cid37, "qty": 1,
+                          "location": "手打的新格子"})
+check("手打新仓位名仍旧能新建", _s37b, 200)
+check("确实多了一个仓位",
+      CON.execute("SELECT COUNT(*) AS n FROM location").fetchone()["n"],
+      _n_before37b + 1)
+
+p("\n【36】批量挪品类:只改归属,不碰库存和流水")
+
+# 用户的原话:「我想要增加封装 R0805,把这个一排的元件放下面去」——
+# 界面上是多选 + 「挪到品类…」,后端这条路就是 update_component(category_id=...)。
+_s, _t36 = call(server.list_categories)
+_t36 = [n for n in _t36["flat"] if n["name"] == "电容"]
+check("有可用的目标品类", len(_t36) >= 1, True)
+_s, _new36 = call(server.create_category,
+                  body={"name": "R0805 测试", "parent_id": _t36[0]["id"]})
+check("新建子类拿到了 id", bool((_new36 or {}).get("id")), True)
+_nid36 = (_new36 or {}).get("id")
+_s, _src36 = call(server.list_components, query={"limit": "3"})
+_targets36 = _src36["items"][:3]
+check("库里有可挪的元件", len(_targets36) > 0, True)
+_before36 = {i["id"]: (i.get("on_hand") or 0) for i in _targets36}
+_moved36 = 0
+for _i in _targets36:
+    _s2, _r2 = call(server.update_component, match=(str(_i["id"]),),
+                    body={"category_id": _nid36})
+    if _s2 in (200, 201):
+        _moved36 += 1
+check("每一颗都挪成功了", _moved36, len(_targets36))
+check("category_id 指向新节点",
+      [CON.execute("SELECT category_id AS c FROM component WHERE id=?",
+                   (_i["id"],)).fetchone()["c"] for _i in _targets36],
+      [_nid36] * len(_targets36))
+# category 存的一直是**顶层**大类名(和 category_id 指向那一支保持一致),
+# 叶子归属只由 category_id 决定 —— 所以这里期望的是顶层名,不是新节点自己的名字
+check("品类文本跟新节点那一支的顶层名一致",
+      [CON.execute("SELECT category AS c FROM component WHERE id=?",
+                   (_i["id"],)).fetchone()["c"] for _i in _targets36],
+      ["电容"] * len(_targets36))
+check("新节点确实在「电容」这一支下面",
+      CON.execute("SELECT COUNT(*) AS n FROM category WHERE id=? AND name='R0805 测试'",
+                  (_nid36,)).fetchone()["n"], 1)
+check("挪品类不动库存",
+      [CON.execute("SELECT COALESCE(SUM(qty),0) AS q FROM stock WHERE component_id=?",
+                   (_i["id"],)).fetchone()["q"] for _i in _targets36],
+      [_before36[_i["id"]] for _i in _targets36])
+# 挪回原位,别把后面的扫描搞乱
+for _i in _targets36:
+    call(server.update_component, match=(str(_i["id"]),),
+         body={"category_id": _i["category_id"]}) if _i.get("category_id") else None
+
+
 _mism = 0
 for _r in CON.execute("SELECT id, category, category_id FROM component "
                       "WHERE category_id IS NOT NULL"):

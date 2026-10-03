@@ -754,6 +754,9 @@ class ComponentsTab(ttk.Frame):
         ttk.Button(head, text="＋ 新增元件", command=self.add).pack(side="right")
         ttk.Button(head, text="编辑", command=self.edit).pack(side="right", padx=6)
         ttk.Button(head, text="删除", command=self.delete).pack(side="right")
+        # 人已经站在这一级上了,加子类不该逼他退回首页再找位置
+        ttk.Button(head, text="＋ 新建子类", command=self.add_sub_here).pack(
+            side="right", padx=6)
 
         # 封装这一级(菜单的第三级)。做成一行可点的芯片,而不是又一页:
         # 同一个大类里封装通常只有两三种,为它单开一页会把「看一眼料」变成三次点击。
@@ -806,10 +809,9 @@ class ComponentsTab(ttk.Frame):
             ("value", "值", 68, "w"),
             ("on_hand", "现有", 55, "e"),
             ("min_stock", "安全", 50, "e"),
-            ("required", "需求", 55, "e"),
-            ("deficit", "缺口", 55, "e"),
-            ("on_order", "在途", 55, "e"),
-            ("to_order", "该买", 55, "e"),
+            # 需求/缺口/在途/该买 是**项目 BOM 的缺料口径**,不是库存本身的事,
+            # 摆在库存页只会让人以为"我缺料了"。它们在项目页和 BOM 复核里都有,
+            # 这里整列去掉,腾出来的宽度留给真正的库存信息和后面的属性列。
             ("state", "状态", 55, "center"),
             ("note", "备注", 130, "w", True),
         ], height=14)
@@ -820,6 +822,8 @@ class ComponentsTab(ttk.Frame):
         self.tree.tag_configure("low", background="#fff6dd")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-1>", self._on_double)
+        # 多选:把一整排元件挪到同一个新品类下,是这一页最常见的批量操作
+        self.tree.configure(selectmode="extended")
 
         self.menu = tk.Menu(self, tearoff=0)
         self.menu.add_command(label="入库", command=lambda: self._quick_move("IN"))
@@ -827,6 +831,7 @@ class ComponentsTab(ttk.Frame):
         self.menu.add_command(label="盘点", command=lambda: self._quick_move("ADJUST"))
         self.menu.add_command(label="移库", command=lambda: self._quick_move("TRANSFER"))
         self.menu.add_separator()
+        self.menu.add_command(label="挪到品类…", command=self.move_to_category)
         self.menu.add_command(label="编辑…", command=self.edit)
         self.menu.add_command(label="删除", command=self.delete)
         self.tree.bind("<Button-3>", self._popup)
@@ -1120,6 +1125,68 @@ class ComponentsTab(ttk.Frame):
         self.app.set_status(f"加好了「{node['path']} / {name}」", 5)
         self.reload()
 
+    def add_sub_here(self):
+        """在**当前这一级**下面新建子类。
+
+        列表页原来只有「＋ 新增元件 / 编辑 / 删除」,想加子类得退回库存首页 ——
+        而人明明已经站在这一级上了。用户的原话:「我想要增加封装 R0805,
+        把这个一排的元件放下面去,就没有这个按键,只能跑到库存首页去新建」。
+        所以这里不只建类:建完顺手问一句要不要把**选中的那些元件**挪进去。
+        """
+        node = self._last_cat()
+        if node is None or node.get("id") is None:
+            self.go_home()
+            return
+        self._load_cat_tree()
+        live = self._cat_flat.get(node["id"])
+        if live is None:
+            self.reload()
+            return
+        picked = self.selected_ids()
+        name = ask_text(self, "新增子品类",
+                        f"挂在「{live['path']}」下面的新品类叫什么?", "")
+        if not name:
+            return
+        res = call(self.con, server.create_category, parent=self,
+                   body={"name": name, "parent_id": live["id"]})
+        if res is None:
+            return
+        self.app.set_status(f"加好了「{live['path']} / {name}」", 5)
+        new_id = (res or {}).get("id")
+        if picked and new_id:
+            if messagebox.askyesno(
+                    "顺手挪一下?",
+                    f"把选中的 {len(picked)} 颗元件挪到「{live['path']} / {name}」下面吗?\n\n"
+                    "只改它们挂在哪个品类下,库存和流水都不动。", parent=self):
+                self._move_ids_to(picked, int(new_id), f"{live['path']} / {name}")
+        self.reload()
+
+    def move_to_category(self):
+        """把选中的元件一次性挪到某个品类路径下。"""
+        picked = self.selected_ids()
+        if not picked:
+            return
+        here = self._last_cat()
+        dlg = CategoryPickerDialog(self, self.app,
+                                  cat_id=(here or {}).get("id"))
+        self.wait_window(dlg)
+        target, path = dlg.result
+        if target is None:
+            return
+        self._move_ids_to(picked, int(target), path)
+        self.reload()
+
+    def _move_ids_to(self, ids, target_id, path):
+        """批量改归属。只动 category / category_id,不碰库存和流水。"""
+        done = 0
+        for cid in ids:
+            res = call(self.con, server.update_component, parent=self,
+                       match=(str(cid),), body={"category_id": int(target_id)})
+            if res is not None:
+                done += 1
+        self.app.set_status(f"{done} 颗元件挪到了「{path}」", 6)
+        return done
+
     def rename_cat(self, node):
         name = ask_text(self, "改品类名", "新的名字:", node["name"])
         if not name or name == node["name"]:
@@ -1340,6 +1407,10 @@ class ComponentsTab(ttk.Frame):
     # ------------------------------------------------------ 数据
 
     def reload(self):
+        # 刷新前记住选中的那一行:重建表格会让 Tk 发 <<TreeviewSelect>>,
+        # 那一刻 selected_id() 是空的,右下角「仓位分布 / 最近流水」会被
+        # 一并清掉 —— 用户报的「出入库流水没显示」其实是这么来的(流水写进去了)。
+        keep = self.selected_id()
         # stocked=1:库存为 0 的元件在 SQL 层就被滤掉,二级页面自然只剩有货的
         data = call(self.con, server.list_components,
                     query={"stocked": "1", "sort": "category"}, quiet=True)
@@ -1384,6 +1455,9 @@ class ComponentsTab(ttk.Frame):
             else:
                 self.go_home()
 
+        # 选中设回去,Tk 会重新触发 _on_select,两张表跟着恢复
+        self._restore_selection(keep)
+
     def _reopen_path(self):
         """刷新之后把用户留在原来那一层,而不是弹回首页。
 
@@ -1420,13 +1494,11 @@ class ComponentsTab(ttk.Frame):
         self.board.render(specs, empty_text="还没有元件入库。")
 
     def _insert_component(self, it):
-        # 需求/缺口/在途/该买 为 0 时留空 —— 一列 0 会把真正要注意的数字淹掉
+        # 顺序必须和 _build_cat 里的列定义一致 —— 这里是位置参数,不是按名字填的
         self.tree.insert("", "end", iid=str(it["id"]), values=(
             it.get("name") or "", it.get("lcsc_pn") or "", it.get("mpn") or "",
             it.get("marking") or "", it.get("package") or "",
             it.get("value") or "", it.get("on_hand") or 0, it.get("min_stock") or 0,
-            it.get("required") or "", it.get("deficit") or "",
-            it.get("on_order") or "", it.get("to_order") or "",
             STATE_LABEL.get(it.get("stock_state"), ""), it.get("note") or ""),
             tags=(it.get("stock_state") or "",))
 
@@ -1440,6 +1512,28 @@ class ComponentsTab(ttk.Frame):
     def selected_id(self):
         sel = self.tree.selection()
         return int(sel[0]) if sel else None
+
+    def _restore_selection(self, cid):
+        """刷新之后把选中还回去。
+
+        重建表格会触发 <<TreeviewSelect>>,而那次回调里 selected_id() 是 None ——
+        _on_select 一进来就清空「仓位分布 / 最近流水」,于是这两张表每次刷新都变空白,
+        看起来像出入库没记流水。把选中设回去,Tk 会再触发一次 _on_select,两张表回来。
+        """
+        if not cid or not self.tree.exists(str(cid)):
+            return
+        self.tree.selection_set(str(cid))
+        self.tree.see(str(cid))
+
+    def selected_ids(self):
+        """选中的全部元件 id。表格是多选的 —— 批量挪品类靠它。"""
+        out = []
+        for iid in self.tree.selection():
+            try:
+                out.append(int(iid))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     # ------------------------------------------------------ 选中与右键
 
@@ -1484,7 +1578,12 @@ class ComponentsTab(ttk.Frame):
             self.app.refresh_all()
 
     def add(self):
-        dlg = ComponentDialog(self, self.app, None)
+        # 把「我正站在哪一级」带进弹窗 —— 不带的话新料会被后端兜底丢到根级「其他」,
+        # 和用户所在的位置毫无关系(用户报的正是这个)。
+        # 只认 view=="cat":搜索页复用同一张表,但 crumb 里还留着上一次钻取的路径,
+        # 照带就会把料挂到上一次那个品类上。
+        node = self._last_cat() if self.view == "cat" else None
+        dlg = ComponentDialog(self, self.app, None, cat_id=(node or {}).get("id"))
         self.app.wait_window(dlg)
         if dlg.done:
             self.app.refresh_all()
@@ -6196,11 +6295,13 @@ class ComponentDialog(tk.Toplevel):
         ("product_url", "商品链接", None),
     ]
 
-    def __init__(self, parent, app: App, cid):
+    def __init__(self, parent, app: App, cid, cat_id=None):
         super().__init__(parent)
         self.app = app
         self.con = app.con
         self.cid = cid
+        # 新建时「默认挂到我现在站的这一级」——由 ComponentsTab.add() 传进来
+        self.cat_id = cat_id
         self.done = False
         self.vars = {}
         self._loc_map = {}          # 显示路径 -> location id
@@ -6261,6 +6362,10 @@ class ComponentDialog(tk.Toplevel):
                 cid_cur = existing.get("category_id")
                 if cid_cur and cid_cur in self._cat_by_id:
                     cur_cat = self._cat_by_id[cid_cur]
+                elif not cid and cat_id in self._cat_by_id:
+                    # 新建:预填成用户当前所在的那一级(全路径),保存时就落在这一级
+                    cid_cur = cat_id
+                    cur_cat = self._cat_by_id[cat_id]
                 var = tk.StringVar(value=cur_cat)
                 self._picked_cat_id = cid_cur if cid_cur in self._cat_by_id else None
                 self._picked_cat_label = cur_cat if self._picked_cat_id else ""
