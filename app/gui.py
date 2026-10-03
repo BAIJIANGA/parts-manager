@@ -1084,6 +1084,363 @@ class ComponentsTab(ttk.Frame):
 
 # --------------------------------------------------------------------- 出入库
 
+def category_options(con):
+    """品类下拉的选项。统一从后端 meta 拿,免得界面上再维护第二份清单。"""
+    meta = call(con, server.meta, quiet=True) or {}
+    return list(meta.get("categories") or []) or ["其他"]
+
+
+class CategoryDialog(tk.Toplevel):
+    """挑一个品类。双击 BOM 行单独改的时候用。"""
+
+    def __init__(self, parent, app: App, current="", options=None):
+        super().__init__(parent)
+        self.title("改品类")
+        self.transient(parent.winfo_toplevel())
+        self.resizable(False, False)
+        self.value = None
+        opts = list(options or []) or ["其他"]
+        cur = str(current or "").strip()
+        if cur and cur not in opts:
+            opts = [cur] + opts       # 库里已有的词也要能选回来
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="这一行算哪一类?").grid(row=0, column=0, sticky="w")
+        self.var = tk.StringVar(value=cur or opts[0])
+        # 故意**不**设成 readonly:下拉只是建议。推断不出来的品类(光耦、
+        # 传感器模块……)必须能自己打进去,否则用户只能挑一个最接近的凑合 ——
+        # 那等于把「猜错了」换成「被迫选了个不准确的」
+        cb = ttk.Combobox(body, textvariable=self.var, values=opts, width=24)
+        cb.grid(row=1, column=0, sticky="w", pady=(6, 14))
+        btns = ttk.Frame(body)
+        btns.grid(row=2, column=0, sticky="e")
+        ttk.Button(btns, text="取消", command=self.destroy, width=10).pack(side="right")
+        ttk.Button(btns, text="确定", command=self.ok, width=10).pack(side="right", padx=6)
+        self.bind("<Return>", lambda _e: self.ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        cb.focus_set()
+
+    def ok(self):
+        self.value = self.var.get().strip() or "其他"
+        self.destroy()
+
+
+def ask_category(parent, app: App, current="", options=None):
+    d = CategoryDialog(parent, app, current, options)
+    parent.winfo_toplevel().wait_window(d)
+    return d.value
+
+
+class BomReviewDialog(tk.Toplevel):
+    """导入 BOM 之前,先让人把品类过一遍。
+
+    为什么要这一步:品类是「按品类找料」「按值筛选」的基础,而推断难免出错 ——
+    导出格式五花八门,缺位号、写错封装、把料号填进值那一列,都会让推断跑偏。
+
+    但**不能让人从头看一遍**:他会直接点确定,那这一步就白加了。所以这里:
+      · 默认只列「要确认」的行(线索打架的、只有弱证据的、认不出的)
+      · 每一行都写着推断依据,一眼能看出该不该改
+      · 选中的多行可以一次改掉,不用一行一行点
+    想从头看就把筛选关掉。
+    """
+
+    COLS = [
+        ("row", "行", 42, "e"),
+        ("name", "名称", 148, "w", True),
+        ("lcsc_pn", "立创编号", 82, "center"),
+        ("value", "值", 68, "w"),
+        ("package", "封装", 78, "w"),
+        ("designators", "位号", 108, "w", True),
+        ("qty", "数量", 44, "e"),
+        ("category", "品类", 84, "center"),
+        ("conf", "把握", 58, "center"),
+        ("reason", "推断依据", 236, "w", True),
+    ]
+
+    def __init__(self, parent, app: App, preview: dict, default_name="", on_confirm=None):
+        super().__init__(parent)
+        self.title("导入 BOM 前核对品类")
+        self.transient(parent.winfo_toplevel())
+        self.geometry("1220x700")
+        self.minsize(1000, 520)
+        self.app = app
+        self.con = app.con
+        self.on_confirm = on_confirm
+        self._lines = list(preview.get("lines") or [])
+        self._cats = {}                       # source_row -> 人工改过的品类
+        # 后端给的是「推断得出来的品类」;再并上用户库里已经在用的,
+        # 免得他自己用惯的词在这里选不到
+        opts = list(preview.get("categories") or [])
+        for c in category_options(app.con):
+            if c not in opts:
+                opts.append(c)
+        self._opts = opts or ["其他"]
+
+        body = ttk.Frame(self, padding=10)
+        body.pack(fill="both", expand=True)
+
+        head = ttk.Frame(body)
+        head.pack(fill="x")
+        ttk.Label(head, text=f"{preview.get('filename') or 'BOM'} —— "
+                             f"{len(self._lines)} 行,"
+                             f"总需求 {preview.get('total_qty') or 0} 个",
+                  style="Big.TLabel").pack(side="left")
+        need = int(preview.get("need_review") or 0)
+        ttk.Label(head,
+                  text=(f"其中 {need} 行的品类要你确认" if need else "品类都认得明确"),
+                  foreground=("#c0392b" if need else "#1e8449")).pack(side="right")
+
+        nrow = ttk.Frame(body)
+        nrow.pack(fill="x", pady=(8, 2))
+        ttk.Label(nrow, text="项目名称").pack(side="left", padx=(0, 6))
+        self.name = tk.StringVar(value=default_name)
+        ttk.Entry(nrow, textvariable=self.name, width=32).pack(side="left")
+        ttk.Label(nrow, text="(BOM 行挂到这个项目下;同名项目会被整份覆盖)",
+                  style="Dim.TLabel").pack(side="left", padx=8)
+
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(4, 4))
+        self.only_review = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="只看要确认的", variable=self.only_review,
+                        command=self._render).pack(side="left")
+        ttk.Label(bar, text="把选中的改成").pack(side="left", padx=(14, 4))
+        self.pick = tk.StringVar(value=self._opts[0])
+        # 可打字:下拉是建议,认不出的新品类要能自己填
+        ttk.Combobox(bar, textvariable=self.pick, values=self._opts, width=16).pack(
+            side="left")
+        ttk.Button(bar, text="应用", command=self._apply_sel).pack(side="left", padx=6)
+        ttk.Label(bar, text="双击一行能单独改;下拉也能直接打字;"
+                            "Ctrl / Shift 可以多选",
+                  style="Dim.TLabel").pack(side="left", padx=6)
+
+        f, self.tree = make_tree(body, self.COLS, height=15)
+        f.pack(fill="both", expand=True)
+        self.tree.configure(selectmode="extended")
+        self.tree.tag_configure("review", background="#fff6dd")
+        self.tree.tag_configure("fixed", background="#e8f6ec")
+        self.tree.bind("<Double-1>", lambda _e: self._edit_one())
+
+        warn = preview.get("warnings") or []
+        if warn:
+            ttk.Label(body, text=("解析时有 %d 条提醒:" % len(warn))
+                                + " / ".join(warn[:3]) + (" …" if len(warn) > 3 else ""),
+                      style="Dim.TLabel", wraplength=1120,
+                      justify="left").pack(anchor="w", pady=(6, 0))
+
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(8, 0))
+        self.sum = tk.StringVar()
+        ttk.Label(btns, textvariable=self.sum, style="Dim.TLabel").pack(side="left")
+        ttk.Button(btns, text="取消", command=self.destroy, width=12).pack(side="right")
+        ttk.Button(btns, text="确认导入", command=self.ok, width=14).pack(side="right", padx=8)
+
+        self._render()
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+
+    # ------------------------------------------------------------ 内部
+
+    def _cat_of(self, line):
+        return self._cats.get(line.get("source_row")) or line.get("category") or "其他"
+
+    def _render(self):
+        keep = set(self.tree.selection())
+        clear_tree(self.tree)
+        shown = 0
+        for line in self._lines:
+            conf = line.get("confidence") or "none"
+            fixed = line.get("source_row") in self._cats
+            if self.only_review.get() and conf == "high" and not fixed:
+                continue
+            shown += 1
+            tags = ("fixed",) if fixed else (("review",) if conf != "high" else ())
+            self.tree.insert("", "end", iid=str(line.get("source_row")), values=(
+                line.get("source_row"), line.get("name") or "",
+                line.get("lcsc_pn") or "", line.get("value") or "",
+                line.get("package") or "", line.get("designators") or "",
+                line.get("qty") or 0, self._cat_of(line),
+                "人工指定" if fixed else (line.get("confidence_label") or ""),
+                "由人指定" if fixed else (line.get("reason") or "")), tags=tags)
+        n_review = sum(1 for l in self._lines
+                       if (l.get("confidence") or "none") != "high"
+                       or l.get("source_row") in self._cats)
+        self.sum.set(f"显示 {shown} / {len(self._lines)} 行;要过一眼的 {n_review} 行。"
+                     f"导入后还能在库存页随时改品类。")
+        back = [i for i in keep if self.tree.exists(i)]
+        if back:
+            self.tree.selection_set(back)
+
+    def _apply_sel(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先在下面选中要改的行(按住 Ctrl / Shift 可以多选)。",
+                                parent=self)
+            return
+        cat = self.pick.get().strip() or "其他"
+        for iid in sel:
+            self._cats[int(iid)] = cat
+        self._render()
+        self.app.set_status(f"已把 {len(sel)} 行的品类改成「{cat}」")
+
+    def _edit_one(self):
+        sel = self.tree.selection()
+        if len(sel) != 1:
+            return
+        row = int(sel[0])
+        line = next((l for l in self._lines if l.get("source_row") == row), None)
+        if line is None:
+            return
+        got = ask_category(self, self.app, self._cat_of(line), self._opts)
+        if got:
+            self._cats[row] = got
+            self._render()
+
+    def ok(self):
+        name = self.name.get().strip()
+        if not name:
+            messagebox.showinfo("提示", "项目名称不能空。", parent=self)
+            return
+        # JSON 的键是字符串,后端两种都认,这里统一成字符串省得扯皮
+        cats = {str(k): v for k, v in self._cats.items()}
+        self.destroy()
+        if self.on_confirm:
+            self.on_confirm(name, cats)
+
+
+class SimilarDialog(tk.Toplevel):
+    """按「值 + 封装」在库存里找相似元件,由人确认。
+
+    为什么要有它:导出的 BOM 常常缺料号、缺位号,只剩值和封装,而且同一样东西
+    不同工具写法还不一样(4.7k / 4.7kΩ / 4700;C0805 / 0805 / C-0805)。
+    严格相等找不到,人就得自己在几百行里翻。
+
+    这里给出候选和「像在哪里」,但**不替人认定是同一颗料** ——
+    出库记错料,比多花两秒确认严重得多。
+    """
+
+    COLS = [
+        ("name", "元件", 186, "w", True),
+        ("lcsc_pn", "立创编号", 86, "center"),
+        ("value", "值", 74, "w"),
+        ("package", "封装", 82, "w"),
+        ("category", "品类", 78, "w"),
+        ("on_hand", "库存", 50, "e"),
+        ("verdict", "把握", 148, "center"),
+        ("match", "像在哪里", 186, "w", True),
+    ]
+
+    def __init__(self, parent, app: App, *, value="", package="", category="",
+                 on_pick=None, in_stock_only=True):
+        super().__init__(parent)
+        self.title("按「值 + 封装」找相似元件")
+        self.transient(parent.winfo_toplevel())
+        self.geometry("1040x640")
+        self.minsize(900, 480)
+        self.app = app
+        self.con = app.con
+        self.on_pick = on_pick
+        self._items = {}
+        self._opts = category_options(app.con)
+
+        body = ttk.Frame(self, padding=10)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="按「值 + 封装」在库存里找相似",
+                  style="Big.TLabel").pack(anchor="w")
+
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(8, 2))
+        ttk.Label(bar, text="值").pack(side="left", padx=(0, 4))
+        self.v_value = tk.StringVar(value=value or "")
+        ttk.Entry(bar, textvariable=self.v_value, width=15).pack(side="left")
+        ttk.Label(bar, text="封装").pack(side="left", padx=(10, 4))
+        self.v_pkg = tk.StringVar(value=package or "")
+        ttk.Entry(bar, textvariable=self.v_pkg, width=15).pack(side="left")
+        ttk.Label(bar, text="品类").pack(side="left", padx=(10, 4))
+        self.v_cat = tk.StringVar(value=category or "")
+        ttk.Combobox(bar, textvariable=self.v_cat, values=[""] + self._opts, width=13,
+                     state="readonly").pack(side="left")
+        self.stocked = tk.BooleanVar(value=bool(in_stock_only))
+        ttk.Checkbutton(bar, text="只看有库存的", variable=self.stocked,
+                        command=self.reload).pack(side="left", padx=10)
+        ttk.Button(bar, text="找相似", command=self.reload).pack(side="left")
+
+        ttk.Label(body, text="相似度只说明「像」,是不是同一颗料要你自己确认。",
+                  style="Dim.TLabel").pack(anchor="w", pady=(0, 4))
+
+        f, self.tree = make_tree(body, self.COLS, height=13)
+        f.pack(fill="both", expand=True)
+        self.tree.tag_configure("strong", background="#e8f6ec")
+        self.tree.tag_configure("weak", foreground="#8d99a6")
+        self.tree.bind("<Double-1>", lambda _e: self.pick())
+
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(8, 0))
+        self.sum = tk.StringVar()
+        ttk.Label(btns, textvariable=self.sum, style="Dim.TLabel",
+                  wraplength=640, justify="left").pack(side="left")
+        ttk.Button(btns, text="关闭", command=self.destroy, width=12).pack(side="right")
+        if on_pick:
+            ttk.Button(btns, text="选中它去开单", command=self.pick,
+                       width=16).pack(side="right", padx=8)
+
+        self.bind("<Return>", lambda _e: self.reload())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.reload()
+        self.grab_set()
+
+    def reload(self):
+        q = {"value": self.v_value.get().strip(), "package": self.v_pkg.get().strip(),
+             "category": self.v_cat.get().strip(), "limit": "20"}
+        if self.stocked.get():
+            q["stocked"] = "1"
+        data = call(self.con, server.components_similar, query=q, quiet=True) or {}
+        items = data.get("items") or []
+        clear_tree(self.tree)
+        self._items = {}
+        for it in items:
+            score = int(it.get("score") or 0)
+            tags = ("strong",) if score >= 90 else (("weak",) if score < 50 else ())
+            self.tree.insert("", "end", iid=str(it["id"]), values=(
+                it.get("name") or "", it.get("lcsc_pn") or "", it.get("value") or "",
+                it.get("package") or "", it.get("category") or "",
+                it.get("on_hand") or 0, it.get("verdict") or "",
+                it.get("match") or ""), tags=tags)
+            self._items[it["id"]] = it
+        if items:
+            top = items[0]
+            self.sum.set(f"{len(items)} 个候选;最像的是「{top.get('name')}」"
+                         f"({top.get('match')})。")
+        elif not (q["value"] or q["package"]):
+            self.sum.set("值或封装至少填一个 —— 两个都空就没有比对的依据。")
+        elif self.stocked.get():
+            # 被「只看有库存的」滤空了。这时说「没有像的」是错的 ——
+            # 用户会得出「库里没有这颗料」的结论,而事实可能只是现在没库存,
+            # 那要去买、还是要先入库,是完全不同的下一步。所以再查一次,说清楚。
+            alt = dict(q)
+            alt.pop("stocked", None)
+            others = (call(self.con, server.components_similar, query=alt, quiet=True)
+                      or {}).get("items") or []
+            if others:
+                self.sum.set(f"有 {len(others)} 个像的,但都没库存(被「只看有库存的」"
+                             f"滤掉了)。取消勾选就能看到;要出库的话得先入库。")
+            else:
+                self.sum.set("没有像的 —— 库里可能压根没有这颗料。"
+                             "可以只填值、或把封装去掉再试一次。")
+        else:
+            self.sum.set("没有像的。可以只填值、或把封装去掉再试一次。")
+
+    def pick(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先选中一颗料。", parent=self)
+            return
+        cid = int(sel[0])
+        if self.on_pick:
+            self.destroy()
+            self.on_pick(cid)
+
+
 class MoveForm(ttk.Frame):
     """一个方向的开单区:左边找元件,右边填单。
 
@@ -1121,6 +1478,9 @@ class MoveForm(ttk.Frame):
         self.only_stocked = tk.BooleanVar(value=(action == "OUT"))
         ttk.Checkbutton(sbar, text="只列有库存的", variable=self.only_stocked,
                         command=self.reload).pack(side="left")
+        # 手上这颗料的写法和库里不一致时(0402 写成 0602、4.7k 写成 4.7kΩ),
+        # 靠搜索是找不到的,得按值+封装算相似
+        ttk.Button(sbar, text="找相似…", command=self.similar).pack(side="left", padx=(6, 0))
 
         self.list_hint = tk.StringVar()
         ttk.Label(left, textvariable=self.list_hint, style="Dim.TLabel",
@@ -1226,6 +1586,38 @@ class MoveForm(ttk.Frame):
     def only_low(self):
         self._only_low = not self._only_low
         self.reload()
+
+    def similar(self):
+        """按值+封装找相似。没选中元件时就把搜索框里打的字当值用。"""
+        cid = self._current_id()
+        it = self._items.get(cid) if cid else None
+        SimilarDialog(
+            self, self.app,
+            value=(it or {}).get("value") or self.q.get().strip(),
+            package=(it or {}).get("package") or "",
+            category=(it or {}).get("category") or "",
+            on_pick=self.select_by_id,
+            # 出库时没库存的候选帮不上忙;入库时反过来,只想要有库存的是自相矛盾
+            in_stock_only=(self.action == "OUT"))
+
+    def select_by_id(self, cid) -> bool:
+        """把某个元件选中。从「找相似」里挑中之后走这里,好让人接着填数量提交。
+
+        要先清掉搜索框、取消「只看缺货」:挑中的那颗料很可能正因为被筛选挡着
+        而不在列表里,不放开就选不上,用户会觉得「点了没反应」。
+
+        返回**有没有真的选上**。没选上时调用方得说话 —— 静默不做事最糟。
+        """
+        self.q.set("")
+        self._only_low = False
+        self.reload()
+        key = str(cid)
+        if not self.tree.exists(key):
+            return False
+        self.tree.selection_set(key)
+        self.tree.see(key)
+        self.tree.focus(key)
+        return True
 
     def _on_select(self, _event=None):
         sel = self.tree.selection()
@@ -1572,6 +1964,9 @@ class ProjectsTab(ttk.Frame):
         ttk.Button(tools, text="替代料…", command=self.substitutes).pack(side="left", padx=6)
         ttk.Button(tools, text="添加料行…", command=self.add_line).pack(side="left")
         ttk.Button(tools, text="移除选中行", command=self.remove_line).pack(side="left", padx=6)
+        # BOM 上这一行和库里那颗料的写法对不上时用这个 ——
+        # 导出的 BOM 常常只剩值和封装,严格相等是找不到的
+        ttk.Button(tools, text="找相似库存…", command=self.similar_for_line).pack(side="left")
         ttk.Label(tools, text="双击一行可直接改用量/损耗/可选/免点。",
                   style="Dim.TLabel").pack(side="left", padx=8)
 
@@ -1637,6 +2032,44 @@ class ProjectsTab(ttk.Frame):
         self._pid = int(sel[0])
         self.load_bom()
         self._sync_panes()
+
+    def similar_for_line(self):
+        """拿 BOM 明细里选中那一行的值+封装,去库存里找相似。"""
+        sel = self.t_bom.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先在 BOM 明细里选一行。", parent=self)
+            return
+        vals = self.t_bom.item(sel[0], "values")
+        # 列序:名称 / 立创编号 / 值 / 封装 / 单块 / 损耗 / 需求 / 现有 / 替代 / 缺口 / 标记 / 位号
+        value, package = str(vals[2] or ""), str(vals[3] or "")
+        if not (value or package):
+            messagebox.showinfo(
+                "提示", "这一行既没有值也没有封装,没有能比对的东西。\n"
+                        "可以先在「编辑选中行…」里补上。", parent=self)
+            return
+        SimilarDialog(self, self.app, value=value, package=package,
+                      on_pick=self._pick_similar_from_line, in_stock_only=True)
+
+    def _pick_similar_from_line(self, cid):
+        """挑中之后直接切到「元件出库」并选中它。
+
+        找相似的目的十有八九就是要把这颗料发出去,不替他切页的话
+        还得自己翻到那个子页签再找一遍,等于白找。
+        """
+        if not self._pid:
+            return
+        self.sub.select(self.pane_out)
+        if self.pane_out.form.select_by_id(cid):
+            self.app.set_status("已选中,填数量就能出库")
+        else:
+            # 找相似时如果没勾「只看有库存的」,挑中的料可能现在就是没库存,
+            # 而出库列表默认不列没库存的。这时必须说话 ——
+            # 悄悄切个页什么都不选,用户会以为按钮坏了
+            messagebox.showinfo(
+                "提示",
+                "这颗料现在没有库存,出库列表里默认不列它。\n"
+                "先在「元件入库」里把它收进来,或者取消勾选「只列有库存的」。",
+                parent=self)
 
     def _sync_panes(self):
         """把「现在选的是哪个项目」同步给两个方向的开单区。
@@ -1807,15 +2240,22 @@ class ProjectsTab(ttk.Frame):
             messagebox.showerror("读不了文件", str(exc), parent=self)
             return
 
-        default_name = os.path.splitext(os.path.basename(path))[0]
-        name = ask_text(self, "导入 BOM", "项目名称(留空则用文件名):", default_name)
-        if name is None:
-            return
-        name = name or default_name
-
         upload = {"filename": os.path.basename(path), "data": data}
-        rep = call(self.con, server.bom_import, body={"project_name": name}, upload=upload,
-                   parent=self)
+        # 先解析一遍再让人确认。直接导进去再改就晚了:那一刻品类已经落库,
+        # 而且人根本不知道哪些行是猜的。
+        preview = call(self.con, server.bom_preview, upload=upload, parent=self)
+        if not preview:
+            return
+        default_name = os.path.splitext(os.path.basename(path))[0]
+        BomReviewDialog(self, self.app, preview, default_name=default_name,
+                        on_confirm=lambda name, cats: self._import_confirmed(
+                            upload, name, cats))
+
+    def _import_confirmed(self, upload, name, categories):
+        """复核完了,带着人工改过的品类真正落库。"""
+        rep = call(self.con, server.bom_import,
+                   body={"project_name": name, "categories": categories},
+                   upload=upload, parent=self)
         if rep is None:
             return
         warn = rep.get("warnings") or []
@@ -1826,6 +2266,8 @@ class ProjectsTab(ttk.Frame):
                f"BOM {lines} 行,新建/复用元件 {rep.get('components_created', 0)} 个\n"
                f"总需求 {rep.get('total_qty', 0)}\n"
                f"警告 {len(warn)} 条")
+        if categories:
+            msg += f"\n人工改过品类的 {len(categories)} 行已按你改的落库"
         if warn:
             msg += "\n\n" + "\n".join(f"· {w}" for w in warn[:10])
         messagebox.showinfo("导入完成", msg, parent=self)

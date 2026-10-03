@@ -222,6 +222,31 @@ def main() -> int:
               ("新增元件", lambda: gui.ComponentDialog(app, app, None)),
               ("查重与合并", lambda: gui.DedupeDialog(app, app)),
               ("选一个元件", lambda: gui.ComponentPicker(app, app))]
+    # 导入复核窗口是全套里列最多的(10 列),最容易撑爆;找相似窗口 8 列。
+    # 两个都用**真实**的后端 payload,不然界面改了字段名这里也发现不了。
+    _csv = os.path.join(CACHE, "layout_review.csv")
+    with io.open(_csv, "w", encoding="utf-8", newline="") as f:
+        f.write("Designator,Quantity,Value,Footprint\n"
+                "R1,1,10kΩ,0603\n"
+                "C1,1,100nF,0805\n"
+                ",2,10k,F3\n")
+    with open(_csv, "rb") as f:
+        _up = {"filename": "layout_review.csv", "data": f.read()}
+    try:
+        _prev = gui.call(app.con, server.bom_preview, upload=_up)
+    except Exception as exc:  # noqa: BLE001
+        p(f"  (导入复核窗口跳过:拿不到预览 payload {type(exc).__name__}: {exc})")
+        _prev = None
+    if _prev:
+        makers.append(("导入复核", lambda: gui.BomReviewDialog(
+            app, app, _prev, default_name="排版体检板")))
+    _c = app.con.execute(
+        "SELECT value, package FROM component WHERE merged_into IS NULL"
+        " ORDER BY (value = '') + (package = ''), id LIMIT 1").fetchone()
+    if _c:
+        makers.append(("找相似", lambda: gui.SimilarDialog(
+            app, app, value=_c["value"] or "", package=_c["package"] or "")))
+
     row = app.con.execute(
         "SELECT id FROM location WHERE structural=0 ORDER BY id LIMIT 1").fetchone()
     if row:

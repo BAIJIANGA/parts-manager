@@ -818,6 +818,236 @@ _s, ls1 = call(server.lowstock, query={"moved": "1"})
 check("lowstock 也认 moved=1:返回的每一个都真的有流水",
       all(live_moves(i["id"]) > 0 for i in ls1["items"]), True)
 
+# ---------------------------------------------------------------- 【27】
+p("\n【27】BOM 品类推断:带依据、带把握,并且支持人工改写")
+
+
+def cls(designators, fp="", val="", hint=""):
+    return bom.classify(designators, fp, val, hint)
+
+
+# 位号是最传统的判据
+check("位号 R1 -> 电阻", cls(["R1"], "0603", "10kΩ")[0], "电阻")
+check("位号有依据时把握算「明确」", cls(["R1"], "0603", "10kΩ")[1], "high")
+
+# 这次新增的判据。导出的 BOM 常常连位号都没有,只剩值 ——
+# 而值的单位本身就把品类说死了
+check("没有位号,靠值 10kΩ 的单位认出电阻", cls([], "0603", "10kΩ")[0], "电阻")
+check("值 100nF 的单位 F -> 电容", cls([], "0805", "100nF")[0], "电容")
+check("值 4.7uH 的单位 H -> 电感", cls([], "0603", "4.7uH")[0], "电感")
+check("靠值认出来也算明确依据,不是瞎猜", cls([], "0805", "100nF")[1], "high")
+check("理由里写出了是哪个单位", "F" in cls([], "0805", "100nF")[2], True)
+check("值 R47 里的 R 是欧姆位 -> 电阻", cls([], "", "R47")[0], "电阻")
+
+# 认不出来就别装懂
+check("值 10k(没有单位)不硬猜", cls([], "0603", "10k")[0], "其他")
+check("认不出来时把握是 none", cls([], "0603", "10k")[1], "none")
+check("料号形状的值不会被当成标称值", cls([], "", "CH224K")[0], "其他")
+
+# 线索打架 -> 降级,并把冲突写出来让人拍板
+_c, _f, _w = cls(["C1"], "0805", "10kΩ")
+check("位号说电容、值说电阻时,仍给出一个结果(按位号)", _c, "电容")
+check("但把握降级成「要确认」", _f, "low")
+check("而且理由里把两条冲突都摆出来",
+      ("矛盾" in _w) and ("电容" in _w) and ("电阻" in _w), True)
+
+# 只有弱证据时同样要降级:封装像芯片,但认不出是什么片子
+check("光凭 SOT-23 只能猜是芯片", cls([], "SOT-23-5", "")[0], "芯片/IC")
+check("弱证据的把握是「要确认」", cls([], "SOT-23-5", "")[1], "low")
+
+# BOM 自带品类列时最权威
+check("BOM 自带品类时以它为准", cls([], "0603", "", "钽电容")[0], "钽电容")
+check("并说明这个品类来自 BOM 本身", "BOM" in cls([], "0603", "", "钽电容")[2], True)
+
+# 封装强特征压过位号 —— 旧版就有的行为,不能退化成跟着位号跑
+check("U3 配接线端子封装 -> 连接器(封装压过位号)",
+      cls(["U3"], "KF301-5.0-2P", "")[0], "连接器")
+check("发光二极管不会被封装里的数字带成电感",
+      cls([], "LED-0805", "")[0], "发光二极管")
+check("SOD-123 没有位号也认得出是二极管", cls([], "SOD-123", "")[0], "二极管")
+
+# 规则表产出的品类必须都能在下拉里选到,否则人看见一个选不回来的词
+_reach = {c for _k, c in bom.CATEGORY_BY_PREFIX}
+_reach |= {c for _k, c in bom.CATEGORY_BY_FOOTPRINT}
+_reach |= {"其他", "芯片/IC", "电阻", "电容", "电感"}
+check("规则表产出的品类都在 CATEGORIES 里", sorted(_reach - set(bom.CATEGORIES)), [])
+check("品类清单没有重复项", len(bom.CATEGORIES), len(set(bom.CATEGORIES)))
+_s, _m = call(server.meta)
+check("界面拿到的品类选项也包含 BOM 会推断出来的那些",
+      sorted(set(bom.CATEGORIES) - set(_m["categories"])), [])
+
+# ---- 复核结果按行号回传,并且真的落库
+rev = write_csv("review_bom.csv",
+                "Designator,Quantity,Value,Footprint\n"
+                "R1,1,10k,F1\n"
+                "C1,1,100nF,F2\n"
+                ",2,10k,F3\n")
+_s, prev = call(server.bom_preview, upload=upload_of(rev))
+check("预览把行数报出来", prev["line_count"], 3)
+check("预览给了每行的行号(复核结果要按它回传)",
+      all(l["source_row"] is not None for l in prev["lines"]), True)
+check("预览给了每行的把握",
+      [l["confidence"] for l in prev["lines"]], ["high", "high", "none"])
+check("把握连中文说法一起给(界面不用自己再抄一份)",
+      [l["confidence_label"] for l in prev["lines"]], ["明确", "明确", "认不出"])
+check("预览把「有几行要人确认」统计出来了", prev["need_review"], 1)
+check("预览把品类选项一起给出来(就一份清单)",
+      sorted(set(bom.CATEGORIES) - set(prev["categories"])), [])
+check("预览给了每行的依据,人才能判断该不该改",
+      all(l["reason"] for l in prev["lines"]), True)
+check("认不出来的那行,依据里说了为什么认不出",
+      "没有" in prev["lines"][2]["reason"], True)
+
+row_r = prev["lines"][0]["source_row"]
+_s, rep = call(server.bom_import,
+               body={"project_name": "人工复核板",
+                     "categories": {str(row_r): "金属膜电阻"}},
+               upload=upload_of(rev))
+check("人工改过的品类按行号落库", rep["rows"][0]["category"], "金属膜电阻")
+check("同一个值+封装,但行号没改的那行仍用推断结果",
+      rep["rows"][1]["category"], "电容")
+check("元件表里存的也确实是改过的那个词",
+      CON.execute("SELECT category FROM component WHERE name=?",
+                  (rep["rows"][0]["name"],)).fetchone()[0], "金属膜电阻")
+check("人工改过之后不再显示成「认不出」",
+      CON.execute("SELECT category FROM component WHERE name=?",
+                  (rep["rows"][2]["name"],)).fetchone()[0], "其他")
+
+# 不改的时候行为不变:不传 categories 就全用推断结果
+_s, rep2 = call(server.bom_import, body={"project_name": "不做复核板"},
+                upload=upload_of(rev))
+check("不传复核结果时照旧用推断结果", rep2["rows"][0]["category"], "电阻")
+
+# ---- 元件**早就存在**时,人工改的品类也必须写进去
+# 重新导入同一块板的改版 BOM 必然踩到这条:元件上一版就在库里了。
+# 如果这里被 upsert 的「只补空字段,不覆盖已有值」默默丢掉,用户改完点确认、
+# 界面提示导入成功、库里却还是老样子 —— 复核这一步就成了会骗人的摆设。
+again = write_csv("review_again.csv",
+                  "Designator,Quantity,Value,Footprint\n"
+                  "R1,1,10k,F1\n")
+_s, pa = call(server.bom_preview, upload=upload_of(again))
+nm = pa["lines"][0]["name"]
+r_a = pa["lines"][0]["source_row"]
+cat_before = CON.execute("SELECT category FROM component WHERE name=?", (nm,)).fetchone()[0]
+_s, _r = call(server.bom_import,
+              body={"project_name": "人工复核板", "categories": {str(r_a): "合金电阻"}},
+              upload=upload_of(again))
+cat_after = CON.execute("SELECT category FROM component WHERE name=?", (nm,)).fetchone()[0]
+check("元件已存在时,人工改的品类照样写进去了", cat_after, "合金电阻")
+check("而且确实和改之前不一样(说明真的写下去了)", cat_before != cat_after, True)
+check("导入报告里显示的也是人工指定的那个",
+      _r["rows"][0]["category"], "合金电阻")
+
+# 反过来:没人工复核的时候,不能拿猜的结果去覆盖库里已有的品类
+_s, pb = call(server.bom_preview, upload=upload_of(again))
+_s, _r2 = call(server.bom_import, body={"project_name": "人工复核板"},
+               upload=upload_of(again))
+check("没有人工复核时,推断结果不会覆盖已有的品类",
+      CON.execute("SELECT category FROM component WHERE name=?", (nm,)).fetchone()[0],
+      "合金电阻")
+check("推断出来的确实是另一个品类(电阻),它没被写进去",
+      pb["lines"][0]["category"], "电阻")
+
+# 但空着的品类还是该由推断补上 —— 老元件当初没填品类,不能一直空着
+CON.execute("UPDATE component SET category='' WHERE name=?", (nm,))
+_s, _r3 = call(server.bom_import, body={"project_name": "人工复核板"},
+               upload=upload_of(again))
+check("原来品类是空的,推断结果会补上",
+      CON.execute("SELECT category FROM component WHERE name=?", (nm,)).fetchone()[0],
+      "电阻")
+
+# ---------------------------------------------------------------- 【28】
+p("\n【28】出库找料:按「值 + 封装」算相似,由人确认")
+
+
+def mk_raw(name, value, package, category="其他", qty=0):
+    _s, r = call(server.create_component, body={
+        "name": name, "category": category, "value": value, "package": package})
+    cid = r["id"]
+    if qty:
+        call(server.stock_move, body={"kind": "IN", "component_id": cid, "qty": qty})
+    return cid
+
+
+S_A = mk_raw("相似料 4k7 0603", "4.7kΩ", "0603", "电阻", 5)
+S_B = mk_raw("相似料 4k7 0805", "4.7kΩ", "0805", "电阻", 9)
+S_C = mk_raw("相似料 4700 0603", "4700", "0603", "其他")
+S_D = mk_raw("相似料 100nF 0603", "100nF", "0603", "电容", 3)
+
+_s, sim = call(server.components_similar,
+               query={"value": "4.7k", "package": "0603"})
+by_id = {i["id"]: i for i in sim["items"]}
+check("最像的那一档排在最前面", sim["items"][0]["score"], 90)
+check("最像的那个把握写「很可能是同一颗」",
+      sim["items"][0]["verdict"], "很可能是同一颗")
+check("并且说清像在哪里(值和封装都点出来)",
+      sim["items"][0]["match"], "数值相同(写法不同)、封装相同")
+check("写法更全的那一颗(4.7kΩ)同样在最高档", by_id[S_A]["score"], 90)
+check("只写数值不写单位的(4700)也认得出来", by_id[S_C]["score"], 90)
+check("封装不同的同类仍会列出来,但分数更低",
+      by_id[S_B]["score"] < by_id[S_A]["score"], True)
+check("封装不同时明确提醒封装要自己看",
+      by_id[S_B]["verdict"], "值对上了,封装要自己看")
+# 这条曾经是错的:100nF 0603 光靠封装凑巧一样就挤进了候选。
+# 值才是主判据,值对不上的一律不算候选 —— 列出来纯属噪音。
+check("值完全不同的不会因为封装凑巧一样就挤进来", S_D in by_id, False)
+
+# 「单位和值都相同」只在两边都写了单位、而且真的一样时才说。
+# 4.7k 和 4700 谁都没写单位,硬说「单位相同」是假话,还会把
+# 写得最全的 4.7kΩ 压到后面去
+_s, sim_u = call(server.components_similar,
+                 query={"value": "4.7kΩ", "package": "0603"})
+check("两边都写了同样的单位时才说「值和单位都相同」",
+      sim_u["items"][0]["match"], "值和单位都相同、封装相同")
+# 值给得全的时候,写得全的那颗要排在只写数值的前面
+check("值给全时,写得同样全的那颗排在前面",
+      sim_u["items"][0]["id"], S_A)
+check("分数从高到低排",
+      [i["score"] for i in sim["items"]],
+      sorted((i["score"] for i in sim["items"]), reverse=True))
+check("每一行都带着「像在哪里」的说明",
+      all(i["match"] for i in sim["items"]), True)
+check("接口把查询条件回显出来", sim["query"]["value"], "4.7k")
+check("接口自带一句「要你自己确认」的说明", "确认" in sim["hint"], True)
+
+# 千分位/单位写法归一化:0.1uF 与 100nF 是同一个值
+_s, sim4 = call(server.components_similar, query={"value": "100nF"})
+ids4 = {i["id"] for i in sim4["items"]}
+check("只给值也能找", S_D in ids4, True)
+row_u = CON.execute("SELECT id FROM component WHERE value='0.1uF'"
+                    " AND merged_into IS NULL").fetchone()
+if row_u:
+    check("0.1uF 被认出和 100nF 是同一个值(只是单位写法不同)",
+          row_u[0] in ids4, True)
+
+# 只看有库存 —— 出库时没库存的候选帮不上忙
+S_E = mk_raw("相似料 4k7 0603 无库存", "4.7kΩ", "0603", "电阻")
+_s, sim2 = call(server.components_similar,
+                query={"value": "4.7kΩ", "package": "0603", "stocked": "1"})
+ids2 = {i["id"] for i in sim2["items"]}
+check("勾了「只看有库存的」,没库存的就不出现", S_E in ids2, False)
+check("有库存的还在", S_A in ids2, True)
+_s, sim3 = call(server.components_similar, query={"value": "4.7kΩ", "package": "0603"})
+ids3 = {i["id"] for i in sim3["items"]}
+check("不勾的话没库存的也列(入库时可能正想找它)", S_E in ids3, True)
+_top = sim3["items"][0]["score"]
+_same = [i["on_hand"] > 0 for i in sim3["items"] if i["score"] == _top]
+check("分数一样时有库存的排在前面(没库存的帮不上出库)",
+      _same, sorted(_same, reverse=True))
+
+# 只给封装时只是「有点像」—— 不能让人以为这就是那颗料
+_s, sim5 = call(server.components_similar, query={"package": "0603"})
+check("只给封装时也找得到东西", len(sim5["items"]) > 0, True)
+check("但把握一律是「只是有点像」",
+      {i["verdict"] for i in sim5["items"]}, {"只是有点像"})
+_s, sim6 = call(server.components_similar, query={"package": "R_0603"})
+check("封装归一化后 C0805 / c-0805 / 0805 这类写法能对上",
+      any(i["id"] == S_A for i in sim6["items"]), True)
+check("两个条件都空时什么都不给(没有比对的依据)",
+      len(call(server.components_similar, query={})[1]["items"]), 0)
+check("limit 参数管用",
+      len(call(server.components_similar, query={"package": "0603", "limit": "1"})[1]["items"]), 1)
+
 CON.close()
 p("\n" + "=" * 62)
 p(f"结果:{'全部通过' if not FAILS else '失败 ' + str(len(FAILS)) + ' 项'}")

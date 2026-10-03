@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bom  # noqa: E402
 import db  # noqa: E402
+import values  # noqa: E402
 import xlsx  # noqa: E402
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -79,11 +80,10 @@ def start_idle_watchdog(seconds: int) -> None:
 
     threading.Thread(target=loop, daemon=True).start()
 
-CATEGORY_SUGGESTIONS = [
-    "电阻", "电容", "电感", "磁珠", "二极管", "发光二极管", "三极管/MOS",
-    "芯片/IC", "连接器", "晶振", "开关", "电位器", "保险丝", "继电器",
-    "传感器", "模块", "结构件", "其他",
-]
+# 品类下拉的选项。前一段直接取自 bom.CATEGORIES —— 那边是「BOM 导入时能推断出
+# 哪些品类」的唯一来源,两处各维护一份的话,上游认出来的词在界面上会选不到。
+# 后面几个是手工录入才会用到的(推断不出来,只能人填)。
+CATEGORY_SUGGESTIONS = list(bom.CATEGORIES) + ["传感器", "模块", "结构件"]
 
 ROUTES: list[tuple[str, re.Pattern, Callable]] = []
 
@@ -239,6 +239,111 @@ def component_row(row) -> dict:
     d = db.row_to_dict(row)
     d["params"] = db.parse_params(d.get("params"))
     return d
+
+
+# 封装名归一化:去掉分隔符和空格再比,好让 C0805 / c-0805 / 0805 这些写法能对上
+_PKG_SEP_RE = re.compile(r"[\s\-_/]+")
+
+
+def norm_package(text) -> str:
+    return _PKG_SEP_RE.sub("", str(text or "").upper())
+
+
+def similar_components(con, *, value="", package="", category="", limit=8,
+                       in_stock_only=False) -> list[dict]:
+    """按「值 + 封装」找相似元件,给人确认用。
+
+    为什么需要:导出的 BOM 常常只有值和封装,料号、位号都不全,而且同一样东西
+    不同工具的写法还不一样(4.7k / 4.7kΩ / 4700;C0805 / 0805 / C-0805)。
+    严格相等找不到,人就得自己在几百行里翻。
+
+    打分:
+      值和单位都相同      +60
+      数值相同(写法不同)  +50   4.7k 与 4.7kΩ 属于这一类
+      封装相同            +30
+      封装写法相近        +15   一方包含另一方,比如 CAP-0805 与 0805
+      品类相同            +10
+    得分越高越像,但**只是像**。界面必须把「值对上了、封装要自己看」这种区别说清楚,
+    不能笼统地显示一个「匹配」。
+    """
+    want_num, want_unit = values.parse_value(value)
+    want_pkg = norm_package(package)
+    want_cat = str(category or "").strip()
+
+    out: list[dict] = []
+    for r in con.execute(COMPONENT_SELECT + " WHERE c.merged_into IS NULL"):
+        score, why = 0, []
+        value_hit = False
+
+        num, unit = values.parse_value(r["value"] or "")
+        if want_num is not None and num is not None:
+            # 相对容差:4.7kΩ 解析出来是 4700.000000000001 这种也别漏判
+            if abs(num - want_num) <= abs(want_num) * 1e-9 + 1e-15:
+                value_hit = True
+                score += 60
+                # 两边都写了单位而且一样,才叫「单位和值都相同」。
+                # 4.7k 和 4700 谁都没写单位,这时说「单位相同」是假话,
+                # 而且会把它排到 4.7kΩ 前面去 —— 明明后者写得还更全。
+                if want_unit and unit and want_unit == unit:
+                    why.append("值和单位都相同")
+                else:
+                    why.append("数值相同(写法不同)")
+
+        got_pkg = norm_package(r["package"] or "")
+        if want_pkg and got_pkg:
+            if got_pkg == want_pkg:
+                score += 30
+                why.append("封装相同")
+            elif want_pkg in got_pkg or got_pkg in want_pkg:
+                score += 15
+                why.append("封装写法相近")
+
+        if want_cat and (r["category"] or "") == want_cat:
+            score += 10
+            why.append("品类相同")
+
+        if score <= 0:
+            continue
+        # 给了值却对不上值的,不算候选。只对上封装的,在「值」这个主判据上彻底错了 ——
+        # 100nF 0603 不可能是 4.7k 0603 的替代,把它列进候选只是噪音。
+        # 值本身解析不出来时(比如那一列填的是料号)才允许只靠封装匹配。
+        if want_num is not None and not value_hit:
+            continue
+        d = component_row(r)
+        if in_stock_only and not d["on_hand"]:
+            continue
+        if score >= 90:
+            verdict = "很可能是同一颗"
+        elif score >= 50:
+            verdict = "值对上了,封装要自己看"
+        else:
+            verdict = "只是有点像"
+        d["score"] = score
+        d["match"] = "、".join(why)
+        d["verdict"] = verdict
+        out.append(d)
+
+    # 同样像的时候,有库存的排前面 —— 找相似多半是为了出库,没库存的帮不上忙
+    out.sort(key=lambda c: (-c["score"], -(c["on_hand"] or 0), c["name"] or ""))
+    return out[:max(1, limit)]
+
+
+@route("GET", r"/api/components/similar")
+def components_similar(ctx: Ctx, m):
+    try:
+        limit = int(ctx.q("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    q = {"value": ctx.q("value") or "", "package": ctx.q("package") or "",
+         "category": ctx.q("category") or ""}
+    return 200, {
+        "items": similar_components(
+            ctx.con, value=q["value"], package=q["package"], category=q["category"],
+            limit=max(1, min(limit, 50)),
+            in_stock_only=ctx.q("stocked") in ("1", "true", "yes")),
+        "query": q,
+        "hint": "按「值 + 封装」算的相似度,越大越像;是不是同一颗料要你自己确认。",
+    }
 
 
 @route("GET", r"/api/components")
@@ -1897,10 +2002,24 @@ def bom_preview(ctx: Ctx, m):
         "sheets": xlsx.sheet_names(path) if is_excel else [],
         "line_count": len(items), "total_qty": sum(i["qty"] for i in items),
         "warnings": warnings,
+        # 有多少行的品类是「猜的、或者线索打架」,复核时要一眼看到 ——
+        # 让人从头到尾逐行看一遍是不现实的,他会直接点确定
+        "need_review": sum(1 for i in items
+                           if i.get("category_confidence") in ("low", "none")),
+        "categories": list(bom.CATEGORIES),
         "lines": [{
+            # source_row 是复核结果回传时的键。按行号而不是按位置回传,
+            # 因为解析时会跳过空行/重复行,按位置对会整体错位
+            "source_row": i.get("source_row"),
             "lcsc_pn": i["lcsc_pn"], "mpn": i["mpn"], "name": i["name"],
             "category": i["category"], "package": i["package"], "value": i["value"],
             "qty": i["qty"], "designators": ",".join(i["designators"]),
+            "confidence": i.get("category_confidence") or "none",
+            # 连显示名一起给:免得界面里再抄一份「high -> 明确」的映射,
+            # 两份清单迟早走散
+            "confidence_label": bom.CONF_LABEL.get(
+                i.get("category_confidence") or "none", ""),
+            "reason": i.get("category_reason") or "",
         } for i in items],
     }
 
@@ -1917,6 +2036,8 @@ def bom_import(ctx: Ctx, m):
             project_code=ctx.b("project_code"), repo=ctx.b("repo"),
             sheet_name=ctx.b("sheet"),
             replace_existing=bool(ctx.b("replace", True)),
+            # 导入前人工复核的结果:{行号: 品类}。没复核过就是 None,走推断结果
+            categories=ctx.b("categories"),
         )
     except Exception as exc:
         raise ApiError(400, f"导入失败:{exc}")

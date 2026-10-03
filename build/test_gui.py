@@ -53,6 +53,22 @@ def check(label, got, want):
     return ok
 
 
+def buttons_of(root):
+    """收集一棵控件树里所有按钮的文字。用来确认某个入口真的摆出来了。"""
+    out = []
+
+    def walk(w):
+        for c in w.winfo_children():
+            try:
+                if isinstance(c, (gui.ttk.Button, tk.Button)):
+                    out.append(str(c.cget("text")))
+            except tk.TclError:
+                pass
+            walk(c)
+    walk(root)
+    return out
+
+
 def card_labels(card):
     """把一张大类卡片上所有 Label 的文字取出来(卡片是 tk.Frame)。"""
     out = []
@@ -1204,6 +1220,271 @@ def main() -> int:
                   str(pid) in pr.t_proj.get_children(), True)
         finally:
             gui.messagebox = real_box
+
+        # ---------------------------------------------------------- 第二步
+        p("\n【24】BOM 导入前核对品类:只列要确认的,能逐行改也能批量改")
+        cats = gui.category_options(app.con)
+        prev = {
+            "filename": "自检板.xlsx", "total_qty": 12, "need_review": 2,
+            "categories": cats,
+            "warnings": ["第 5 行:位号数(1)与数量(2)不一致,按数量为准"],
+            "lines": [
+                {"source_row": 2, "name": "10kΩ 0603", "lcsc_pn": "C1", "value": "10kΩ",
+                 "package": "0603", "designators": "R1", "qty": 1,
+                 "category": "电阻", "confidence": "high",
+                 "confidence_label": "明确", "reason": "位号 R 开头,按惯例是电阻"},
+                {"source_row": 3, "name": "10k 0603", "lcsc_pn": None, "value": "10k",
+                 "package": "0603", "designators": "", "qty": 1,
+                 "category": "其他", "confidence": "none",
+                 "confidence_label": "认不出",
+                 "reason": "位号、值、封装里都没有能认出品类的线索"},
+                {"source_row": 4, "name": "10kΩ 0805", "lcsc_pn": None, "value": "10kΩ",
+                 "package": "0805", "designators": "C9", "qty": 10,
+                 "category": "电容", "confidence": "low",
+                 "confidence_label": "要确认",
+                 "reason": "位号 C 开头,按惯例是电容；值 10kΩ 的单位是 Ω,Ω 只能是电阻。"
+                           "这几条线索互相矛盾,请人工确认"},
+            ],
+        }
+        got = {}
+        dlg = gui.BomReviewDialog(app, app, prev, default_name="自检板",
+                                  on_confirm=lambda n, c: got.update(name=n, cats=c))
+        dlg.update()
+        # 让人从头看一遍是不现实的,他只会直接点确定 —— 所以默认只摆要确认的
+        check("默认只列要确认的行", len(dlg.tree.get_children()), 2)
+        check("行号就是回传用的键(解析会跳行,按位置对会错位)",
+              sorted(int(i) for i in dlg.tree.get_children()), [3, 4])
+        check("要确认的行有底色提醒",
+              "review" in str(dlg.tree.item("4", "tags")), True)
+        check("表格里写出了推断依据,人才能判断该不该改",
+              "矛盾" in dlg.tree.item("4", "values")[9], True)
+        check("把握用的是后端给的中文说法(界面不再抄一份)",
+              dlg.tree.item("4", "values")[8], "要确认")
+        check("汇总写清了显示几行、要过几行",
+              "显示 2 / 3 行" in dlg.sum.get() and "要过一眼的 2 行" in dlg.sum.get(), True)
+
+        dlg.only_review.set(False)
+        dlg._render()
+        dlg.update()
+        check("关掉筛选能看到全部", len(dlg.tree.get_children()), 3)
+        check("认得出明确的那行也在", "2" in dlg.tree.get_children(), True)
+        dlg.only_review.set(True)
+        dlg._render()
+        dlg.update()
+
+        # 批量改:选中的多行一次改掉,不用一行一行点
+        dlg.tree.selection_set(["3", "4"])
+        app.update()
+        dlg.pick.set("电阻")
+        dlg._apply_sel()
+        app.update()
+        check("批量改完两行都是电阻",
+              [dlg.tree.item(i, "values")[7] for i in dlg.tree.get_children()],
+              ["电阻", "电阻"])
+        check("改过的行标成人工指定",
+              [dlg.tree.item(i, "values")[8] for i in dlg.tree.get_children()],
+              ["人工指定", "人工指定"])
+        check("改过的行换成另一种底色",
+              "fixed" in str(dlg.tree.item("3", "tags")), True)
+        check("改过的行依据也改成「由人指定」",
+              dlg.tree.item("3", "values")[9], "由人指定")
+
+        # 逐行改。ask_category 会 wait_window 把测试卡死,所以换掉它
+        real_ask = gui.ask_category
+        gui.ask_category = lambda *a, **k: "钽电容"
+        try:
+            dlg.tree.selection_set(["4"])
+            app.update()
+            dlg._edit_one()
+            app.update()
+            check("双击一行能单独改品类", dlg.tree.item("4", "values")[7], "钽电容")
+        finally:
+            gui.ask_category = real_ask
+
+        # 项目名空着不让过
+        box24 = FakeBox()
+        gui.messagebox = box24
+        try:
+            dlg.name.set("")
+            dlg.ok()
+            app.update()
+            check("项目名空着会被挡住", bool(box24.infos), True)
+            check("并说明原因", "名称" in str(box24.infos[0][1]), True)
+            check("挡住了就不会关掉对话框", bool(dlg.winfo_exists()), True)
+        finally:
+            gui.messagebox = real_box
+
+        # 下拉必须能直接打字:推断不出来的品类(比如光耦)不能只让人凑合选一个
+        def _combos(w, out):
+            for c in w.winfo_children():
+                if isinstance(c, gui.ttk.Combobox):
+                    out.append(c)
+                _combos(c, out)
+            return out
+
+        _all = _combos(dlg, [])
+        check("复核窗口的下拉不是只读的(能自己打字填新品类)",
+              all("readonly" not in str(c.cget("state")) for c in _all), True)
+        dlg.tree.selection_set(["3"])
+        app.update()
+        dlg.pick.set("光耦")
+        dlg._apply_sel()
+        app.update()
+        check("自己打进去的品类能被采用",
+              dlg.tree.item("3", "values")[7], "光耦")
+
+        dlg.name.set("自检复核板")
+        dlg.ok()
+        app.update()
+        check("确认后把项目名交回去", got.get("name"), "自检复核板")
+        check("只把人工改过的行交回去,没改的不动",
+              sorted(got.get("cats") or {}), ["3", "4"])
+        _dlg3 = gui.CategoryDialog(app, app, "电容", ["电阻", "电容"])
+        _dlg3.update()
+        check("单独改品类的小窗口也能打字",
+              "readonly" not in str(_combos(_dlg3, [])[0].cget("state")), True)
+        _dlg3.var.set("钽电容")
+        _dlg3.ok()
+        check("打进去的新品类能带回来", _dlg3.value, "钽电容")
+        check("交回去的是「行号 -> 品类」",
+              (got.get("cats") or {}).get("4"), "钽电容")
+        check("自己打进去的新品类也一起交回去",
+              (got.get("cats") or {}).get("3"), "光耦")
+        check("确认后对话框自己关掉", bool(dlg.winfo_exists()), False)
+
+        p("\n【25】出库找相似:候选排好序,挑中就能接着开单")
+        sdlg = gui.SimilarDialog(app, app, value="10kΩ", package="0603",
+                                 on_pick=lambda cid: got.update(picked=cid),
+                                 in_stock_only=True)
+        sdlg.update()
+        check("找到了候选", len(sdlg.tree.get_children()) > 0, True)
+        check("输入框用传进来的值预填好", sdlg.v_value.get(), "10kΩ")
+        check("封装也预填好", sdlg.v_pkg.get(), "0603")
+        check("默认勾着「只看有库存的」", sdlg.stocked.get(), True)
+        check("汇总里点出了最像的是哪个", "最像" in sdlg.sum.get(), True)
+        check("有回调时摆出「选中它去开单」",
+              any("去开单" in t for t in buttons_of(sdlg)), True)
+        check("表格里写着「像在哪里」",
+              any("相同" in dlg2 for dlg2 in
+                  [sdlg.tree.item(i, "values")[7] for i in sdlg.tree.get_children()]), True)
+
+        first = sdlg.tree.get_children()[0]
+        sdlg.tree.selection_set(first)
+        app.update()
+        sdlg.pick()
+        app.update()
+        check("挑中之后把元件号交回去", got.get("picked"), int(first))
+        check("挑完对话框自己关掉", bool(sdlg.winfo_exists()), False)
+
+        # 被「只看有库存的」滤空时,必须说清「有,只是没库存」——
+        # 说成「没有这颗料」会把用户引去做完全不同的下一步
+        _nostock = app.con.execute(
+            "SELECT c.value, c.package FROM component c WHERE c.merged_into IS NULL"
+            " AND c.value <> '' AND NOT EXISTS (SELECT 1 FROM stock s"
+            " WHERE s.component_id=c.id AND s.qty > 0) LIMIT 1").fetchone()
+        if _nostock:
+            sdlg3 = gui.SimilarDialog(app, app, value=_nostock["value"],
+                                      package=_nostock["package"], on_pick=None,
+                                      in_stock_only=True)
+            sdlg3.update()
+            check("没库存的料不会出现在「只看有库存的」列表里",
+                  len(sdlg3.tree.get_children()), 0)
+            check("但要说明「有,只是都被滤掉了」,不能让人以为没有这颗料",
+                  "没库存" in sdlg3.sum.get(), True)
+            check("并指出下一步怎么办(取消勾选 / 先入库)",
+                  "取消勾选" in sdlg3.sum.get(), True)
+            sdlg3.destroy()
+
+        sdlg2 = gui.SimilarDialog(app, app, value="", package="", on_pick=None)
+        sdlg2.update()
+        check("没给值也没给封装时没有候选", len(sdlg2.tree.get_children()), 0)
+        check("并说明缺的是比对依据", "依据" in sdlg2.sum.get(), True)
+        check("没有回调时不摆「选中它去开单」",
+              any("去开单" in t for t in buttons_of(sdlg2)), False)
+        sdlg2.destroy()
+
+        p("\n【26】找相似的两个入口接在了该在的地方")
+        app.nb.select(app.tab_proj)
+        app.update()
+        pr = app.tab_proj
+        check("BOM 明具有「找相似库存…」按钮",
+              any("找相似库存" in t for t in buttons_of(pr)), True)
+        check("开单区有「找相似…」按钮",
+              any("找相似" in t for t in buttons_of(pr.pane_in.form)), True)
+
+        # 拿 BOM 明细里选中那一行的值+封装去库存里找
+        line = None
+        for iid in pr.t_bom.get_children():
+            v = pr.t_bom.item(iid, "values")
+            if v[2] or v[3]:
+                line = iid
+                break
+        seen = {}
+        real_sim = gui.SimilarDialog
+        gui.SimilarDialog = lambda parent, a, **kw: seen.update(kw)
+        try:
+            if line:
+                pr.t_bom.selection_set(line)
+                app.update()
+                pr.similar_for_line()
+                check("拿的是 BOM 那一行的值/封装",
+                      bool(seen.get("value") or seen.get("package")), True)
+                check("出库方向默认只看有库存的", seen.get("in_stock_only"), True)
+                check("接了回调,挑中之后能接着开单", bool(seen.get("on_pick")), True)
+
+            # 开单区那个按钮:入库方向刻意**不**勾只看有库存的
+            f_in = pr.pane_in.form
+            if f_in._items:
+                # 挑一颗有值的料,不然这条断言等于没测到「预填」
+                cid = next((k for k, v in f_in._items.items() if v.get("value")),
+                           next(iter(f_in._items)))
+                f_in.tree.selection_set(str(cid))
+                app.update()
+                seen.clear()
+                f_in.similar()
+                check("用选中那颗料的值去预填",
+                      (seen.get("value") or ""),
+                      (f_in._items[cid].get("value") or ""))
+                check("封装也一起带过去(值+封装才是判据)",
+                      (seen.get("package") or ""),
+                      (f_in._items[cid].get("package") or ""))
+                check("入库方向不勾「只看有库存的」(要收的料现在库存就是 0)",
+                      seen.get("in_stock_only"), False)
+        finally:
+            gui.SimilarDialog = real_sim
+
+        # 挑中之后切到出库子页签并选中它
+        out_form = pr.pane_out.form
+        out_ids = list(out_form._items)
+        if out_ids:
+            cid = out_ids[0]
+            pr._pick_similar_from_line(cid)
+            app.update()
+            check("挑中之后自动切到「元件出库」子页签",
+                  pr.sub.index(pr.sub.select()), 2)
+            check("并且在那个列表里选中了它", out_form._current_id(), cid)
+            # 选中的料可能正被搜索词挡在外面 —— 不放开筛选就点不上,
+            # 用户会以为「点了没反应」
+            out_form.q.set("绝不可能匹配的词 zzz")
+            out_form.reload()
+            app.update()
+            check("搜索词把它挡住了", str(cid) in out_form.tree.get_children(), False)
+            check("select_by_id 会放开筛选把它选出来",
+                  out_form.select_by_id(cid), True)
+            app.update()
+            check("而且真的成了当前选中", out_form._current_id(), cid)
+            # 没库存的料不在出库列表里,这时必须返回 False 让调用方说话,
+            # 而不是静默什么都不发生
+            _no_stock = app.con.execute(
+                "SELECT c.id FROM component c WHERE c.merged_into IS NULL"
+                " AND NOT EXISTS (SELECT 1 FROM stock s WHERE s.component_id=c.id"
+                " AND s.qty > 0) LIMIT 1").fetchone()
+            if _no_stock:
+                check("没库存的料选不上,返回 False 让调用方去解释",
+                      out_form.select_by_id(_no_stock[0]), False)
+            out_form.q.set("")
+            out_form.reload()
+            app.update()
 
         app.refresh_all()
         app.update()

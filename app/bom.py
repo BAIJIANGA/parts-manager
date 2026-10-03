@@ -19,6 +19,7 @@ import re
 from typing import Any, Iterable
 
 import db
+import values
 import xlsx
 
 # 规范字段 -> 可接受的表头写法。
@@ -40,6 +41,9 @@ HEADER_ALIASES: dict[str, list[str]] = {
             "manufacturer p/n", "mpn", "mpn/part number", "part number", "part no",
             "partno", "厂家料号", "制造商料号", "厂商料号", "厂家型号", "厂商型号"],
     "manufacturer": ["manufacturer", "厂家", "制造商", "厂商", "mfr", "brand"],
+    # 有些导出会自带品类列。它比任何推断都权威,所以认出来就直接用。
+    # 故意不收 "type"/"kind":那两列常常写的是 SMD / 直插 / 贴片,不是品类。
+    "category": ["category", "品类", "分类", "类别", "元件类别", "component category"],
     "supplier_pn": ["supplier part", "supplier part number", "supplier part no",
                     "supplier part #", "供应商料号", "供应商编号", "立创编号",
                     "立创料号", "商品编号", "lcsc", "lcsc part", "lcsc part number",
@@ -77,6 +81,15 @@ CATEGORY_BY_PREFIX: list[tuple[str, str]] = [
 # 不规范但真实存在的画法。
 CATEGORY_BY_FOOTPRINT: list[tuple[tuple[str, ...], str]] = [
     (("RES-ADJ", "POTENTIOMETER", "TRIM", "POT_"), "电位器"),
+    # 发光二极管要排在别的前面:LED 封装名里常带 0805/0603 这类数字,
+    # 落到最后那条「R/C/L 开头 + 数字」的弱规则上会被认成电感
+    (("LED_", "LED-", "LED0805", "LED0603", "LED1206"), "发光二极管"),
+    # 二极管封装。SOD / DO-214 是很明确的二极管外形,不会和别的撞。
+    # 故意不收 TO-220 / TO-252:那里面既有 MOS 也有稳压块,认不准就别装懂
+    (("SOD-", "SOD123", "SOD323", "SOD523", "DO-214", "DO-41", "DO-35"), "二极管"),
+    # 接线端子的常见型号族(KF301 / KF128 / KF2EDG …)。国产 BOM 里很常见,
+    # 而且这类料经常被位号写成 U 或 J,不认封装就会跟着位号跑偏
+    (("KF301", "KF128", "KF2EDG", "KF350", "KF7.62", "DG301", "HT396"), "连接器"),
     (("TYPE-C", "TYPEC", "USB", "MICRO-USB", "MINI-USB"), "连接器"),
     (("CONN", "HEADER", "SOCKET", "TERMINAL", "PLUG", "JACK", "PINHD", "HDR"), "连接器"),
     (("XTAL", "CRYSTAL", "OSC", "RESONATOR"), "晶振"),
@@ -87,6 +100,117 @@ CATEGORY_BY_FOOTPRINT: list[tuple[tuple[str, ...], str]] = [
 ]
 
 DESIGNATOR_RE = re.compile(r"^([A-Za-z]+)")
+
+# 芯片常见封装。它只说明「长得像芯片」,识别不出具体是什么片子,所以算弱证据。
+CHIP_FOOTPRINTS = ("SOT", "QFN", "QFP", "BGA", "SOP", "SOIC", "DFN", "LQFP", "TSSOP")
+
+# 值的单位 -> 品类。导出的 BOM 常常位号、料号都不全,但「值」几乎总在,
+# 而值的单位本身就限定了它是什么:Ω 只能是电阻,F 只能是电容,H 只能是电感。
+VALUE_UNIT_CATEGORY = {"Ω": "电阻", "F": "电容", "H": "电感"}
+
+# 品类全集。它同时是导入复核对话框里那个下拉框的选项来源 ——
+# 只有一处定义,免得上游认出来的品类在界面上反而选不到。
+# 顺序就是下拉框里的顺序:常用的排前面。
+CATEGORIES = [
+    "电阻", "电容", "电感", "磁珠", "二极管", "发光二极管", "三极管/MOS",
+    "芯片/IC", "连接器", "晶振", "开关", "保险丝", "电位器", "继电器",
+    "测试点", "电池", "扬声器", "电机", "其他",
+]
+
+# 置信度常量。界面按它决定哪些行要标红催人看一眼。
+CONF_HIGH, CONF_LOW, CONF_NONE, CONF_HUMAN = "high", "low", "none", "human"
+CONF_LABEL = {CONF_HIGH: "明确", CONF_LOW: "要确认", CONF_NONE: "认不出",
+              CONF_HUMAN: "人工指定"}
+
+
+def value_category(value: Any) -> tuple[str | None, str]:
+    """从「值」的单位判品类。返回 (品类, 理由);判不出来时品类是 None。
+
+    这是这次新增的判据。位号可以被省掉、料号可以被省掉,但「值」几乎总在,
+    而且 10kΩ / 100nF / 4.7uH 里的那个单位已经把品类说死了。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None, ""
+    num, unit = values.parse_value(text)
+    if num is None:
+        return None, ""
+    if unit in VALUE_UNIT_CATEGORY:
+        cat = VALUE_UNIT_CATEGORY[unit]
+        return cat, f"值 {text} 的单位是 {unit},{unit} 只能是{cat}"
+    # 4R7 / R47:R 是欧姆位(当小数点用),不是单位,但足以说明这是电阻
+    if re.search(r"[Rr]", text):
+        return "电阻", f"值 {text} 里的 R 是欧姆位,所以是电阻"
+    return None, ""
+
+
+def classify(designators: Iterable[str] | None = None, footprint: Any = "",
+             value: Any = "", hint: Any = "") -> tuple[str, str, str]:
+    """判品类,并给出**依据**和**把握有多大**。返回 (品类, 置信度, 理由)。
+
+    置信度:
+      high  有明确依据(封装关键词 / 位号前缀 / 值的单位 / BOM 里写的品类),
+            而且所有线索互相印证
+      low   线索之间**打架**,或者只有「封装长得像芯片」这类弱证据 ——
+            这两种情况人工必须看一眼
+      none  一个可用的线索都没有,归到「其他」
+      human 导入时人手动指定的
+
+    为什么返回理由而不是只返回一个词:这是给人工复核看的。只说「我猜是电容」
+    没法判断该不该改,说「值 100nF 的单位是 F」才能一眼看出对不对。
+
+    为什么线索打架要降级而不是硬选一个:那份 BOM 自己就矛盾,比如位号写着 C1
+    而值是 10kΩ。这种只能是数据错了,该由人拍板,程序不该装作知道。
+
+    优先级(数字越小越权威)刻意保持和旧版一致:封装里的强特征(比如
+    RES-ADJ→电位器、TYPE-C→连接器)要压过位号,因为「用 U3 标接线端子」
+    这类不规范的画法真实存在,而封装的写法通常更接近事实。
+    """
+    votes: list[tuple[int, str, str]] = []      # (优先级, 品类, 理由)
+
+    text_hint = str(hint or "").strip()
+    if text_hint:
+        votes.append((0, text_hint, f"BOM 里本来就写着品类「{text_hint}」"))
+
+    fp = str(footprint or "").upper()
+    for keys, cat in CATEGORY_BY_FOOTPRINT:
+        if any(k in fp for k in keys):
+            votes.append((1, cat, f"封装 {footprint} 里的关键词是{cat}的特征"))
+            break
+
+    for d in designators or []:
+        m = DESIGNATOR_RE.match(str(d).strip())
+        if not m:
+            continue
+        prefix = m.group(1).upper()
+        for pfx, cat in CATEGORY_BY_PREFIX:
+            if prefix.startswith(pfx):
+                votes.append((2, cat, f"位号 {prefix} 开头,按惯例是{cat}"))
+                break
+        break
+
+    vcat, vwhy = value_category(value)
+    if vcat:
+        votes.append((3, vcat, vwhy))
+
+    if not any(v[0] <= 3 for v in votes):       # 还没有明确依据,试试弱证据
+        if any(k in fp for k in CHIP_FOOTPRINTS):
+            votes.append((4, "芯片/IC", f"封装 {footprint} 是芯片常见的封装(弱证据)"))
+        elif fp[:1] in ("R", "C", "L") and any(ch.isdigit() for ch in fp):
+            cat = {"R": "电阻", "C": "电容", "L": "电感"}[fp[0]]
+            votes.append((4, cat, f"封装 {footprint} 以 {fp[0]} 开头且带数字(弱证据)"))
+
+    if not votes:
+        return "其他", CONF_NONE, "位号、值、封装里都没有能认出品类的线索"
+
+    votes.sort(key=lambda v: v[0])
+    strong = [v for v in votes if v[0] <= 3]
+    pick = (strong or votes)[0]
+    if len({v[1] for v in votes}) == 1:
+        # 一条线索都没有对不上的,才敢说「明确」
+        return pick[1], (CONF_HIGH if strong else CONF_LOW), pick[2]
+    why = "；".join(v[2] for v in votes) + "。这几条线索互相矛盾,请人工确认"
+    return pick[1], CONF_LOW, why
 
 
 def _norm(s: Any) -> str:
@@ -109,26 +233,8 @@ def split_designators(raw: Any) -> list[str]:
 
 
 def guess_category(designators: Iterable[str], footprint: str = "", value: str = "") -> str:
-    """判断品类。先用封装里的强特征纠正,再按位号前缀,最后按封装形状兜底。"""
-    fp = (footprint or "").upper()
-    for keys, cat in CATEGORY_BY_FOOTPRINT:
-        if any(k in fp for k in keys):
-            return cat
-
-    for d in designators:
-        m = DESIGNATOR_RE.match(str(d).strip())
-        if not m:
-            continue
-        prefix = m.group(1).upper()
-        for pfx, cat in CATEGORY_BY_PREFIX:
-            if prefix.startswith(pfx):
-                return cat
-
-    if any(k in fp for k in ("SOT", "QFN", "QFP", "BGA", "SOP", "SOIC", "DFN", "LQFP", "TSSOP")):
-        return "芯片/IC"
-    if fp.startswith(("R", "C", "L")) and any(ch.isdigit() for ch in fp):
-        return {"R": "电阻", "C": "电容", "L": "电感"}[fp[0]]
-    return "其他"
+    """只要品类名时用这个(老调用点)。判据、置信度和理由见 classify。"""
+    return classify(designators, footprint, value)[0]
 
 
 def find_header(rows: list[list[Any]]) -> tuple[int, dict[str, int]]:
@@ -294,7 +400,9 @@ def rows_to_items(rows: list[list[Any]]) -> tuple[list[dict], list[str]]:
             )
             qty = qty if qty is not None else len(designators)
 
-        category = guess_category(designators, str(footprint or ""), str(value or ""))
+        category, cat_conf, cat_why = classify(
+            designators, str(footprint or ""), str(value or ""),
+            _cell(row, cols, "category") or "")
 
         items.append({
             "lcsc_pn": lcsc.upper() if lcsc else None,
@@ -304,6 +412,8 @@ def rows_to_items(rows: list[list[Any]]) -> tuple[list[dict], list[str]]:
                                str(footprint) if footprint else None,
                                mpn, lcsc, category),
             "category": category,
+            "category_confidence": cat_conf,
+            "category_reason": cat_why,
             "value": str(value) if value else None,
             "package": str(footprint) if footprint else None,
             "designators": designators,
@@ -346,15 +456,31 @@ def find_component(con, lcsc_pn: str | None, mpn: str | None, name: str | None =
 
 
 def upsert_component(con, item: dict) -> tuple[int, bool]:
-    """插入或补全元件。返回 (元件 id, 是否新建)。只补空字段,不覆盖已有值。"""
+    """插入或补全元件。返回 (元件 id, 是否新建)。只补空字段,不覆盖已有值。
+
+    **一个例外:导入前人工指定的品类,哪怕原来已经有品类也要写进去。**
+    推断出来的品类只是新料的默认值,猜错也就猜错了;人工改过的是决定。
+    如果这条被「不覆盖已有值」默默丢掉,用户改完点确认、界面提示导入成功、
+    库里却还是老样子 —— 那复核这一步就成了摆设,而且是会骗人的那种。
+
+    重新导入同一块板的改版 BOM 时必然踩到这条:元件早就在库里了,
+    不复核前改的品类等于白改。
+    """
     existing = find_component(con, item.get("lcsc_pn"), item.get("mpn"), item.get("name"))
+    human = item.get("category_confidence") == CONF_HUMAN
     if existing:
         cid = existing["id"]
         updates, args = [], []
-        for field in ("lcsc_pn", "mpn", "manufacturer", "category", "value", "package", "name"):
+        for field in ("lcsc_pn", "mpn", "manufacturer", "value", "package", "name"):
             if not existing[field] and item.get(field):
                 updates.append(f"{field}=?")
                 args.append(item[field])
+        # 品类单独处理:空着的补上;人工复核改过的直接覆盖
+        want_cat = item.get("category")
+        if want_cat and (human or not existing["category"]) \
+                and want_cat != existing["category"]:
+            updates.append("category=?")
+            args.append(want_cat)
         if updates:
             updates.append("updated_at=?")
             args.extend([db.now(), cid])
@@ -377,9 +503,27 @@ def upsert_component(con, item: dict) -> tuple[int, bool]:
 
 def import_items(con, items: list[dict], project_name: str, *, project_code: str | None = None,
                  repo: str | None = None, replace_existing: bool = True,
-                 warnings: list[str] | None = None) -> dict:
-    """把已经解析好的条目导入成一个项目。xlsx 与 csv 共用这一套落库逻辑。"""
+                 warnings: list[str] | None = None,
+                 categories: dict | None = None) -> dict:
+    """把已经解析好的条目导入成一个项目。xlsx 与 csv 共用这一套落库逻辑。
+
+    categories 是「导入前人工复核」的结果:{source_row: 品类}。
+    复核对话框按行号回传,所以这里按 source_row 覆盖 —— 用行号而不是用位置,
+    是因为中间可能有被跳过的行,按位置对会整体错位。
+    JSON 传过来的键是字符串,所以两种写法都认。
+    """
     warnings = list(warnings or [])
+    if categories:
+        fixed = []
+        for it in items:
+            row = it.get("source_row")
+            override = categories.get(row, categories.get(str(row)))
+            if override:
+                it = dict(it, category=str(override).strip(),
+                          category_confidence=CONF_HUMAN,
+                          category_reason="导入时人工指定")
+            fixed.append(it)
+        items = fixed
     proj = con.execute("SELECT * FROM project WHERE name=?", (project_name,)).fetchone()
     if proj:
         project_id = proj["id"]
@@ -434,11 +578,12 @@ def import_items(con, items: list[dict], project_name: str, *, project_code: str
 
 def import_bom(con, path: str, project_name: str, project_code: str | None = None,
                repo: str | None = None, sheet_name: str | None = None,
-               replace_existing: bool = True) -> dict:
+               replace_existing: bool = True, categories: dict | None = None) -> dict:
     """把一份 BOM 文件(xlsx 或 csv)导入成项目。返回导入报告。"""
     items, warnings = parse_any(path, sheet_name=sheet_name)
     report = import_items(con, items, project_name, project_code=project_code, repo=repo,
-                          replace_existing=replace_existing, warnings=warnings)
+                          replace_existing=replace_existing, warnings=warnings,
+                          categories=categories)
     report["source"] = os.path.basename(path)
     return report
 
