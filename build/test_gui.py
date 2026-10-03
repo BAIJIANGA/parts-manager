@@ -181,13 +181,17 @@ def main() -> int:
         app.update()
         p(f"  窗口 {app.winfo_width()}x{app.winfo_height()},状态栏:{app.status.get()}")
 
-        for i, name in enumerate(["元件库存", "出入库", "项目BOM", "流水", "仓位"]):
+        wanted = ["总览", "库存", "出入库", "项目 BOM", "采购", "仓位", "流水"]
+        check("页签数量和名字都对", app.nb.index("end"), len(wanted))
+        for i, name in enumerate(wanted):
             app.nb.select(i)
             app.update()
             app.update_idletasks()
-            p(f"  [OK ] 标签页「{name}」渲染正常")
+            check(f"标签页「{name}」的标题", app.nb.tab(i, "text").strip(), name)
+        p(f"  [OK ] {len(wanted)} 个标签页全部渲染正常")
 
-        app.nb.select(0)
+        # 后面的断言都针对库存页 —— 必须真的切到它,否则控件不算被显示出来
+        app.nb.select(app.tab_comp)
         app.update()
         tab = app.tab_comp
 
@@ -280,17 +284,20 @@ def main() -> int:
         check("首页已收起", bool(tab.page_home.winfo_ismapped()), False)
         check("二级表行数 = 该大类在库元件数", len(tab.tree.get_children()), n0)
         cols = [tab.tree.heading(c)["text"] for c in tab.tree["columns"]]
-        k_qty = cols.index("库存")
+        k_qty = cols.index("现有")
         check("二级表里每行库存都 > 0",
               all(float(tab.tree.item(k, "values")[k_qty]) > 0
                   for k in tab.tree.get_children()), True)
+        # 这五列是这次重做的核心:我有什么 / 要多少 / 缺多少 / 在路上多少 / 该买多少
+        for col in ("现有", "安全", "需求", "缺口", "在途", "该买"):
+            check(f"二级表有「{col}」列", col in cols, True)
         show = str(tab.tree.cget("show"))
         check("二级是平表,没有展开三角",
               "headings" in show and "tree" not in show, True)
         p(f"  点开「{cat0}」-> {n0} 个型号(该大类在库的全在这里),页面切换正常")
         for k in tab.tree.get_children():
             v = tab.tree.item(k, "values")
-            p(f"      {v[0]}  库存 {v[k_qty]}  {v[cols.index('状态')]}")
+            p(f"      {v[0]}  现有 {v[k_qty]}  {v[cols.index('状态')]}")
 
         rows = tab.tree.get_children()
         tab.tree.selection_set(rows[0])
@@ -317,7 +324,7 @@ def main() -> int:
 
         # ---------------------------------------------------------- 出入库
         p("\n【5】出入库:拆成入库 / 出库两个页签,先选项目再进二级页")
-        app.nb.select(1)
+        app.nb.select(app.tab_stock)
         app.update()
         st = app.tab_stock
         check("默认停在入库", st.action, "IN")
@@ -403,15 +410,15 @@ def main() -> int:
         app.update()
         check("返回项目卡片首页正常", st.view, "home")
 
-        app.nb.select(2)
+        app.nb.select(app.tab_proj)
         app.update()
         p(f"  [OK ] 项目页 {len(app.tab_proj.t_proj.get_children())} 个项目,"
           f"BOM {len(app.tab_proj.t_bom.get_children())} 行,缺料标签「{app.tab_proj.shortage.get()}」")
 
-        app.nb.select(3)
+        app.nb.select(app.tab_move)
         app.update()
         p(f"  [OK ] 流水页 {len(app.tab_move.tree.get_children())} 行")
-        app.nb.select(4)
+        app.nb.select(app.tab_loc)
         app.update()
         p(f"  [OK ] 仓位页 {len(app.tab_loc.tree.get_children())} 行")
 
@@ -428,6 +435,254 @@ def main() -> int:
         mv.update()
         p("  [OK ] 出入库弹窗(盘点 / 移库也从这里走)")
         mv.destroy()
+
+        # ============================================ 这次重做的部分
+        app_con = app.con
+
+        def actx(**kw):
+            return gui.make_ctx(app_con, **kw)
+
+        def API(fn, query=None, body=None, match=None):
+            return fn(actx(query=query, body=body), M(*match) if match else None)[1]
+
+        p("\n【8】总览页")
+        app.nb.select(app.tab_dash)
+        app.update()
+        dash = app.tab_dash
+        check("8 个统计数字都填上了",
+              [k for k, v in dash.vals.items() if v.get() in ("", "–")], [])
+        check("总览列出了项目进度", len(dash.t_proj.get_children()), 1)
+        check("总览列出了最近流水", len(dash.t_recent.get_children()) > 0, True)
+        pv = dash.t_proj.item(dash.t_proj.get_children()[0], "values")
+        check("项目行带「能造」数量(第 3 列)", pv[2] != "", True)
+        p("  " + " / ".join(f"{k}={v.get()}" for k, v in dash.vals.items()))
+
+        p("\n【9】采购页:该买 → 下单 → 到货")
+        app.nb.select(app.tab_purchase)
+        app.update()
+        buy = app.tab_purchase
+        check("该买清单里有缺料的料号", len(buy.t_buy.get_children()) > 0, True)
+        check("原因列说清了为什么该买",
+              any("项目缺料" in str(buy.t_buy.item(k, "values")[12])
+                  for k in buy.t_buy.get_children()), True)
+        check("汇总文字非空", bool(buy.buy_sum.get()), True)
+
+        picked = buy.t_buy.get_children()[:3]
+        buy.t_buy.selection_set(picked)
+        app.update()
+        target = int(picked[0])
+        n_before = len(buy.t_po.get_children())
+        buy.add_selected()
+        app.update()
+        check("加入采购单后下面多了 3 条", len(buy.t_po.get_children()), n_before + 3)
+
+        by = {i["id"]: i for i in API(server.list_components, query={"limit": "0"})["items"]}
+        check("只是「想买」不算在途", by[target]["on_order"], 0)
+        check("所以该买数量没被抵掉", by[target]["to_order"] > 0, True)
+
+        # 采购单列表按状态再按 id 倒序排,所以第一行不是刚为 picked[0] 建的那单,
+        # 得按元件号反查出来,不能想当然取 get_children()[0]。
+        po_id = app_con.execute(
+            "SELECT id FROM purchase WHERE component_id=? ORDER BY id DESC LIMIT 1",
+            (target,)).fetchone()[0]
+        buy.t_po.selection_set(str(po_id))
+        app.update()
+        buy.set_status("ordered")
+        app.update()
+        check("标记已下单后状态列变成「已下单」",
+              buy.t_po.item(str(po_id), "values")[0], "已下单")
+        by = {i["id"]: i for i in API(server.list_components, query={"limit": "0"})["items"]}
+        check("已下单的数量算进在途了", by[target]["on_order"] > 0, True)
+
+        rd = gui.ReceiveDialog(app, app, po_id)
+        rd.update()
+        rd.v_qty.set("1")
+        rd.do(None)
+        app.update()
+        rec = app_con.execute("SELECT received FROM purchase WHERE id=?",
+                              (po_id,)).fetchone()[0]
+        check("到货入库把已收数量记成 1", rec, 1)
+        check("到货写了一条带采购单号的入库流水", app_con.execute(
+            "SELECT COUNT(*) FROM movement WHERE purchase_id=? AND kind='IN'",
+            (po_id,)).fetchone()[0], 1)
+
+        p("\n【10】层级仓位:柜 → 层 → 格")
+        loc = app.tab_loc
+        app.nb.select(loc)
+        app.update()
+        chain, parent = [], None
+        for code, name, structural in (("A柜", "A柜", True), ("A-01", "01层", True),
+                                       ("A-01-02", "02格", False)):
+            b = {"code": code, "name": name, "structural": structural}
+            if parent:
+                b["parent_id"] = parent
+            parent = API(server.create_location, body=b)["id"]
+            chain.append(parent)
+        loc.reload()
+        app.update()
+        check("02格的上级是 01层", loc.tree.parent(str(chain[2])), str(chain[1]))
+        check("01层的上级是 A柜", loc.tree.parent(str(chain[1])), str(chain[0]))
+        check("A柜标成「分层」", loc.tree.item(str(chain[0]), "values")[2], "分层")
+        check("02格标成「存货」", loc.tree.item(str(chain[2]), "values")[2], "存货")
+
+        try:
+            API(server.stock_move, body={"kind": "IN", "component_id": cid0,
+                                        "qty": 5, "location": "A柜"})
+            check("往分层仓位直接放东西会被挡住", False, True)
+        except server.ApiError as exc:
+            check("往分层仓位直接放东西会被挡住", "分层仓位" in exc.message, True)
+
+        API(server.stock_move, body={"kind": "IN", "component_id": cid0,
+                                     "qty": 7, "location": "A-01-02"})
+        loc.reload()
+        loc.tree.selection_set(str(chain[0]))
+        loc._on_pick()
+        app.update()
+        check("选中 A柜 能级联看到子仓位里的料",
+              len(loc.t_contents.get_children()) > 0, True)
+        check("说明里标明了是级联统计", "含子仓位" in loc.summary.get(), True)
+        loc.tree.selection_set(str(chain[2]))
+        loc._on_pick()
+        app.update()
+        check("选中 02格 能看到放进去的 7 个",
+              any(float(loc.t_contents.item(k, "values")[4]) == 7
+                  for k in loc.t_contents.get_children()), True)
+
+        p("\n【11】项目页:计划数量 / 能造几块 / BOM 行编辑")
+        proj = app.tab_proj
+        app.nb.select(proj)
+        proj.reload()
+        app.update()
+        kids = proj.t_proj.get_children()
+        check("项目列表 1 行", len(kids), 1)
+        pv = proj.t_proj.item(kids[0], "values")
+        check("项目行第 2 列是「计划」数量", pv[1], "1")
+        check("标题里写了计划与能造",
+              "计划" in proj.title.get() and "能造" in proj.title.get(), True)
+        check("BOM 表 12 列(含单块/损耗/替代/标记)", len(proj.t_bom["columns"]), 12)
+
+        bid0 = int(proj.t_bom.get_children()[0])
+        line0 = proj._lines[bid0]
+        bd = gui.BomLineDialog(app, proj, line0)
+        bd.update()
+        check("BOM 行弹窗回填了单块用量", bd.v["per_board"].get(), str(line0["per_board"]))
+        bd.v["attrition"].set("5")
+        bd.save()
+        proj.reload()
+        app.update()
+        check("损耗率改成 5% 真的存下来了", proj._lines[bid0]["attrition"], 5.0)
+        check("弹窗已标记完成", bd.done, True)
+
+        sd = gui.SubstituteDialog(app, proj, proj._lines[bid0])
+        sd.update()
+        n_sub = len(sd.tree.get_children())
+        # 必须挑一个**真有库存**的元件当替代料,否则 sub_qty 本来就是 0,
+        # 测不出「替代料库存计入可用量」这件事
+        cands = [i for i in API(server.list_components, query={"limit": "0"})["items"]
+                 if i["on_hand"] > 0 and i["id"] != proj._lines[bid0]["component_id"]]
+        check("库里有带库存的元件可以拿来当替代料", len(cands) > 0, True)
+        API(server.add_substitute, body={"component_id": cands[0]["id"]}, match=(bid0,))
+        sd.reload()
+        app.update()
+        check("加了替代料后弹窗里多一行", len(sd.tree.get_children()), n_sub + 1)
+        check("替代料汇总里会说明计入可用量", "可用量" in sd.sum.get(), True)
+        sd.destroy()
+        rep_after = API(server.project_bom, match=(proj._pid,))
+        line_after = [l for l in rep_after["lines"] if l["bom_id"] == bid0][0]
+        check("替代料的库存真的被算进这一行的可用量", line_after["sub_qty"] > 0, True)
+        check("可用量 = 本件现有 + 替代料现有",
+              line_after["available"], line_after["on_hand"] + line_after["sub_qty"])
+
+        p("\n【12】元件弹窗:新字段与参数解析")
+        d3 = gui.ComponentDialog(app, app, cid0)
+        d3.update()
+        for key in ("unit_price", "min_stock", "reorder_qty", "supplier", "default_loc_id"):
+            check(f"弹窗有「{key}」字段", key in d3.vars, True)
+        d3.params.delete("1.0", "end")
+        d3.params.insert("1.0", "耐压=50V\n精度=1%\n没有等号的行\n\n温度= -40~85C")
+        parsed = d3._parse_params()
+        check("参数按 key=value 解析", parsed.get("耐压"), "50V")
+        check("参数值两边空格被去掉", parsed.get("温度"), "-40~85C")
+        check("没有等号的行被忽略", len(parsed), 3)
+        d3.destroy()
+
+        p("\n【13】元件选择器")
+        pk = gui.ComponentPicker(app, app, "测试")
+        pk.update()
+        total_c = len(pk.tree.get_children())
+        check("选择器列出了元件", total_c > 0, True)
+        pk.q.set("10k")
+        pk.reload()
+        app.update()
+        check("搜索能过滤掉不相关的", 0 < len(pk.tree.get_children()) < total_c, True)
+        pk.tree.selection_set(pk.tree.get_children()[0])
+        pk.pick()
+        check("选中后返回元件 id", isinstance(pk.result, int), True)
+
+        p("\n【14】丝印 / 参数都要能搜到 —— 拆机料靠这个认回来")
+        mk = API(server.create_component, body={
+            "name": "拆机 SOT-23-5 未知芯片", "category": "芯片 IC",
+            "marking": "CX4R", "package": "SOT-23-5",
+            "params": {"来源": "salvage-bin-7"}})
+        mk_id = mk["id"]
+        got = API(server.list_components, query={"q": "CX4R"})
+        check("按丝印搜得到", [i["id"] for i in got["items"]], [mk_id])
+        check("丝印真的存下来了", got["items"][0]["marking"], "CX4R")
+        API(server.update_component, body={"marking": "KGMK"}, match=(mk_id,))
+        check("改了丝印后按新丝印搜得到",
+              [i["id"] for i in API(server.list_components, query={"q": "KGMK"})["items"]],
+              [mk_id])
+        check("旧丝印搜不到了",
+              len(API(server.list_components, query={"q": "CX4R"})["items"]), 0)
+        check("参数(JSON)里的值也能搜到(只可能由 params 命中)",
+              [i["id"] for i in
+               API(server.list_components, query={"q": "salvage-bin-7"})["items"]],
+              [mk_id])
+
+        p("\n【15】快速入库 —— 收货那一刻的录入")
+        app.nb.select(app.tab_comp)
+        app.update()
+        qi = gui.QuickInDialog(app, app)
+        qi.update()
+        stock_of = lambda cid: app_con.execute(  # noqa: E731
+            "SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?", (cid,)
+        ).fetchone()[0]
+
+        qi.q.set("10k")
+        qi.reload()
+        app.update()
+        check("输入关键字后列出了候选", len(qi.tree.get_children()) > 0, True)
+        pick = int(qi.tree.get_children()[0])
+        qi.tree.selection_set(str(pick))
+        qi.v_qty.set("3")
+        before = stock_of(pick)
+        qi.commit()
+        app.update()
+        check("搜到已有的,回车直接入库 3 个", stock_of(pick), before + 3)
+        check("入库后窗口不关(可以接着录下一袋)", bool(qi.winfo_exists()), True)
+        check("入库后搜索框自动清空", qi.q.get(), "")
+        check("入库后数量回到 1", qi.v_qty.get(), "1")
+
+        n_before = app_con.execute("SELECT COUNT(*) FROM component").fetchone()[0]
+        qi.q.set("ZZTOP-999-瞎写的")
+        qi.reload()
+        app.update()
+        check("库里没有时提示「会新建」", "新建" in qi.hint.get(), True)
+        qi.v_qty.set("2")
+        qi.commit()
+        app.update()
+        check("搜不到时当场新建了一条元件",
+              app_con.execute("SELECT COUNT(*) FROM component").fetchone()[0], n_before + 1)
+        newrow = app_con.execute(
+            "SELECT id, category FROM component WHERE name=?",
+            ("ZZTOP-999-瞎写的",)).fetchone()
+        check("新建的先归到「未分类」,不拦着你先记下来", newrow["category"], "未分类")
+        check("新建的同时就入库了 2 个", stock_of(newrow["id"]), 2)
+        qi.destroy()
+
+        p("\n【16】快捷键")
+        check("Ctrl+I 绑上了快速入库", bool(app.bind_all("<Control-i>")), True)
+        check("F5 绑上了刷新全部", bool(app.bind_all("<F5>")), True)
 
         app.refresh_all()
         app.update()

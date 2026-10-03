@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 from typing import Any, Iterable
@@ -323,46 +324,132 @@ def import_bom(con, path: str, project_name: str, project_code: str | None = Non
     }
 
 
-def shortage_report(con, project_id: int) -> dict:
-    """算缺料:需求 - 现有库存。返回带状态的行与汇总。"""
-    rows = con.execute(
-        """SELECT b.id, b.component_id, b.required_qty, b.designators, b.placed_qty,
-                  c.lcsc_pn, c.mpn, c.name, c.category, c.package, c.value, c.min_stock,
-                  COALESCE((SELECT SUM(qty) FROM stock s WHERE s.component_id=b.component_id),0) AS on_hand
-           FROM project_bom b JOIN component c ON c.id=b.component_id
-           WHERE b.project_id=?
-           ORDER BY c.category, c.value, c.lcsc_pn""",
-        (project_id,),
-    ).fetchall()
+def build_report(con, project_id: int) -> dict:
+    """项目的完整物料报告:每行要多少、有多少、缺多少,以及整块板**能造几块**。
 
-    lines, shortage_lines, shortage_qty = [], 0, 0
+    口径(与 InvenTree 对齐):
+
+      单块用量  per_board = BOM 里写的 required_qty
+      总需求    need      = ceil(per_board × (1 + 损耗%)) × 项目计划数量 + 固定损耗
+      可用      available = 本件现有 + 替代料现有
+      缺口      gap       = max(0, need − available)
+      该买      to_order  = max(0, gap − 在途)
+      这一行能支持几块 line_build = floor(max(0, available − 固定损耗) / (per_board × (1+损耗%)))
+      能造几块  can_build = 所有「卡产能」的行里最少的那个(= 瓶颈决定产量)
+
+    三处刻意的取舍,都写在这里免得以后自己看不懂:
+
+    * **免点件(consumable)不卡产能**。螺丝、锡、扎带这类东西算需求(要买),
+      但不应决定「能装出几块板」。
+    * **可选件(optional)也不卡产能**。InvenTree 是把它算进去的,但那意味着
+      「少一个本来就可以不装的电阻」会把整块板的可造数打成 0,对个人使用非常反直觉。
+      缺的可选件会单独统计(optional_missing),不会悄悄丢掉。
+    * **替代料的库存算进这一行的可用量**,否则设替代料就白设了。
+    """
+    proj = con.execute("SELECT * FROM project WHERE id=?", (project_id,)).fetchone()
+    if not proj:
+        raise ValueError("项目不存在")
+    boards = max(int(proj["qty"] or 1), 1)
+
+    rows = con.execute(
+        """SELECT b.id AS bom_id, b.component_id, b.required_qty, b.designators,
+                  b.placed_qty, b.optional, b.consumable, b.attrition, b.setup_qty, b.note,
+                  c.lcsc_pn, c.mpn, c.name, c.category, c.package, c.value, c.unit,
+                  c.unit_price, c.min_stock,
+                  COALESCE((SELECT SUM(qty) FROM stock s
+                             WHERE s.component_id = b.component_id), 0) AS on_hand,
+                  COALESCE((SELECT SUM(pu.qty) FROM purchase pu
+                             WHERE pu.component_id = b.component_id
+                               AND pu.status = 'ordered'), 0) AS on_order
+             FROM project_bom b JOIN component c ON c.id = b.component_id
+            WHERE b.project_id = ?
+            ORDER BY c.category, c.value_num, c.value, c.name""",
+        (project_id,)).fetchall()
+
+    lines = []
+    shortage_lines = shortage_qty = optional_missing = 0
+    shortage_value = 0.0
+    bottleneck = None
+
     for r in rows:
+        per_board = max(int(r["required_qty"]), 0)
+        attrition = float(r["attrition"] or 0)
+        setup = int(r["setup_qty"] or 0)
+        optional = bool(r["optional"])
+        consumable = bool(r["consumable"])
+
+        per_board_with_loss = per_board * (1 + attrition / 100.0)
+        need = int(math.ceil(per_board_with_loss * boards)) + setup
+
+        subs = [dict(s) for s in con.execute(
+            """SELECT s.id, s.component_id, c.name, c.value, c.package, c.lcsc_pn, c.mpn,
+                      COALESCE((SELECT SUM(qty) FROM stock st
+                                 WHERE st.component_id = s.component_id), 0) AS on_hand
+                 FROM bom_substitute s JOIN component c ON c.id = s.component_id
+                WHERE s.bom_id = ? ORDER BY c.value_num, c.value, c.name""",
+            (r["bom_id"],))]
         on_hand = int(r["on_hand"])
-        required = int(r["required_qty"])
-        gap = max(0, required - on_hand)
+        sub_qty = sum(int(s["on_hand"]) for s in subs)
+        available = on_hand + sub_qty
+        on_order = int(r["on_order"])
+
+        gap = max(0, need - available)
+        to_order = max(0, gap - on_order)
+
+        if per_board_with_loss > 0:
+            line_build = int(max(0.0, available - setup) / per_board_with_loss)
+        else:
+            line_build = boards          # 用量为 0 的行不该限制产能
+
+        blocking = not (consumable or optional) and per_board > 0
+        if blocking:
+            bottleneck = line_build if bottleneck is None else min(bottleneck, line_build)
+
         if gap:
-            shortage_lines += 1
             shortage_qty += gap
+            shortage_value += gap * float(r["unit_price"] or 0)
+            if optional:
+                optional_missing += 1
+            elif not consumable:
+                shortage_lines += 1
+
         lines.append({
+            "bom_id": r["bom_id"],
             "component_id": r["component_id"],
-            "lcsc_pn": r["lcsc_pn"],
-            "mpn": r["mpn"],
-            "name": r["name"],
-            "category": r["category"],
-            "package": r["package"],
-            "value": r["value"],
-            "required_qty": required,
-            "designators": r["designators"],
+            "lcsc_pn": r["lcsc_pn"], "mpn": r["mpn"], "name": r["name"],
+            "category": r["category"], "package": r["package"], "value": r["value"],
+            "unit": r["unit"], "unit_price": float(r["unit_price"] or 0),
+            "per_board": per_board,
+            "required_qty": per_board,          # 兼容既有调用
+            "need": need,
             "placed_qty": int(r["placed_qty"]),
-            "on_hand": on_hand,
-            "gap": gap,
+            "remaining": max(0, need - int(r["placed_qty"])),
+            "on_hand": on_hand, "sub_qty": sub_qty, "available": available,
+            "on_order": on_order, "gap": gap, "to_order": to_order,
+            "line_build": line_build, "blocking": blocking,
+            "optional": optional, "consumable": consumable,
+            "attrition": attrition, "setup_qty": setup,
+            "designators": r["designators"], "note": r["note"],
+            "substitutes": subs,
             "ok": gap == 0,
         })
+
+    lines.sort(key=lambda x: (x["ok"], -x["gap"], x["category"], x["name"]))
     return {
         "project_id": project_id,
+        "project_name": proj["name"],
+        "boards": boards,
         "lines": lines,
         "line_count": len(lines),
+        "can_build": int(bottleneck or 0),
         "shortage_lines": shortage_lines,
         "shortage_qty": shortage_qty,
+        "shortage_value": round(shortage_value, 2),
+        "optional_missing": optional_missing,
         "ready": shortage_lines == 0,
     }
+
+
+# 老名字,给还在用的调用点留个入口
+shortage_report = build_report
+

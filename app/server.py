@@ -146,18 +146,83 @@ class Ctx:
         return v
 
 
+def _as_float(v, default=0.0) -> float:
+    if v in (None, ""):
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _truthy(v) -> int:
+    """1/True/'1'/'true'/'yes' 都算真 —— 界面传字符串、自检传布尔,两种都要认。"""
+    return 1 if v in (1, "1", True, "true", "yes") else 0
+
+
+def _flag(ctx, name) -> bool:
+    """查询串里的开关。界面传的是字符串,自检可能传布尔,统一成字符串再比。"""
+    return str(ctx.q(name, "")).strip().lower() in ("1", "true", "yes")
+
+
 # ---------------------------------------------------------------- 元件
 
-COMPONENT_SELECT = """
+# 库存口径全部集中在这几个片段里,别处一律引用,保证任何界面上的数字都一致:
+#
+#   现有 on_hand    = 各仓位数量之和
+#   需求 required   = Σ(活动项目的 BOM 单块用量 × 项目计划数量)
+#   可用 available  = 现有(本系统不做硬占用/预留,所以两者相同)
+#   缺口 deficit    = max(0, 需求 − 可用)
+#   在途 on_order   = 已下单未到货
+#   目标 target     = max(需求, 安全库存)
+#   该买 to_order   = max(0, 目标 − 现有 − 在途)
+#
+# 「该买」这条我**故意和 InvenTree 不一样**,因为它的算法会欠购。
+# InvenTree 的 quantity_to_order(已核对 master 源码 part/models.py:1529)是:
+#       required -= max(total_stock, minimum_stock)
+# 代入一个真实场景 —— 需求 50、安全库存 100、现有 30:
+#       InvenTree: 50 − max(30,100) = 50 − 100 = −50  →  建议买 0
+# 可你手上只有 30、项目要出 50,实际缺 20,它却说不用买。
+# 换个场景,需求 200、安全库存 100、现有 30:
+#       InvenTree: 200 − 100 = 100  →  建议买 100,而实际缺 170。
+#
+# 所以我改用「目标库存」的说法,意思直白、也能自己验算:
+#       手上要留够 max(项目要用的, 安全库存) 那么多,差的才买。
+# 上面两个例子分别得出 70 和 170,是对的。这样一来安全库存才真的起到补货作用,
+# 而不是一个只出现在提示文字里、不参与计算的数字。
+ON_HAND_SQL = "COALESCE((SELECT SUM(s.qty) FROM stock s WHERE s.component_id = c.id), 0)"
+
+REQUIRED_SQL = """COALESCE((
+    SELECT SUM(b.required_qty * MAX(p.qty, 1))
+      FROM project_bom b JOIN project p ON p.id = b.project_id
+     WHERE b.component_id = c.id AND p.status = 'active'), 0)"""
+
+# 在途 = 已下单但还没到的数量。只有 status='ordered' 才算 —— 'todo' 还只是
+# 想买(购物车里),不能拿来抵采购建议,否则会把「要买」算成「已经买了」。
+ON_ORDER_SQL = """COALESCE((
+    SELECT SUM(pu.qty - pu.received) FROM purchase pu
+     WHERE pu.component_id = c.id AND pu.status = 'ordered'), 0)"""
+
+COMPONENT_SELECT = f"""
 SELECT c.*,
-       COALESCE((SELECT SUM(s.qty) FROM stock s WHERE s.component_id = c.id), 0) AS on_hand,
+       {ON_HAND_SQL} AS on_hand,
+       {REQUIRED_SQL} AS required,
+       {ON_HAND_SQL} AS available,
+       {ON_ORDER_SQL} AS on_order,
+       MAX({REQUIRED_SQL}, c.min_stock) AS target,
+       MAX(0, {REQUIRED_SQL} - {ON_HAND_SQL}) AS deficit,
+       MAX(0, MAX({REQUIRED_SQL}, c.min_stock) - {ON_HAND_SQL} - {ON_ORDER_SQL}) AS to_order,
        CASE
-         WHEN COALESCE((SELECT SUM(s.qty) FROM stock s WHERE s.component_id = c.id), 0) = 0 THEN 'out'
-         WHEN COALESCE((SELECT SUM(s.qty) FROM stock s WHERE s.component_id = c.id), 0) < c.min_stock THEN 'low'
+         WHEN {ON_HAND_SQL} = 0 THEN 'out'
+         WHEN {ON_HAND_SQL} < c.min_stock THEN 'low'
+         WHEN {ON_HAND_SQL} < {REQUIRED_SQL} THEN 'short'
          ELSE 'ok'
        END AS stock_state
 FROM component c
 """
+
+# 库存状态的显示名,界面和报表共用
+STATE_LABEL = {"ok": "充足", "low": "偏低", "short": "缺料", "out": "缺货"}
 
 
 def component_row(row) -> dict:
@@ -172,11 +237,15 @@ def list_components(ctx: Ctx, m):
     keyword = ctx.q("q")
     if keyword:
         like = f"%{keyword}%"
+        # 搜索是主入口,不是分类的补充 —— 所以凡是用户可能记得的碎片都要命中:
+        # 名称、立创编号、厂家料号、厂家、值、封装、**丝印**、**参数 JSON**、备注、品类。
+        # 丝印那一条是给拆机料用的:SOT-23 上只印着三个字母,查不到就等于没存。
         where.append(
             "(c.name LIKE ? OR c.lcsc_pn LIKE ? OR c.mpn LIKE ? OR c.manufacturer LIKE ?"
-            " OR c.value LIKE ? OR c.package LIKE ? OR c.note LIKE ? OR c.category LIKE ?)"
+            " OR c.value LIKE ? OR c.package LIKE ? OR c.marking LIKE ? OR c.params LIKE ?"
+            " OR c.note LIKE ? OR c.category LIKE ?)"
         )
-        args += [like] * 8
+        args += [like] * 10
     if ctx.q("category"):
         where.append("c.category = ?")
         args.append(ctx.q("category"))
@@ -197,7 +266,7 @@ def list_components(ctx: Ctx, m):
     # stocked=1:只要真正有库存的。on_hand 是子查询算出来的,所以只能在外层过滤。
     # 桌面版的「元件库存」首页靠它把库存为 0 的元件整个滤掉 —— 导入 BOM 只是记下
     # 「这块板子要用什么」,东西还没买回来,那不算库存。
-    if ctx.q("stocked") in ("1", "true", "yes"):
+    if _flag(ctx, "stocked"):
         outer_where.append("on_hand > 0")
     if outer_where:
         sql += " WHERE " + " AND ".join(outer_where)
@@ -257,13 +326,19 @@ def create_component(ctx: Ctx, m):
     name = ctx.require("name")
     cur = ctx.con.execute(
         """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, value, package,
-                                params, datasheet_url, product_url, unit, min_stock, note)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                marking, params, datasheet_url, product_url, unit, min_stock,
+                                reorder_qty, supplier, unit_price, default_loc_id, note)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ctx.b("lcsc_pn"), ctx.b("mpn"), ctx.b("manufacturer"), name,
          ctx.b("category") or "其他", ctx.b("value"), ctx.b("package"),
-         db.dump_params(ctx.b("params")), ctx.b("datasheet_url"), ctx.b("product_url"),
-         ctx.b("unit") or "个", ctx.bi("min_stock", 0) or 0, ctx.b("note")),
+         ctx.b("marking"), db.dump_params(ctx.b("params")),
+         ctx.b("datasheet_url"), ctx.b("product_url"),
+         ctx.b("unit") or "个", ctx.bi("min_stock", 0) or 0,
+         ctx.bi("reorder_qty", 0) or 0, ctx.b("supplier"),
+         _as_float(ctx.b("unit_price")), ctx.bi("default_loc_id", 0) or None,
+         ctx.b("note")),
     )
+    db.set_value_num(ctx.con, int(cur.lastrowid), ctx.b("value"))
     ctx.con.commit()
     return 201, {"id": int(cur.lastrowid)}
 
@@ -279,7 +354,8 @@ def update_component(ctx: Ctx, m):
         "lcsc_pn": ctx.b("lcsc_pn"), "mpn": ctx.b("mpn"),
         "manufacturer": ctx.b("manufacturer"), "name": ctx.b("name"),
         "category": ctx.b("category"), "value": ctx.b("value"),
-        "package": ctx.b("package"), "datasheet_url": ctx.b("datasheet_url"),
+        "package": ctx.b("package"), "marking": ctx.b("marking"),
+        "datasheet_url": ctx.b("datasheet_url"),
         "product_url": ctx.b("product_url"), "unit": ctx.b("unit"), "note": ctx.b("note"),
     }
     sets, args = [], []
@@ -293,6 +369,18 @@ def update_component(ctx: Ctx, m):
     if "min_stock" in ctx.body:
         sets.append("min_stock=?")
         args.append(ctx.bi("min_stock", 0) or 0)
+    if "reorder_qty" in ctx.body:
+        sets.append("reorder_qty=?")
+        args.append(ctx.bi("reorder_qty", 0) or 0)
+    if "unit_price" in ctx.body:
+        sets.append("unit_price=?")
+        args.append(_as_float(ctx.b("unit_price")))
+    if "supplier" in ctx.body:
+        sets.append("supplier=?")
+        args.append(ctx.b("supplier") or None)
+    if "default_loc_id" in ctx.body:
+        sets.append("default_loc_id=?")
+        args.append(ctx.bi("default_loc_id", 0) or None)
     if not sets:
         return 200, {"ok": True, "unchanged": True}
 
@@ -302,6 +390,9 @@ def update_component(ctx: Ctx, m):
         ctx.con.execute(f"UPDATE component SET {', '.join(sets)} WHERE id=?", args)
     except Exception as exc:  # 唯一约束等
         raise ApiError(400, f"保存失败:{exc}")
+    # value 变了就重算数值列,否则排序/筛选会跟显示对不上
+    if any(s.startswith("value=") for s in sets):
+        db.set_value_num(ctx.con, cid, ctx.b("value"))
     ctx.con.commit()
     return 200, {"ok": True}
 
@@ -332,29 +423,95 @@ def meta(ctx: Ctx, m):
     return 200, {
         "categories": sorted(set(cats) | set(CATEGORY_SUGGESTIONS)),
         "filters": {"categories": cats, "packages": pkgs, "manufacturers": mfrs},
-        "locations": [db.row_to_dict(r) for r in ctx.con.execute(
-            "SELECT * FROM location ORDER BY code")],
+        "locations": [dict(db.row_to_dict(r),
+                           path=db.location_path(ctx.con, r["id"]))
+                      for r in ctx.con.execute("SELECT * FROM location ORDER BY code")],
+        "state_labels": STATE_LABEL,
+        "purchase_status": PURCHASE_STATUS,
+        "units": ["个", "只", "片", "米", "克", "套", "张", "对"],
     }
 
 
 # ---------------------------------------------------------------- 仓位与出入库
 
 
+@route("GET", r"/api/locations")
+def list_locations(ctx: Ctx, m):
+    """层级仓位表,附带每个仓位的库存件数与总量。界面直接拿去画树。"""
+    items = []
+    for r in ctx.con.execute("SELECT * FROM location ORDER BY code"):
+        d = db.row_to_dict(r)
+        d["path"] = db.location_path(ctx.con, r["id"])
+        agg = ctx.con.execute(
+            "SELECT COALESCE(SUM(qty),0) AS qty, COUNT(DISTINCT component_id) AS kinds "
+            "FROM stock WHERE location_id=? AND qty>0", (r["id"],)).fetchone()
+        d["qty"] = int(agg["qty"])
+        d["kinds"] = int(agg["kinds"])
+        d["children"] = ctx.con.execute(
+            "SELECT COUNT(*) AS n FROM location WHERE parent_id=?", (r["id"],)).fetchone()["n"]
+        items.append(d)
+    return 200, {"items": items}
+
+
 @route("POST", r"/api/locations")
 def create_location(ctx: Ctx, m):
     code = str(ctx.require("code")).strip()
+    parent = ctx.b("parent_id") or ctx.b("parent")
+    parent_id = None
+    if parent not in (None, "", 0, "0"):
+        parent_id = _get_location_id(ctx.con, parent)
     try:
-        cur = ctx.con.execute("INSERT INTO location(code, note) VALUES(?,?)",
-                              (code, ctx.b("note")))
+        cur = ctx.con.execute(
+            "INSERT INTO location(code, name, parent_id, structural, note) VALUES(?,?,?,?,?)",
+            (code, ctx.b("name") or code, parent_id,
+             _truthy(ctx.b("structural")), ctx.b("note")))
     except Exception:
-        raise ApiError(400, f"仓位 {code} 已存在")
+        raise ApiError(400, f"仓位编码 {code} 已存在")
     ctx.con.commit()
     return 201, {"id": int(cur.lastrowid)}
+
+
+@route("PUT", r"/api/locations/(\d+)")
+def update_location(ctx: Ctx, m):
+    lid = int(m.group(1))
+    if not ctx.con.execute("SELECT 1 FROM location WHERE id=?", (lid,)).fetchone():
+        raise ApiError(404, "仓位不存在")
+    sets, args = [], []
+    for key in ("code", "name", "note"):
+        if key in ctx.body:
+            sets.append(f"{key}=?")
+            args.append(ctx.b(key))
+    if "structural" in ctx.body:
+        sets.append("structural=?")
+        args.append(1 if ctx.b("structural") in (1, "1", True, "true") else 0)
+    if "parent_id" in ctx.body:
+        pid = ctx.b("parent_id")
+        if pid in (None, "", 0, "0"):
+            sets.append("parent_id=NULL")
+        else:
+            pid = _get_location_id(ctx.con, pid)
+            if pid == lid:
+                raise ApiError(400, "不能把自己设成自己的上级")
+            sets.append("parent_id=?")
+            args.append(pid)
+    if not sets:
+        return 200, {"ok": True, "unchanged": True}
+    args.append(lid)
+    try:
+        ctx.con.execute(f"UPDATE location SET {', '.join(sets)} WHERE id=?", args)
+    except Exception as exc:
+        raise ApiError(400, f"保存失败:{exc}")
+    ctx.con.commit()
+    return 200, {"ok": True}
 
 
 @route("DELETE", r"/api/locations/(\d+)")
 def delete_location(ctx: Ctx, m):
     lid = int(m.group(1))
+    kids = ctx.con.execute("SELECT COUNT(*) AS n FROM location WHERE parent_id=?",
+                           (lid,)).fetchone()["n"]
+    if kids:
+        raise ApiError(409, f"该仓位下面还有 {kids} 个子仓位,先删子仓位")
     used = ctx.con.execute("SELECT COUNT(*) AS n FROM stock WHERE location_id=? AND qty<>0",
                            (lid,)).fetchone()["n"]
     if used:
@@ -362,6 +519,43 @@ def delete_location(ctx: Ctx, m):
     ctx.con.execute("DELETE FROM location WHERE id=?", (lid,))
     ctx.con.commit()
     return 200, {"ok": True}
+
+
+@route("GET", r"/api/locations/(\d+)/contents")
+def location_contents(ctx: Ctx, m):
+    """某个仓位里装了什么。cascade=1 时连子仓位一起算。"""
+    lid = int(m.group(1))
+    row = ctx.con.execute("SELECT * FROM location WHERE id=?", (lid,)).fetchone()
+    if not row:
+        raise ApiError(404, "仓位不存在")
+
+    if _flag(ctx, "cascade"):
+        # 递归往下把所有子仓位 id 收进来(SQLite 的 WITH RECURSIVE 就够用)
+        ids = [r["id"] for r in ctx.con.execute(
+            """WITH RECURSIVE sub(id) AS (
+                   SELECT ? UNION ALL
+                   SELECT l.id FROM location l JOIN sub ON l.parent_id = sub.id)
+               SELECT id FROM sub""", (lid,))]
+    else:
+        ids = [lid]
+    marks = ",".join("?" * len(ids))
+    rows = ctx.con.execute(
+        f"""SELECT c.id, c.name, c.lcsc_pn, c.mpn, c.category, c.value, c.package,
+                   c.unit, c.unit_price, s.qty, s.location_id,
+                   l.code AS location_code
+              FROM stock s JOIN component c ON c.id = s.component_id
+              JOIN location l ON l.id = s.location_id
+             WHERE s.location_id IN ({marks}) AND s.qty > 0
+             ORDER BY c.category, c.value_num, c.value, c.name""", ids)
+    items = [db.row_to_dict(r) for r in rows]
+    return 200, {
+        "location": db.row_to_dict(row),
+        "path": db.location_path(ctx.con, lid),
+        "items": items,
+        "kinds": len({i["id"] for i in items}),
+        "total_qty": sum(int(i["qty"]) for i in items),
+        "value": round(sum(int(i["qty"]) * float(i["unit_price"] or 0) for i in items), 2),
+    }
 
 
 def _get_location_id(con, code_or_id) -> int:
@@ -380,8 +574,33 @@ def _get_location_id(con, code_or_id) -> int:
     return int(cur.lastrowid)
 
 
+def _fallback_location(con, comp) -> int:
+    """没指定仓位时该放哪:先看这个元件的默认仓位,再退到「未分类」。
+
+    收货那一刻不该逼着人选仓位 —— 常用的料都有固定的家(`default_loc_id` 设一次就够),
+    没设的先进「未分类」,以后再慢慢归位。社区里弃用这类系统最常见的抱怨就是
+    「每用一次料都得去改数据库」,所以能省的一步一定要省。
+    """
+    if comp is not None and comp["default_loc_id"]:
+        return int(comp["default_loc_id"])
+    row = con.execute(
+        "SELECT id FROM location WHERE structural=0 ORDER BY id LIMIT 1").fetchone()
+    if row:
+        return int(row["id"])
+    cur = con.execute("INSERT INTO location(code, name) VALUES('未分类','未分类')")
+    return int(cur.lastrowid)
+
+
 def _bump(con, component_id: int, location_id: int, delta: int) -> int:
     """在事务内给余额加减,返回变动后的数量。禁止负库存。"""
+    if delta > 0:
+        # 标了「只用来分层」的仓位不装东西(比如「A柜」和「02层」本身)。
+        # 挡住它是为了防止东西被放到一个其实没有物理位置的节点上。
+        loc = con.execute("SELECT code, structural FROM location WHERE id=?",
+                          (location_id,)).fetchone()
+        if loc and loc["structural"]:
+            raise ApiError(409, f"「{loc['code']}」是分层仓位,不能直接放东西;"
+                                f"请放到它下面的具体仓位里")
     row = con.execute("SELECT qty FROM stock WHERE component_id=? AND location_id=?",
                       (component_id, location_id)).fetchone()
     cur = int(row["qty"]) if row else 0
@@ -416,7 +635,12 @@ def stock_move(ctx: Ctx, m):
     if qty is None or qty < 0:
         raise ApiError(400, "数量必须是不小于 0 的整数")
 
-    loc = _get_location_id(ctx.con, ctx.b("location") or ctx.b("location_id"))
+    raw_loc = ctx.b("location") or ctx.b("location_id")
+    if raw_loc in (None, ""):
+        # 没写仓位 = 放这个元件的默认位置(没设就进「未分类」)
+        loc = _fallback_location(ctx.con, comp)
+    else:
+        loc = _get_location_id(ctx.con, raw_loc)
     to_loc = None
     if kind == "TRANSFER":
         to_loc = _get_location_id(ctx.con, ctx.b("to_location") or ctx.b("to_location_id"))
@@ -571,21 +795,76 @@ def rebuild(ctx: Ctx, m):
 
 @route("GET", r"/api/projects")
 def list_projects(ctx: Ctx, m):
-    rows = ctx.con.execute(
-        """SELECT p.*,
-                  (SELECT COUNT(*) FROM project_bom b WHERE b.project_id=p.id) AS bom_lines,
-                  (SELECT COALESCE(SUM(required_qty),0) FROM project_bom b
-                    WHERE b.project_id=p.id) AS required_qty
-           FROM project p ORDER BY p.id DESC""")
-    return 200, {"items": [db.row_to_dict(r) for r in rows]}
+    """项目列表。每个项目带上「能造几块」和缺料统计 —— 这是项目页最该先看到的。"""
+    items = []
+    for r in ctx.con.execute("SELECT * FROM project ORDER BY id DESC"):
+        d = db.row_to_dict(r)
+        agg = ctx.con.execute(
+            """SELECT COUNT(*) AS lines,
+                      COALESCE(SUM(required_qty),0) AS per_board,
+                      COALESCE(SUM(placed_qty),0) AS placed
+               FROM project_bom WHERE project_id=?""", (r["id"],)).fetchone()
+        d["bom_lines"] = int(agg["lines"])
+        d["per_board"] = int(agg["per_board"])
+        d["placed"] = int(agg["placed"])
+        d["required_qty"] = int(agg["per_board"]) * max(int(d.get("qty") or 1), 1)
+        rep = bom.build_report(ctx.con, r["id"])
+        d["can_build"] = rep["can_build"]
+        d["shortage_lines"] = rep["shortage_lines"]
+        d["shortage_qty"] = rep["shortage_qty"]
+        d["shortage_value"] = rep["shortage_value"]
+        d["ready"] = rep["ready"]
+        items.append(d)
+    return 200, {"items": items}
 
 
 @route("POST", r"/api/projects")
 def create_project(ctx: Ctx, m):
-    cur = ctx.con.execute("INSERT INTO project(name, code, repo, note) VALUES(?,?,?,?)",
-                          (ctx.require("name"), ctx.b("code"), ctx.b("repo"), ctx.b("note")))
+    cur = ctx.con.execute(
+        "INSERT INTO project(name, code, repo, qty, status, note) VALUES(?,?,?,?,?,?)",
+        (ctx.require("name"), ctx.b("code"), ctx.b("repo"), ctx.bi("qty", 1) or 1,
+         ctx.b("status") or "active", ctx.b("note")))
     ctx.con.commit()
     return 201, {"id": int(cur.lastrowid)}
+
+
+@route("GET", r"/api/projects/(\d+)")
+def get_project(ctx: Ctx, m):
+    pid = int(m.group(1))
+    row = ctx.con.execute("SELECT * FROM project WHERE id=?", (pid,)).fetchone()
+    if not row:
+        raise ApiError(404, "项目不存在")
+    d = db.row_to_dict(row)
+    rep = bom.build_report(ctx.con, pid)
+    d.update({k: rep[k] for k in ("can_build", "shortage_lines", "shortage_qty",
+                                  "shortage_value", "ready", "line_count")})
+    d["latest"] = ctx.con.execute(
+        "SELECT MAX(created_at) AS t FROM movement WHERE project_id=?", (pid,)).fetchone()["t"]
+    return 200, d
+
+
+@route("PUT", r"/api/projects/(\d+)")
+def update_project(ctx: Ctx, m):
+    pid = int(m.group(1))
+    if not ctx.con.execute("SELECT 1 FROM project WHERE id=?", (pid,)).fetchone():
+        raise ApiError(404, "项目不存在")
+    sets, args = [], []
+    for key in ("name", "code", "repo", "status", "note"):
+        if key in ctx.body:
+            sets.append(f"{key}=?")
+            args.append(ctx.b(key))
+    if "qty" in ctx.body:
+        qty = ctx.bi("qty", 1) or 1
+        if qty < 1:
+            raise ApiError(400, "计划数量至少是 1")
+        sets.append("qty=?")
+        args.append(qty)
+    if not sets:
+        return 200, {"ok": True, "unchanged": True}
+    args.append(pid)
+    ctx.con.execute(f"UPDATE project SET {', '.join(sets)} WHERE id=?", args)
+    ctx.con.commit()
+    return 200, {"ok": True}
 
 
 @route("DELETE", r"/api/projects/(\d+)")
@@ -619,10 +898,10 @@ def pick_for_project(ctx: Ctx, m):
         plan = [(int(i["component_id"]), int(i["qty"]), i.get("location_id") or i.get("location"))
                 for i in requested]
     else:
-        rep = bom.shortage_report(ctx.con, pid)
+        rep = bom.build_report(ctx.con, pid)
         plan = []
         for line in rep["lines"]:
-            need = line["required_qty"] - line["placed_qty"]
+            need = line["need"] - line["placed_qty"]
             if need > 0:
                 plan.append((line["component_id"], need, None))
 
@@ -674,6 +953,391 @@ def pick_for_project(ctx: Ctx, m):
             failed.append({"component_id": cid, "qty": qty, "reason": exc.message})
     ctx.con.commit()
     return 200, {"ok": not failed, "picked": done, "failed": failed}
+
+
+# ---------------------------------------------------------------- BOM 编辑与替代料
+
+
+@route("PUT", r"/api/bom/(\d+)")
+def update_bom_line(ctx: Ctx, m):
+    """改一行 BOM:用量、位号、损耗率、固定损耗、可选/免点。"""
+    bid = int(m.group(1))
+    if not ctx.con.execute("SELECT 1 FROM project_bom WHERE id=?", (bid,)).fetchone():
+        raise ApiError(404, "BOM 行不存在")
+    sets, args = [], []
+    for key in ("designators", "note"):
+        if key in ctx.body:
+            sets.append(f"{key}=?")
+            args.append(ctx.b(key))
+    for key in ("required_qty", "setup_qty"):
+        if key in ctx.body:
+            val = ctx.bi(key, 0) or 0
+            if val < 0:
+                raise ApiError(400, "数量不能是负数")
+            sets.append(f"{key}=?")
+            args.append(val)
+    if "attrition" in ctx.body:
+        try:
+            val = float(ctx.body["attrition"] or 0)
+        except (TypeError, ValueError):
+            raise ApiError(400, "损耗率要是数字")
+        if val < 0:
+            raise ApiError(400, "损耗率不能是负数")
+        sets.append("attrition=?")
+        args.append(val)
+    for key in ("optional", "consumable"):
+        if key in ctx.body:
+            sets.append(f"{key}=?")
+            args.append(_truthy(ctx.b(key)))
+    if not sets:
+        return 200, {"ok": True, "unchanged": True}
+    args.append(bid)
+    ctx.con.execute(f"UPDATE project_bom SET {', '.join(sets)} WHERE id=?", args)
+    ctx.con.commit()
+    return 200, {"ok": True}
+
+
+@route("DELETE", r"/api/bom/(\d+)")
+def delete_bom_line(ctx: Ctx, m):
+    ctx.con.execute("DELETE FROM project_bom WHERE id=?", (int(m.group(1)),))
+    ctx.con.commit()
+    return 200, {"ok": True}
+
+
+@route("POST", r"/api/projects/(\d+)/bom")
+def add_bom_line(ctx: Ctx, m):
+    """手动往项目里加一行料。"""
+    pid = int(m.group(1))
+    if not ctx.con.execute("SELECT 1 FROM project WHERE id=?", (pid,)).fetchone():
+        raise ApiError(404, "项目不存在")
+    try:
+        cur = ctx.con.execute(
+            """INSERT INTO project_bom(project_id, component_id, required_qty, designators,
+                                       optional, consumable, attrition, setup_qty, note)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (pid, ctx.bi("component_id", 0), ctx.bi("required_qty", 1) or 1,
+             ctx.b("designators"), _truthy(ctx.b("optional")), _truthy(ctx.b("consumable")),
+             float(ctx.body.get("attrition") or 0), ctx.bi("setup_qty", 0) or 0, ctx.b("note")))
+    except Exception as exc:
+        raise ApiError(400, f"添加失败(这一行可能已经存在):{exc}")
+    ctx.con.commit()
+    return 201, {"id": int(cur.lastrowid)}
+
+
+@route("GET", r"/api/bom/(\d+)/substitutes")
+def list_substitutes(ctx: Ctx, m):
+    bid = int(m.group(1))
+    rows = ctx.con.execute(
+        """SELECT s.id, s.note, c.id AS component_id, c.name, c.lcsc_pn, c.mpn,
+                  c.value, c.package, c.category, c.unit_price,
+                  COALESCE((SELECT SUM(qty) FROM stock st
+                             WHERE st.component_id = s.component_id), 0) AS on_hand
+             FROM bom_substitute s JOIN component c ON c.id = s.component_id
+            WHERE s.bom_id = ? ORDER BY c.value_num, c.value, c.name""", (bid,))
+    items = [db.row_to_dict(r) for r in rows]
+    return 200, {"items": items, "total": len(items),
+                 "on_hand": sum(int(i["on_hand"]) for i in items)}
+
+
+@route("POST", r"/api/bom/(\d+)/substitutes")
+def add_substitute(ctx: Ctx, m):
+    """给某一行 BOM 加替代料。替代料的库存会算进这一行的可用量。"""
+    bid = int(m.group(1))
+    if not ctx.con.execute("SELECT 1 FROM project_bom WHERE id=?", (bid,)).fetchone():
+        raise ApiError(404, "BOM 行不存在")
+    cid = ctx.bi("component_id", 0)
+    if not ctx.con.execute("SELECT 1 FROM component WHERE id=?", (cid,)).fetchone():
+        raise ApiError(404, "替代料不存在")
+    try:
+        cur = ctx.con.execute(
+            "INSERT INTO bom_substitute(bom_id, component_id, note) VALUES(?,?,?)",
+            (bid, cid, ctx.b("note")))
+    except Exception:
+        raise ApiError(400, "这个替代料已经加过了")
+    ctx.con.commit()
+    return 201, {"id": int(cur.lastrowid)}
+
+
+@route("DELETE", r"/api/substitutes/(\d+)")
+def delete_substitute(ctx: Ctx, m):
+    ctx.con.execute("DELETE FROM bom_substitute WHERE id=?", (int(m.group(1)),))
+    ctx.con.commit()
+    return 200, {"ok": True}
+
+
+# ---------------------------------------------------------------- 采购与在途
+
+PURCHASE_STATUS = {"todo": "想买", "ordered": "已下单", "arrived": "已到货",
+                   "cancel": "已取消"}
+
+
+@route("GET", r"/api/purchase")
+def list_purchase(ctx: Ctx, m):
+    where, args = [], []
+    status = ctx.q("status")
+    if status in PURCHASE_STATUS:
+        where.append("pu.status = ?")
+        args.append(status)
+    if ctx.qi("component_id", 0):
+        where.append("pu.component_id = ?")
+        args.append(ctx.qi("component_id"))
+    sql = f"""SELECT pu.*, c.name, c.lcsc_pn, c.mpn, c.category, c.value, c.package, c.unit,
+                     c.unit_price AS ref_price, p.name AS project_name,
+                     (pu.qty - pu.received) AS outstanding,
+                     (pu.qty * pu.unit_price) AS amount
+                FROM purchase pu
+                JOIN component c ON c.id = pu.component_id
+                LEFT JOIN project p ON p.id = pu.project_id
+               {'WHERE ' + ' AND '.join(where) if where else ''}
+               ORDER BY CASE pu.status WHEN 'ordered' THEN 0 WHEN 'todo' THEN 1
+                                       WHEN 'arrived' THEN 2 ELSE 3 END,
+                        pu.id DESC"""
+    rows = ctx.con.execute(sql, args).fetchall()
+    items = [db.row_to_dict(r) for r in rows]
+    for it in items:
+        it["status_label"] = PURCHASE_STATUS.get(it["status"], it["status"])
+    return 200, {"items": items, "total": len(items)}
+
+
+def _make_purchase(con, component_id, qty, unit_price=None, supplier=None,
+                   status="todo", project_id=None, note=None):
+    if unit_price in (None, ""):
+        row = con.execute("SELECT unit_price, supplier FROM component WHERE id=?",
+                          (component_id,)).fetchone()
+        unit_price = float(row["unit_price"] or 0) if row else 0.0
+        supplier = supplier or (row["supplier"] if row else None)
+    cur = con.execute(
+        """INSERT INTO purchase(component_id, qty, unit_price, supplier, status,
+                                project_id, note, ordered_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (component_id, int(qty), float(unit_price or 0), supplier, status,
+         project_id, note, db.now() if status == "ordered" else None))
+    return int(cur.lastrowid)
+
+
+@route("POST", r"/api/purchase")
+def create_purchase(ctx: Ctx, m):
+    """新建采购单。可以传一条,也可以传 items 批量(「一键按建议采购」用它)。"""
+    status = ctx.b("status") or "todo"
+    if status not in PURCHASE_STATUS:
+        raise ApiError(400, f"状态只能是 {'/'.join(PURCHASE_STATUS)}")
+    batch = ctx.b("items")
+    if batch:
+        ids = []
+        for it in batch:
+            cid = int(it.get("component_id") or 0)
+            qty = int(it.get("qty") or 0)
+            if not cid or qty <= 0:
+                continue
+            ids.append(_make_purchase(
+                ctx.con, cid, qty, it.get("unit_price"), it.get("supplier"),
+                it.get("status") or status, it.get("project_id") or ctx.b("project_id"),
+                it.get("note")))
+        if not ids:
+            raise ApiError(400, "没有有效的采购项")
+        ctx.con.commit()
+        return 201, {"ok": True, "ids": ids, "count": len(ids)}
+
+    cid = ctx.bi("component_id", 0)
+    if not ctx.con.execute("SELECT 1 FROM component WHERE id=?", (cid,)).fetchone():
+        raise ApiError(404, "元件不存在")
+    qty = ctx.bi("qty", 0)
+    if qty <= 0:
+        raise ApiError(400, "数量要大于 0")
+    pid = _make_purchase(ctx.con, cid, qty, ctx.b("unit_price"), ctx.b("supplier"),
+                         status, ctx.b("project_id"), ctx.b("note"))
+    ctx.con.commit()
+    return 201, {"id": pid}
+
+
+@route("PUT", r"/api/purchase/(\d+)")
+def update_purchase(ctx: Ctx, m):
+    pid = int(m.group(1))
+    row = ctx.con.execute("SELECT * FROM purchase WHERE id=?", (pid,)).fetchone()
+    if not row:
+        raise ApiError(404, "采购单不存在")
+    sets, args = [], []
+    if "qty" in ctx.body:
+        qty = ctx.bi("qty", 0)
+        if qty <= 0:
+            raise ApiError(400, "数量要大于 0")
+        if qty < int(row["received"]):
+            raise ApiError(400, f"已经收货 {row['received']},数量不能改到比它小")
+        sets.append("qty=?")
+        args.append(qty)
+    if "unit_price" in ctx.body:
+        sets.append("unit_price=?")
+        args.append(float(ctx.body["unit_price"] or 0))
+    for key in ("supplier", "note"):
+        if key in ctx.body:
+            sets.append(f"{key}=?")
+            args.append(ctx.b(key))
+    if "status" in ctx.body:
+        status = ctx.b("status")
+        if status not in PURCHASE_STATUS:
+            raise ApiError(400, f"状态只能是 {'/'.join(PURCHASE_STATUS)}")
+        sets.append("status=?")
+        args.append(status)
+        if status == "ordered" and not row["ordered_at"]:
+            sets.append("ordered_at=?")
+            args.append(db.now())
+    if not sets:
+        return 200, {"ok": True, "unchanged": True}
+    args.append(pid)
+    ctx.con.execute(f"UPDATE purchase SET {', '.join(sets)} WHERE id=?", args)
+    ctx.con.commit()
+    return 200, {"ok": True}
+
+
+@route("POST", r"/api/purchase/(\d+)/receive")
+def receive_purchase(ctx: Ctx, m):
+    """到货入库:把数量真正加进库存,并记一条带采购单号的入库流水。
+
+    支持分批:收一部分就先记一部分,在途数量跟着变小;收满才标成「已到货」。
+    """
+    pid = int(m.group(1))
+    row = ctx.con.execute("SELECT * FROM purchase WHERE id=?", (pid,)).fetchone()
+    if not row:
+        raise ApiError(404, "采购单不存在")
+    if row["status"] == "cancel":
+        raise ApiError(409, "已取消的采购单不能入库")
+
+    left = int(row["qty"]) - int(row["received"])
+    if left <= 0:
+        raise ApiError(409, "这一单已经全部到货了")
+    qty = ctx.bi("qty", left) or left
+    if qty <= 0:
+        raise ApiError(400, "到货数量要大于 0")
+    if qty > left:
+        raise ApiError(400, f"到货数量超过未收数量(还剩 {left})")
+
+    loc = ctx.b("location") or ctx.b("location_id")
+    if loc in (None, ""):
+        # 没指定就放这个元件的默认仓位,再没有就放「未分类」。
+        # 这样收货不用每次都手选仓位。
+        comp = ctx.con.execute("SELECT default_loc_id FROM component WHERE id=?",
+                               (row["component_id"],)).fetchone()
+        loc = comp["default_loc_id"] if comp and comp["default_loc_id"] else "未分类"
+    loc_id = _get_location_id(ctx.con, loc)
+
+    _bump(ctx.con, row["component_id"], loc_id, qty)
+    got = int(row["received"]) + qty
+    done = got >= int(row["qty"])
+    ctx.con.execute(
+        "UPDATE purchase SET received=?, status=?, arrived_at=? WHERE id=?",
+        (got, "arrived" if done else "ordered",
+         (row["arrived_at"] or db.now()) if done else None, pid))
+    ctx.con.execute(
+        """INSERT INTO movement(kind, component_id, location_id, qty, project_id,
+                                purchase_id, ref, operator, note)
+           VALUES('IN',?,?,?,?,?,?,?,?)""",
+        (row["component_id"], loc_id, qty, row["project_id"], pid,
+         ctx.b("ref") or f"PO-{pid}", ctx.b("operator") or "本地用户",
+         f"采购到货({row['supplier'] or '未填供应商'})"))
+    db.touch_component(ctx.con, row["component_id"])
+    ctx.con.commit()
+    return 200, {"ok": True, "received": got, "outstanding": int(row["qty"]) - got,
+                 "status": "arrived" if done else "ordered"}
+
+
+@route("DELETE", r"/api/purchase/(\d+)")
+def delete_purchase(ctx: Ctx, m):
+    ctx.con.execute("DELETE FROM purchase WHERE id=?", (int(m.group(1)),))
+    ctx.con.commit()
+    return 200, {"ok": True}
+
+
+# ---------------------------------------------------------------- 该买什么 / 总览
+
+
+def _shopping_rows(con) -> list:
+    """算出「该买什么」。已经在途的扣掉了,所以不会重复建议同一批货。"""
+    rows = con.execute(
+        f"SELECT * FROM ({COMPONENT_SELECT}) "
+        "WHERE to_order > 0 OR on_order > 0 "
+        "ORDER BY category, value_num, value, name").fetchall()
+    out = []
+    for r in rows:
+        d = component_row(r)
+        # 说清「为什么要买」,免得只看到一个数字不知道为什么
+        reasons = []
+        if d["deficit"] > 0:
+            reasons.append(f"项目缺料 {d['deficit']}")
+        if d["min_stock"] and d["on_hand"] < d["min_stock"]:
+            reasons.append(f"低于安全库存 {d['min_stock'] - d['on_hand']}")
+        if d["on_order"]:
+            reasons.append(f"在途 {d['on_order']}")
+        d["reasons"] = reasons
+        d["buy_qty"] = d["to_order"]
+        d["amount"] = round(d["buy_qty"] * float(d["unit_price"] or 0), 2)
+        out.append(d)
+    return out
+
+
+@route("GET", r"/api/shopping")
+def shopping_list(ctx: Ctx, m):
+    items = _shopping_rows(ctx.con)
+    return 200, {
+        "items": items,
+        "total": len(items),
+        "total_qty": sum(i["buy_qty"] for i in items),
+        "total_amount": round(sum(i["amount"] for i in items), 2),
+        "on_order_qty": sum(i["on_order"] for i in items),
+    }
+
+
+@route("GET", r"/api/dashboard")
+def dashboard(ctx: Ctx, m):
+    """总览:一眼看清「我有什么 / 要做什么 / 该买什么」。"""
+    agg = ctx.con.execute(
+        f"""SELECT COUNT(*) AS kinds,
+                   COALESCE(SUM(on_hand),0) AS qty,
+                   COALESCE(SUM(on_hand * unit_price),0) AS value,
+                   COALESCE(SUM(CASE WHEN on_hand = 0 THEN 1 ELSE 0 END),0) AS out_kinds,
+                   COALESCE(SUM(CASE WHEN on_hand > 0 AND min_stock > 0
+                                      AND on_hand < min_stock THEN 1 ELSE 0 END),0) AS low_kinds
+              FROM ({COMPONENT_SELECT})""").fetchone()
+
+    buy = _shopping_rows(ctx.con)
+    on_order = ctx.con.execute(
+        """SELECT COALESCE(SUM(qty - received),0) AS qty,
+                  COALESCE(SUM((qty - received) * unit_price),0) AS amount
+             FROM purchase WHERE status='ordered'""").fetchone()
+
+    projects = []
+    for r in ctx.con.execute("SELECT * FROM project WHERE status='active' ORDER BY id DESC"):
+        rep = bom.build_report(ctx.con, r["id"])
+        projects.append({
+            "id": r["id"], "name": r["name"], "qty": int(r["qty"] or 1),
+            "bom_lines": rep["line_count"], "can_build": rep["can_build"],
+            "shortage_lines": rep["shortage_lines"],
+            "shortage_value": rep["shortage_value"], "ready": rep["ready"],
+        })
+
+    recent = [db.row_to_dict(r) for r in ctx.con.execute(
+        """SELECT mv.id, mv.kind, mv.qty, mv.created_at, mv.note, mv.project_id,
+                  c.name AS component_name, c.value, c.package, c.category,
+                  l.code AS location_code, p.name AS project_name
+             FROM movement mv
+             JOIN component c ON c.id = mv.component_id
+             LEFT JOIN location l ON l.id = mv.location_id
+             LEFT JOIN project p ON p.id = mv.project_id
+            ORDER BY mv.id DESC LIMIT 12""")]
+
+    return 200, {
+        "kinds": int(agg["kinds"]),
+        "total_qty": int(agg["qty"]),
+        "total_value": round(float(agg["value"]), 2),
+        "out_kinds": int(agg["out_kinds"]),
+        "low_kinds": int(agg["low_kinds"]),
+        "buy_kinds": len(buy),
+        "buy_qty": sum(i["buy_qty"] for i in buy),
+        "buy_amount": round(sum(i["amount"] for i in buy), 2),
+        "on_order_qty": int(on_order["qty"]),
+        "on_order_amount": round(float(on_order["amount"]), 2),
+        "projects": projects,
+        "recent": recent,
+    }
 
 
 def _read_upload(ctx: Ctx) -> tuple[str, bytes]:
@@ -970,6 +1634,7 @@ def main(argv=None) -> int:
 
     con = db.connect(args.db)
     db.init_db(con)
+    db.backfill_values(con)
     con.close()
 
     # 便携版:界面关掉后自动退出,不留后台进程
