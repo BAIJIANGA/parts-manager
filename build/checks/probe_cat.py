@@ -70,8 +70,22 @@ def main():
     OUT.append("")
     OUT.append("【2】老库升上来:文本品类变成真正的行")
     src = os.path.join(ROOT, "data", "parts.db")
-    if not os.path.exists(src):
-        OUT.append("  (没有 data/parts.db,跳过 —— 用造出来的老库代替)")
+    # 「老库」的定义是**还没有 component.category_id 这一列**的库。仓库里那个开发用
+    # 的 data/parts.db 跑过一遍就被升级掉了,拿它当老库,这条断言就会随库的状态飘
+    # (实测:升级过之后这里就永远 False)。所以先看它到底算不算老库,不算就现造一个,
+    # 结果才是确定的。只读打开,绝不碰它。
+    legacy_ok = False
+    if os.path.exists(src):
+        try:
+            # db.connect 只连接、不做迁移(迁移在 init_db 里),所以拿它探一下列是安全的
+            _c = db.connect(src)
+            _cols = {r[1] for r in _c.execute("PRAGMA table_info(component)")}
+            _c.close()
+            legacy_ok = "category_id" not in _cols
+        except Exception:
+            legacy_ok = False
+    if not legacy_ok:
+        OUT.append("  (手上没有「还没补过列」的老库,用现造的老库来验这一步)")
         p2 = os.path.join(tmp, "legacy.db")
         con2 = db.connect(p2)
         con2.executescript("""
@@ -80,6 +94,8 @@ def main():
               category TEXT NOT NULL DEFAULT '其他', value TEXT, package TEXT,
               params TEXT NOT NULL DEFAULT '{}', unit TEXT NOT NULL DEFAULT '个',
               min_stock INTEGER NOT NULL DEFAULT 0, unit_price REAL NOT NULL DEFAULT 0,
+              -- v1 就有的几列,init_db 的补列清单里没有它们,缺了建索引就炸
+              mpn TEXT, lcsc_pn TEXT, manufacturer TEXT,
               created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
               updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
             INSERT INTO component(name, category, value, package) VALUES

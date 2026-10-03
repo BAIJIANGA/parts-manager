@@ -1754,6 +1754,201 @@ for _r in CON.execute("SELECT id, category, category_id FROM component "
         _mism += 1
 check("全库扫描:没有元件的品类文本和它在树上的顶层名字对不上", _mism, 0)
 
+
+p("\n【39】BOM 导入按封装落到子类:电阻 + C0603 也要进 R0603(#25)")
+
+# 用户的原话:
+#   「我导入 bom 表你需要把 bom 里面的电阻电感电容按照品类名字分好,**不要只搞一个
+#    电阻**,电阻下面是有子类的。比如封装是 R0603 你就分到 R0603 这里面;如果 bom
+#    里面是 0603,你识别到了他是一个电阻,你就往电阻里面找最相似的放;比如 bom 表上
+#    是电阻、封装写的 0603 而不是 R0603,你也要往 R0603 放。**就算写的是 C0603 你也
+#    要往 R0603 放。**」
+#
+# 这个自检库刚开始只有顶层品类(种子就是 bom.CATEGORIES),所以先按用户真实库的样子
+# 搭出子类(他那边的形状是:电阻 -> R0603/R0805,电容 -> 贴片陶瓷电容 -> C0603/C0805,
+# 电感**没有**子类)。电感这一支故意不建:规则明确「不新建节点」,没有就留在根级。
+
+
+def _ensure_cat(name, parent_id):
+    """按 (名字, 父节点) 找/建一个子类。已有就复用,别撞唯一约束。"""
+    _s2, t2 = call(server.list_categories)
+    for r in t2["flat"]:
+        if r["name"] == name and r["parent_id"] == parent_id:
+            return r["id"]
+    _s2, node = call(server.create_category, body={"name": name, "parent_id": parent_id})
+    return node["id"]
+
+
+_cat_r = cat_node("电阻")["id"]
+_cat_c = cat_node("电容")["id"]
+_cat_l = cat_node("电感")["id"]
+_r0603 = _ensure_cat("R0603", _cat_r)
+_r0805 = _ensure_cat("R0805", _cat_r)
+_c_mlcc = _ensure_cat("贴片陶瓷电容", _cat_c)
+_c0603 = _ensure_cat("C0603", _c_mlcc)     # 注意:子类在**两层**下面,只找一层是找不到的
+_c0805 = _ensure_cat("C0805", _c_mlcc)
+check("子类搭好了:电阻支两个、电容支两层",
+      (db.category_path(CON, _r0603), db.category_path(CON, _c0603)),
+      ("电阻 / R0603", "电容 / 贴片陶瓷电容 / C0603"))
+check("电感这一支本来就(故意)没有子类", cat_node("电感 / L0603"), None)
+
+
+def _mpn_node(mpn):
+    r = CON.execute("SELECT category_id FROM component WHERE mpn=?", (mpn,)).fetchone()
+    return None if r is None else r["category_id"]
+
+
+def _mpn_text(mpn):
+    return CON.execute("SELECT category FROM component WHERE mpn=?", (mpn,)).fetchone()[0]
+
+
+# ---- 带品类列的 BOM:界面复核对话框看到的就是这份(preview -> import)
+bom_cat = write_csv("issue25_cat.csv",
+                    "Designator,Comment,Footprint,Quantity,MPN,Category\n"
+                    "R1,10k,R0603,1,ST39-A1,电阻\n"
+                    "R2,20k,0603,1,ST39-A2,电阻\n"
+                    "R3,30k,C0603,1,ST39-A3,电阻\n"
+                    "R4,40k,R0805,1,ST39-A4,电阻\n"
+                    "C1,100nF,C0603,1,ST39-A5,电容\n"
+                    "L1,10uH,L0603,1,ST39-A6,电感\n"
+                    "R5,50k,SOT-23,1,ST39-A7,电阻\n")
+# ---- 不带品类列的 BOM:只有位号 + 值 + 封装,品类全靠推断
+bom_nocat = write_csv("issue25_nocat.csv",
+                      "Designator,Comment,Footprint,Quantity,MPN\n"
+                      "R11,10k,R0603,1,ST39-B1\n"
+                      "R12,20k,0603,1,ST39-B2\n"
+                      "R13,30k,C0603,1,ST39-B3\n"
+                      "R14,40k,R0805,1,ST39-B4\n"
+                      "C11,100nF,C0603,1,ST39-B5\n"
+                      "L11,10uH,L0603,1,ST39-B6\n"
+                      "C12,100nF,C0805,1,ST39-B7\n")
+
+_ncat0 = CON.execute("SELECT COUNT(*) AS n FROM category").fetchone()["n"]
+_s, _prev39 = call(server.bom_preview, upload=upload_of(bom_cat))
+check("预览把 7 行都解析出来了(走的是界面真正用的那条路)",
+      _prev39["line_count"], 7)
+_s, _repA = call(server.bom_import, body={"project_name": "ISSUE25-带品类列"},
+                 upload=upload_of(bom_cat))
+_s, _repB = call(server.bom_import, body={"project_name": "ISSUE25-不带品类列"},
+                 upload=upload_of(bom_nocat))
+check("两份 BOM 各 7 行", (_repA["bom_lines"], _repB["bom_lines"]), (7, 7))
+check("导入报告里没有「有 N 颗没找到子类」这类提醒(用户说不用提醒他)",
+      [_repA["warnings"], _repB["warnings"]], [[], []])
+check("导入没有新建任何品类节点(不硬造 L0603 之类)",
+      CON.execute("SELECT COUNT(*) AS n FROM category").fetchone()["n"], _ncat0)
+
+# 逐行对落点。带品类列的这 7 行覆盖了用户点名的三种写法 + 认不出尺寸的兜底
+for _mpn, _want, _label in (
+        ("ST39-A1", _r0603, "电阻 + R0603"),
+        ("ST39-A2", _r0603, "电阻 + 0603(缺前缀)"),
+        ("ST39-A3", _r0603, "电阻 + C0603(用户点名:写错字母也要进 R0603)"),
+        ("ST39-A4", _r0805, "电阻 + R0805"),
+        ("ST39-A5", _c0603, "电容 + C0603(电容支的子类在两层下面)"),
+        ("ST39-A6", _cat_l, "电感 + L0603(电感支没有子类 -> 老实留在根级)"),
+        ("ST39-A7", _cat_r, "电阻 + SOT-23(认不出尺寸 -> 留在电阻根级)"),
+        ("ST39-B1", _r0603, "无品类列:位号 R + R0603"),
+        ("ST39-B2", _r0603, "无品类列:位号 R + 0603"),
+        ("ST39-B3", _r0603, "无品类列:位号 R + C0603"),
+        ("ST39-B4", _r0805, "无品类列:位号 R + R0805"),
+        ("ST39-B5", _c0603, "无品类列:位号 C + C0603"),
+        ("ST39-B6", _cat_l, "无品类列:位号 L + L0603(没有子类,留根级)"),
+        ("ST39-B7", _c0805, "无品类列:位号 C + C0805")):
+    check(f"{_label} -> {db.category_path(CON, _want)}", _mpn_node(_mpn), _want)
+
+check("落到子类之后,品类文本仍然是大类名(按品类分组的地方一行都不用改)",
+      [_mpn_text(m) for m in ("ST39-A1", "ST39-A3", "ST39-A5", "ST39-A6")],
+      ["电阻", "电阻", "电容", "电感"])
+
+# 用户点名的那一条:封装写的是 C0603,但这一行是电阻 —— 必须判成电阻,进电阻支
+check("「电阻 + C0603 + 品类列写电阻」判成电阻(不被那个 C 带到电容支)",
+      bom.classify(["R3"], "C0603", "30k", "电阻")[0], "电阻")
+check("同一行写成别的位号也一样(判据是这一行的类型,不是字母)",
+      bom.classify(["R9"], "C0603", "30k", "电阻")[0], "电阻")
+check("不带品类列时靠位号也判成电阻",
+      bom.classify(["R3"], "C0603", "30k", "")[0], "电阻")
+# 上一版为「文件写电容、封装 R0603」立的规矩不能被这次改动推翻
+check("旧的仍然成立:文件写「电容」但封装 R0603、位号 R8 → 按封装算成电阻",
+      bom.classify(["R8"], "R0603", "0Ω", "电容")[0], "电阻")
+check("而且理由里还是写着以封装为准",
+      "以封装为准" in bom.classify(["R8"], "R0603", "0Ω", "电容")[2], True)
+
+# ---- order-independence:同一批行倒过来放,落点必须一模一样。
+# 以前那个 bug 的症状就是「把某一行挪到最前面,结果就变了」(判反之后先建了另一边
+# 的节点,后面跟着错)。
+bom_rev = write_csv("issue25_rev.csv",
+                    "Designator,Comment,Footprint,Quantity,MPN,Category\n"
+                    "R5,50k,SOT-23,1,ST39-C7,电阻\n"
+                    "L1,10uH,L0603,1,ST39-C6,电感\n"
+                    "C1,100nF,C0603,1,ST39-C5,电容\n"
+                    "R4,40k,R0805,1,ST39-C4,电阻\n"
+                    "R3,30k,C0603,1,ST39-C3,电阻\n"
+                    "R2,20k,0603,1,ST39-C2,电阻\n"
+                    "R1,10k,R0603,1,ST39-C1,电阻\n")
+_s, _repC = call(server.bom_import, body={"project_name": "ISSUE25-倒着放"},
+                 upload=upload_of(bom_rev))
+check("同一份 BOM 倒着放,7 行落点与正着放完全一致(结果与行序无关)",
+      [_mpn_node("ST39-C%d" % i) for i in (1, 2, 3, 4, 5, 6, 7)],
+      [_mpn_node("ST39-A%d" % i) for i in (1, 2, 3, 4, 5, 6, 7)])
+
+# ---- package_key 在**插入时**就写好,不留 NULL 等下次启动
+check("导入时就算好了 package_key(那段时间按尺寸筛料才不会漏)",
+      [r["k"] for r in CON.execute(
+          "SELECT package_key AS k FROM component WHERE mpn LIKE 'ST39-%' ORDER BY id")],
+      [footprint.canon(r["p"]) for r in CON.execute(
+          "SELECT package AS p FROM component WHERE mpn LIKE 'ST39-%' ORDER BY id")])
+
+# ---- 兜底:启动时 reconcile_categories() 把堆在**根级**的料自己归位
+check("A(10kΩ R0603)现在堆在「电阻」根级 —— 这是本次要修的起点",
+      CON.execute("SELECT category_id AS c FROM component WHERE id=?",
+                  (A,)).fetchone()["c"], _cat_r)
+_n_recon = db.reconcile_categories(CON)
+check("启动对账确实挪了东西(都堆在根级的那批)", _n_recon > 0, True)
+check("堆在根级的电阻 A 按封装归到了 电阻 / R0603",
+      CON.execute("SELECT category_id AS c FROM component WHERE id=?",
+                  (A,)).fetchone()["c"], _r0603)
+check("堆在根级的电容 B 按封装归到了 电容 / 贴片陶瓷电容 / C0805",
+      CON.execute("SELECT category_id AS c FROM component WHERE id=?",
+                  (B,)).fetchone()["c"], _c0805)
+check("「其他」这一支没有子类,螺丝就留在根级(认不出相似的就不乱挂)",
+      CON.execute("SELECT category_id AS c FROM component WHERE id=?",
+                  (D,)).fetchone()["c"], cat_node("其他")["id"])
+check("发光二极管这一支也没有子类,LED 同样留在根级",
+      CON.execute("SELECT category_id AS c FROM component WHERE id=?",
+                  (E,)).fetchone()["c"], cat_node("发光二极管")["id"])
+
+# ---- 已经挂在**子类**上的料:reconcile 一根都不许动(那是用户自己放的)
+_sub_keep = {m: _mpn_node(m) for m in ("ST39-A5", "ST39-A6", "ST39-B7", "ST39-C3")}
+db.reconcile_categories(CON)
+check("已挂子类的料再跑一次对账也不会被挪走",
+      {m: _mpn_node(m) for m in _sub_keep}, _sub_keep)
+check("再跑一次是幂等的(一颗都不再动)", db.reconcile_categories(CON), 0)
+
+# ---- 人工指定过的品类不许被自动归位覆盖。
+# 复核对话框里人把这一行改成「电容」,它就该待在电容根级 —— 哪怕封装是 R0603
+# (电阻支有同尺寸的 R0603 节点),规则也不许"顺手"把它塞进去。
+bom_h = write_csv("issue25_human.csv",
+                  "Designator,Comment,Footprint,Quantity,MPN,Category\n"
+                  "R21,60k,R0603,1,ST39-H1,电阻\n")
+_s, _prevH = call(server.bom_preview, upload=upload_of(bom_h))
+_rowH = _prevH["lines"][0]["source_row"]
+check("人没改的时候这一行本来是电阻", _prevH["lines"][0]["category"], "电阻")
+_s, _repH = call(server.bom_import,
+                 body={"project_name": "ISSUE25-人工指定",
+                       "categories": {str(_rowH): "电容"}},
+                 upload=upload_of(bom_h))
+check("人工指定的品类落库了", _mpn_text("ST39-H1"), "电容")
+check("人工指定的行留在电容根级,没被自动塞进 C0603/R0603",
+      _mpn_node("ST39-H1"), _cat_c)
+
+# ---- 最后再扫一遍全库:文本和树上顶层名字必须仍然处处一致
+_mism39 = 0
+for _r in CON.execute("SELECT id, category, category_id FROM component "
+                      "WHERE category_id IS NOT NULL"):
+    _root = db.category_root(CON, _r["category_id"])
+    if _root is not None and (_root["name"] or "") != (_r["category"] or ""):
+        _mism39 += 1
+check("全库扫描(第 39 节之后):文本和树上顶层名字仍然处处一致", _mism39, 0)
+
 CON.close()
 p("\n" + "=" * 62)
 p(f"结果:{'全部通过' if not FAILS else '失败 ' + str(len(FAILS)) + ' 项'}")

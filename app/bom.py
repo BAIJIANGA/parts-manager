@@ -168,43 +168,73 @@ def classify(designators: Iterable[str] | None = None, footprint: Any = "",
     优先级(数字越小越权威)刻意保持和旧版一致:封装里的强特征(比如
     RES-ADJ→电位器、TYPE-C→连接器)要压过位号,因为「用 U3 标接线端子」
     这类不规范的画法真实存在,而封装的写法通常更接近事实。
+
+    **但单个字母的封装前缀(C0603 里的那个 C)不算强特征** —— 见下面
+    「独立证人」那段注释。
     """
     votes: list[tuple[int, str, str]] = []      # (优先级, 品类, 理由)
 
     text_hint = str(hint or "").strip()
     fp = str(footprint or "").upper()
-    # 文件里那一列「分类」和封装打架时,以封装为准 —— 封装和位号是从原理图来的
-    # 物理事实,而导出 BOM 里这一列常常是手填/工具生成的,抄错很常见。
-    # 实测:两颗 R0603 的 0Ω / 20kΩ 被文件写成「电容」,于是电阻住进了电容的子树。
-    # 只在**明显不是一类**时才推翻:字符串互相包含就算一致(「贴片陶瓷电容」⊃「电容」),
-    # 「其他 / 未分类」这种兜底品类不动,封装认不出类别时也不动。
-    fp_kind = fprint.category(fp)
-    if (text_hint and fp_kind and fprint.kind(fp)
-            and text_hint not in ("其他", "未分类")
-            and fp_kind not in text_hint and text_hint not in fp_kind):
-        votes.append((0, fp_kind,
-                      f"BOM 里写着「{text_hint}」,但封装 {footprint} 是{fp_kind}"
-                      f" —— 以封装为准"))
-    elif text_hint:
-        votes.append((0, text_hint, f"BOM 里本来就写着品类「{text_hint}」"))
 
+    # 先把「除了 BOM 品类列以外」的线索收齐。位号前缀和值的单位虽然是弱证据,
+    # 但它们是**独立证人**:决定封装前缀有没有资格否决 BOM 写的品类时要看它们站哪边。
+    fp_feature = ""
     for keys, cat in CATEGORY_BY_FOOTPRINT:
         if any(k in fp for k in keys):
-            votes.append((1, cat, f"封装 {footprint} 里的关键词是{cat}的特征"))
+            fp_feature = cat
             break
-
+    des_prefix, des_cat = "", ""
     for d in designators or []:
         m = DESIGNATOR_RE.match(str(d).strip())
         if not m:
             continue
-        prefix = m.group(1).upper()
+        des_prefix = m.group(1).upper()
         for pfx, cat in CATEGORY_BY_PREFIX:
-            if prefix.startswith(pfx):
-                votes.append((2, cat, f"位号 {prefix} 开头,按惯例是{cat}"))
+            if des_prefix.startswith(pfx):
+                des_cat = cat
                 break
         break
-
     vcat, vwhy = value_category(value)
+    others = {c for c in (fp_feature, des_cat, vcat) if c}
+
+    fp_kind = fprint.category(fp)          # 封装前缀猜出的品类(认不出就是空串)
+    fp_code = fprint.kind(fp)              # 那一段前缀本身:R / C / L / RES / CAP …
+
+    # 文件里那一列「分类」和封装打架时,谁说话算数 —— issue #25 把这件事拆成两档:
+    #
+    #   * **多字符**的特征(RES-ADJ / LED_ / SOD- / DO-214 / KF301 / TYPE-C …,
+    #     以及 RES / CAP / IND / LED / FUSE 这种多字母类别代号)照旧有否决权。
+    #     它们是明确的器件类别名,而导出 BOM 里那一列常常是手填/工具生成的、抄错很常见。
+    #   * **单个字母** R / C / L / D 没有这个权威性。用户原话:
+    #     「就算写的是 C0603 你也要往 R0603 放」—— 电阻那行写着 C0603,只是当初画
+    #     封装的人抄错了字母,不该反过来把这一行判成电容(判反之后,它还会被挂到
+    #     电容支下面去,而且结果依赖行的先后顺序,这种 bug 极难查)。
+    #     所以单字母只有在**其它线索也同意它**(有独立证人)时才有资格否决;
+    #     论不过的时候它降级成和位号前缀同级的弱证据(票在 p2):照样投一票,
+    #     但压不过 p0 的品类列,并且会因为「线索打架」被标红交给人确认。
+    #     例外:品类列**自己**就有别的线索作证(位号/值都同意它)时不再投这一票 ——
+    #     那种情况不是"打架",是二比一,三比一,没必要把人叫来看一遍。
+    if (text_hint and fp_kind and fp_code
+            and text_hint not in ("其他", "未分类")
+            and fp_kind not in text_hint and text_hint not in fp_kind):
+        if len(fp_code) > 1 or (fp_kind in others and text_hint not in others):
+            votes.append((0, fp_kind,
+                          f"BOM 里写着「{text_hint}」,但封装 {footprint} 是{fp_kind}"
+                          f" —— 以封装为准"))
+        else:
+            votes.append((0, text_hint, f"BOM 里本来就写着品类「{text_hint}」"))
+            if text_hint not in others:
+                votes.append((2, fp_kind, f"封装 {footprint} 是{fp_kind}的写法"))
+    elif text_hint:
+        votes.append((0, text_hint, f"BOM 里本来就写着品类「{text_hint}」"))
+
+    if fp_feature:
+        votes.append((1, fp_feature, f"封装 {footprint} 里的关键词是{fp_feature}的特征"))
+
+    if des_cat:
+        votes.append((2, des_cat, f"位号 {des_prefix} 开头,按惯例是{des_cat}"))
+
     if vcat:
         votes.append((3, vcat, vwhy))
 
@@ -561,6 +591,14 @@ def upsert_component(con, item: dict) -> tuple[int, bool]:
             if not existing[field] and item.get(field):
                 updates.append(f"{field}=?")
                 args.append(item[field])
+                if field == "package":
+                    # 封装刚补上,索引键必须跟着一起写。只补 package 的话,
+                    # package_key 会一直空到下次启动的 backfill_package_key ——
+                    # 这段时间里按尺寸筛料、按尺寸分组都会漏掉这一条。
+                    # 口径必须是 footprint.canon(和 db.backfill_package_key 同一个),
+                    # 不是 norm_package:后者只去分隔符,认不出尺寸。
+                    updates.append("package_key=?")
+                    args.append(fprint.canon(item[field]))
         # 品类单独处理:空着的补上;人工复核改过的直接覆盖
         want_cat = item.get("category")
         if want_cat and (human or not existing["category"]) \
@@ -588,11 +626,14 @@ def upsert_component(con, item: dict) -> tuple[int, bool]:
     # 这里以前漏了(当前调用方都先在解析阶段归一过,所以属于隐患而不是现网故障)。
     cur = con.execute(
         """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, value, package,
-                                identity_key)
-           VALUES(?,?,?,?,?,?,?,?)""",
+                                package_key, identity_key)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
         (item.get("lcsc_pn") or None, item.get("mpn") or None,
          item.get("manufacturer") or None,
          item["name"], item["category"], item.get("value"), item.get("package"),
+         # 索引键在**插入时**就算好,不留 NULL 等下次启动回填:导入完立刻按封装
+         # 分组/筛选,和重启之后必须是同一个结果。口径见 db.backfill_package_key。
+         fprint.canon(item.get("package")),
          identity_key(item.get("value"), item.get("package"),
                       item.get("mpn"), item.get("lcsc_pn"), item.get("name"))),
     )
@@ -640,10 +681,15 @@ def import_items(con, items: list[dict], project_name: str, *, project_code: str
     created = reused = 0
     total_qty = 0
     bom_rows = []
+    landed_ids: list[int] = []       # 这一批落库的元件(去重后按封装归位用)
+    human_ids: list[int] = []        # 其中**人工指定过品类**的:不许被自动归位覆盖
     for item in items:
         cid, is_new = upsert_component(con, item)
         created += 1 if is_new else 0
         reused += 0 if is_new else 1
+        landed_ids.append(cid)
+        if item.get("category_confidence") == CONF_HUMAN:
+            human_ids.append(cid)
         total_qty += item["qty"]
         designators = ",".join(item["designators"])
         con.execute(
@@ -663,7 +709,22 @@ def import_items(con, items: list[dict], project_name: str, *, project_code: str
             "designators": designators,
         })
 
+    # 按封装把这一批元件落进根品类下面的子类(issue #25 的核心诉求)。
+    #
+    # BOM 给出来的只有**根品类名**(电阻 / 电容 / 电感),所以以前全库的料都堆在根级。
+    # 这里拿每颗料的封装,在所属根品类的**整棵子树**里按尺寸找已有的子类:
+    # 电阻 + R0603 / 0603 / 甚至写错的 C0603 都进「电阻 / R0603」;电容进
+    # 「电容 / 贴片陶瓷电容 / C0603」(子类在第二层,所以查找必须递归);
+    # 电感这一类**没有**子类节点时就老实留在根级 —— 规则刻意不新建节点。
+    #
+    # 桌面版(gui.BomFrame._import_confirmed -> server.bom_import)和 HTTP 入口
+    # (/api/bom/import)最后都走到这里,所以在这一处生效,两条路一起归位。
+    # human_ids 是复核对话框里人工改过品类的那些行:只挂到根节点,绝不自动
+    # 往子类里塞 —— 人说了算,这是用户明确的边界。
+    db.place_in_subcategories(con, landed_ids, no_subclass=human_ids)
+
     con.commit()
+
     return {
         "project_id": project_id,
         "project_name": project_name,

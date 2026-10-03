@@ -495,18 +495,187 @@ def category_root(con: sqlite3.Connection, cat_id):
     return last
 
 
-def reconcile_categories(con: sqlite3.Connection) -> int:
-    """把品类表和 component 对齐。每次启动都跑,幂等。返回挂上的元件数。
+def _category_subtree_ids(con: sqlite3.Connection, cat_id) -> list:
+    """这个节点和它的**所有子孙**的 id(递归,不限层数)。
 
-    做三件事:
+    必须要递归:用户库里的电容是三层 —— 电容 → 贴片陶瓷电容 → C0603。
+    只看一层的话 `电容 + C0603` 永远找不到 C0603 那个节点。
+    """
+    rows = con.execute(
+        """WITH RECURSIVE sub(id) AS (
+               SELECT id FROM category WHERE id=?
+               UNION ALL
+               SELECT c.id FROM category c JOIN sub ON c.parent_id = sub.id)
+           SELECT id FROM sub""", (cat_id,)).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _category_depth(con: sqlite3.Connection, cat_id) -> int:
+    """这个节点离根有几层(根自己算 0)。用来给同尺寸的候选定序。"""
+    cur, guard = cat_id, 0
+    while cur and guard < 32:
+        row = con.execute("SELECT parent_id FROM category WHERE id=?", (cur,)).fetchone()
+        if row is None:
+            break
+        cur, guard = row["parent_id"], guard + 1
+    return guard
+
+
+def match_subcategory(con: sqlite3.Connection, root_id, package):
+    """在 root_id 这棵**子树**里,按封装尺寸挑最该去的那个已有子类节点;没有就 None。
+
+    这就是 issue #25 那位用户要的判断,原话:
+
+        「我导入 bom 表你需要把 bom 里面的电阻电感电容按照品类名字分好,**不要只搞
+         一个电阻**,电阻下面是有子类的。比如封装是 R0603 你就分到 R0603 这里面;
+         如果 bom 里面是 0603,你识别到了他是一个电阻,你就往电阻里面找最相似的放;
+         比如 bom 表上是电阻、封装写的 0603 而不是 R0603,你也要往 R0603 放。
+         **就算写的是 C0603 你也要往 R0603 放。**」
+
+    拆成可测的六步:
+      1. 尺寸认不出来(footprint.size 返回空,比如 SOT-23 / DIP-8)-> None,
+         不硬猜。用户在 BOM 里写「0603」时,那一位数字就是尺寸,认得出;
+      2. 子树里凡是**名字能认出尺寸、且尺寸和它一样**的节点都是候选
+         (递归整棵子树,所以电容那种三层结构也找得到);
+      3. 候选里**优先**挑「前缀和这一支的主流前缀一致」的。主流前缀 = 这一支里
+         所有「有前缀又有尺寸」的节点里出现最多的那个代号(电阻支下是 R)。
+         —— 所以「电阻 + C0603」会落进 R0603:比的是**尺寸数字 0603**,
+         前缀只用来在**同尺寸的候选之间**挑,而不是拿那个 C 去否定它;
+      4. 没有前缀的候选(节点就叫 0603)排主流前缀后面、其它前缀前面 ——
+         它没表态,比一个明确写着别的前缀的节点更该收下这颗料;
+      5. 一个候选都没前缀 -> 退而取任意一个同尺寸候选(用户说的「找最相似的」);
+      6. 连一个同尺寸候选都没有 -> None。**关键:不新建节点,也不报警。** 硬造一堆
+         空子类只会把品类树搞乱;用户说得很明白:「没有就留在根级,也不用提醒我,
+         这是我自己还没分好类」。所以这里安静地返回 None,由调用方留在根级。
+
+    同一档里还有多个候选时,再按「离根近 -> sort -> id」定序 —— 规则本身不关心
+    谁赢,但结果必须**稳定可复现**:同一个库、同一颗料,今天明天挑到同一个节点。
+    只读、不写库;调用方负责把结果写回 component.category_id。
+    """
+    import footprint
+
+    size = footprint.size(package)
+    if not size:
+        return None
+
+    cands: list[tuple[int, str, int, int]] = []   # (节点 id, 前缀代号, 离根几层, sort)
+    kinds: dict[str, int] = {}
+    for cid in _category_subtree_ids(con, root_id):
+        if cid == root_id:
+            continue                      # 根自己不是「子类」,不算候选
+        row = con.execute("SELECT id, name, sort FROM category WHERE id=?",
+                          (cid,)).fetchone()
+        if row is None:
+            continue
+        nsize = footprint.size(row["name"])
+        if not nsize:
+            continue                      # 「贴片陶瓷电容」这种中间层不参与尺寸比对
+        nkind = footprint.kind(row["name"])
+        if nkind:
+            kinds[nkind] = kinds.get(nkind, 0) + 1
+        if nsize == size:
+            cands.append((cid, nkind, _category_depth(con, cid), int(row["sort"] or 0)))
+    if not cands:
+        return None
+
+    main = ""
+    if kinds:
+        # 出现最多的那个代号。并列时按代号排序取第一个。
+        main = sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+    def rank(c):
+        _cid, nkind, _d, _s = c
+        if main and nkind == main:
+            return 0                      # 主流前缀
+        if not nkind:
+            return 1                      # 没前缀,算合理候选
+        return 2                          # 别的前缀:同尺寸也行,但排最后
+
+    cands.sort(key=lambda c: (rank(c), c[2], c[3], c[0]))
+    return cands[0][0]
+
+
+def place_in_subcategories(con: sqlite3.Connection, component_ids=None,
+                           *, no_subclass=()) -> int:
+    """按封装把元件落到根品类下面的子类里。返回挪了几条。
+
+    干两件事:
+      * `category_id` 还空着的 -> 先挂到 `category` 那个文本对应的顶层行;
+      * 挂在**根节点**上的 -> 再用 match_subcategory 在子树里找同尺寸的子类,
+        找得到就挪过去,找不到就留在根级。
+
+    两条**不许碰**的边界(以后别顺手"优化"掉,这是用户的原话要求):
+
+      * **已经挂在子类上的元件一个都不动**。判断标准是「这个节点自己是不是根」
+        (parent_id IS NULL),**不是深度** —— 用户自己在界面里把料放进 R0603,
+        那是他的整理成果;规则只负责把"没人管、堆在根上"的料归位。
+        唯一的例外是文本和那一支的顶层名**对不上**(人工改过品类),
+        这时以文本为准重挂,和 reconcile_categories 第 3 条同源。
+      * **人工指定过品类的不许覆盖**。BOM 导入复核时人改过的行,
+        调用方把它们放进 no_subclass:只挂到根节点,绝不自动往子类里塞 ——
+        人说了算。把 no_subclass 传成"人改过的那些 id"就行。
+
+    认不出尺寸 / 子树里没有同尺寸节点时**保持原样**,不硬猜、不新建子类。
+    """
+    if component_ids is None:
+        rows = con.execute(
+            "SELECT id, category, category_id, package FROM component").fetchall()
+    else:
+        ids = [int(i) for i in component_ids]
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        rows = con.execute(
+            f"SELECT id, category, category_id, package FROM component "
+            f"WHERE id IN ({marks})", ids).fetchall()
+
+    freeze = {int(i) for i in no_subclass}
+    moved = 0
+    for r in rows:
+        want = str(r["category"] or "").strip()
+        if not want:
+            continue                      # 连大类名都没有,无从挂起
+        cid = r["category_id"]
+        if cid is not None:
+            node = con.execute("SELECT id, parent_id FROM category WHERE id=?",
+                               (cid,)).fetchone()
+            if node is not None and node["parent_id"] is not None:
+                root = category_root(con, cid)
+                if root is not None and (root["name"] or "") == want:
+                    continue              # 已经挂在子类上,而且就是这一支 -> 不动
+        root_id = ensure_category(con, want)
+        if root_id is None:
+            continue
+        target = root_id
+        if r["id"] not in freeze:
+            got = match_subcategory(con, root_id, r["package"])
+            if got is not None:
+                target = got
+        if target != r["category_id"]:
+            con.execute("UPDATE component SET category_id=? WHERE id=?", (target, r["id"]))
+            moved += 1
+    if moved:
+        con.commit()
+    return moved
+
+
+def reconcile_categories(con: sqlite3.Connection) -> int:
+    """把品类表和 component 对齐。每次启动都跑,幂等。返回挂上/挪动的元件数。
+
+    做四件事:
       1. 内置品类 + 库里已经在用的品类文本 -> 品类表的顶层行
          (老库升上来时,这一步就是「把 DISTINCT category 变成真正的行」)
       2. 没挂 category_id 的元件 -> 挂到同名的顶层行
       3. category_id 挂着但和文本对不上的 -> 以文本为准改挂
+      4. 挂在**根节点**上的元件 -> 按封装尺寸落进子树里已有的子类
 
-    第 3 条是给「用户直接改了文本」「从别处导入的数据」兜底的。判断只做一层
-    (category 是顶层名),因为再往下分不出用户当初想挂在哪个子类上 ——
-    猜错还不如老实挂在顶层,让他自己在界面里挪。
+    第 3 条是给「用户直接改了文本」「从别处导入的数据」兜底的。原来判断只做一层
+    (category 是顶层名),再往下分不出用户当初想挂在哪个子类上,于是全库的电阻
+    电容电感都堆在根级 —— 这就是 issue #25。第 4 条就是补上这一层:拿着元件的
+    package 在**根品类的整棵子树**里按尺寸找(见 match_subcategory),找得到才挪。
+
+    第 4 条同样是给**用户现有的库**兜底的:那些堆在「电阻」上的料,下次启动
+    会自己归好位。已经挂在子类上的料一根都不动 —— 那是用户自己放的。
     """
     for i, name in enumerate(category_seed()):
         if not str(name).strip():
@@ -557,6 +726,12 @@ def reconcile_categories(con: sqlite3.Connection) -> int:
         if cid != r["category_id"]:
             con.execute("UPDATE component SET category_id=? WHERE id=?", (cid, r["id"]))
             fixed += 1
+    if fixed:
+        con.commit()
+    # 第 4 条:这时候「该挂哪个顶层」已经全都定下来了,再按封装尺寸往子树里放一层。
+    # 只处理还挂在**根节点**上的元件 —— 挂在子类上的是用户自己放的,一根都不动。
+    # 上面第 2/3 条会把 category_id 为空 / 挂错的先落到根上,正好接着被这一趟收走。
+    fixed += place_in_subcategories(con)
     if fixed:
         con.commit()
     return fixed
