@@ -1675,6 +1675,32 @@ check("确实多了一个仓位",
       CON.execute("SELECT COUNT(*) AS n FROM location").fetchone()["n"],
       _n_before37b + 1)
 
+p("\n【38】手动批量出库(不依赖 BOM)")
+
+# 菜单里的「📤 批量出库」走的就是这条路:同一批料一次领走,逐条写流水并盖「手动」章。
+_cid38 = call(server.list_components, query={"limit": "1"})[1]["items"][0]["id"]
+call(server.stock_move, body={"kind": "IN", "component_id": _cid38, "qty": 5,
+                              "location": "未分类", "note": "手动 自检备料"})
+_n38 = CON.execute("SELECT COUNT(*) AS n FROM movement").fetchone()["n"]
+_q38 = CON.execute("SELECT COALESCE(SUM(qty),0) AS q FROM stock WHERE component_id=?",
+                   (_cid38,)).fetchone()["q"]
+_s38, _r38 = call(server.stock_batch,
+                  body={"kind": "OUT",
+                        "items": [{"component_id": _cid38, "qty": 2}],
+                        "location": "未分类", "note": "手动 批量出库"})
+check("批量出库成功", _s38, 200)
+check("流水多了一条",
+      CON.execute("SELECT COUNT(*) AS n FROM movement").fetchone()["n"], _n38 + 1)
+check("最新那条是出库",
+      CON.execute("SELECT kind AS k FROM movement ORDER BY id DESC LIMIT 1"
+                  ).fetchone()["k"], "OUT")
+check("库存相应减少",
+      CON.execute("SELECT COALESCE(SUM(qty),0) AS q FROM stock WHERE component_id=?",
+                  (_cid38,)).fetchone()["q"], _q38 - 2)
+check("这条流水盖了「手动」章",
+      CON.execute("SELECT note AS n FROM movement ORDER BY id DESC LIMIT 1"
+                  ).fetchone()["n"], "手动 批量出库")
+
 p("\n【36】批量挪品类:只改归属,不碰库存和流水")
 
 # 用户的原话:「我想要增加封装 R0805,把这个一排的元件放下面去」——

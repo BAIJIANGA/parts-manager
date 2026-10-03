@@ -64,7 +64,14 @@ def check_trees(root, where, strict=True):
             continue
         if not w.winfo_ismapped():
             continue
-        cols = list(w["columns"])
+        # 表格可以用 displaycolumns 只显示其中几列(元件列表的属性列就是这么
+        # 藏起来的)。藏起来的列不占宽度 —— 这里要量的是「用户真看得见的那些」,
+        # 否则会误报超宽,逼着人为了隐藏列去缩可见列。
+        try:
+            shown = [str(c) for c in w["displaycolumns"]]
+        except Exception:
+            shown = []
+        cols = list(w["columns"]) if (not shown or shown == ["#all"]) else shown
         show = str(w.cget("show"))
         # show="tree headings" 时还有一列 #0 在显示,它不列在 columns 里,得补上,
         # 否则算出来的宽度比真实值小,溢出会被漏判

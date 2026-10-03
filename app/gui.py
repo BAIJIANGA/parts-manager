@@ -121,6 +121,21 @@ def clear_tree(tree):
         tree.delete(*children)
 
 
+# 手动做出的入库/出库,在备注前面盖这个章。流水表没有 source 列,手动单笔的
+# project_id / bom_id / purchase_id 全是空的,事后只能靠「三个 id 都为空」反推,
+# 说不清这条到底是手动做的、还是别的什么没关联的动作。
+MANUAL_TAG = "手动"
+
+
+def manual_note(body):
+    """给手动入口产生的流水盖上来源章(已经盖过就不重复盖)。"""
+    note = str(body.get("note") or "").strip()
+    if note.startswith(MANUAL_TAG):
+        return body
+    body["note"] = f"{MANUAL_TAG} {note}".strip() if note else MANUAL_TAG
+    return body
+
+
 def make_tree(parent, columns, height=14, show="headings"):
     """columns: [(key, 标题, 宽度, 对齐), ...]  返回 (frame, tree)
 
@@ -270,6 +285,9 @@ class App(tk.Tk):
         m_tool = tk.Menu(menubar, tearoff=0)
         m_tool.add_command(label="⚡ 快速入库…", accelerator="Ctrl+I", command=self.quick_in)
         m_tool.add_command(label="📋 批量入库…", accelerator="Ctrl+B", command=self.batch_in)
+        # 出库和入库共用同一个粘贴框:一堆料一次领走,不用一颗一颗点右键
+        m_tool.add_command(label="📤 批量出库…", accelerator="Ctrl+Shift+B",
+                           command=lambda: self.batch_in(out=True))
         m_tool.add_separator()
         m_tool.add_command(label="↶ 撤销上一次出入库", accelerator="Ctrl+Z",
                            command=self.undo_last)
@@ -289,6 +307,7 @@ class App(tk.Tk):
         # 收货时手上可能还拿着袋子,让快捷键能一键到位
         self.bind_all("<Control-i>", lambda _e: self.quick_in())
         self.bind_all("<Control-b>", lambda _e: self.batch_in())
+        self.bind_all("<Control-B>", lambda _e: self.batch_in(out=True))
         self.bind_all("<Control-z>", lambda _e: self.undo_last())
         self.bind_all("<F5>", lambda _e: self.refresh_all())
 
@@ -298,8 +317,9 @@ class App(tk.Tk):
         if dlg.done:
             self.refresh_all()
 
-    def batch_in(self):
-        dlg = BatchInDialog(self, self)
+    def batch_in(self, out=False):
+        """批量入库/出库。out=True 打开的是出库那一版(同一套粘贴框)。"""
+        dlg = BatchInDialog(self, self, kind="OUT" if out else "IN")
         self.wait_window(dlg)
         if dlg.done:
             self.refresh_all()
@@ -687,7 +707,11 @@ class ComponentsTab(ttk.Frame):
         self._build_home()
         self._build_cat()
         self._build_pick()
+        self._load_cols()          # 上次勾的列设置,得在建第一屏之前读到
         self.go_home()
+        # 属性列:None = 自动挑(这一页真有值的属性),列表 = 用户自己勾的
+        self._want_attrs = None
+        self._attr_cols = []
 
     # ---- 给自检用的快捷入口
     @property
@@ -757,6 +781,8 @@ class ComponentsTab(ttk.Frame):
         # 人已经站在这一级上了,加子类不该逼他退回首页再找位置
         ttk.Button(head, text="＋ 新建子类", command=self.add_sub_here).pack(
             side="right", padx=6)
+        ttk.Button(head, text="列…", command=self.pick_columns).pack(
+            side="right")
 
         # 封装这一级(菜单的第三级)。做成一行可点的芯片,而不是又一页:
         # 同一个大类里封装通常只有两三种,为它单开一页会把「看一眼料」变成三次点击。
@@ -807,6 +833,13 @@ class ComponentsTab(ttk.Frame):
             ("marking", "丝印", 78, "center"),
             ("package", "封装", 88, "w", True),
             ("value", "值", 68, "w"),
+            # 属性槽:标题在 _apply_attr_cols() 里按这一页实际有的属性动态填。
+            # 定义 4 个空槽、靠 displaycolumns 决定露几个 —— 换列不用重建整张表,
+            # 属性名是用户自己起的(耐压、精度、Vgs…),列根本没法写死。
+            ("a1", "", 74, "center"),
+            ("a2", "", 74, "center"),
+            ("a3", "", 74, "center"),
+            ("a4", "", 74, "center"),
             ("on_hand", "现有", 55, "e"),
             ("min_stock", "安全", 50, "e"),
             # 需求/缺口/在途/该买 是**项目 BOM 的缺料口径**,不是库存本身的事,
@@ -1398,6 +1431,8 @@ class ComponentsTab(ttk.Frame):
         self._fill(hits)
 
     def _fill(self, rows):
+        # 属性列要按这一页**真有值**的属性来定,所以必须在插行之前算出来
+        self._apply_attr_cols(rows)
         clear_tree(self.tree)
         self._rows = {}
         for it in rows:
@@ -1498,7 +1533,11 @@ class ComponentsTab(ttk.Frame):
         self.tree.insert("", "end", iid=str(it["id"]), values=(
             it.get("name") or "", it.get("lcsc_pn") or "", it.get("mpn") or "",
             it.get("marking") or "", it.get("package") or "",
-            it.get("value") or "", it.get("on_hand") or 0, it.get("min_stock") or 0,
+            it.get("value") or "",
+            # 空格子补 "",保证位置和列定义一直对齐(这里是位置参数)
+            *[attrs.clean(it.get("params")).get(n, "")
+              for n in (list(self._attr_cols) + [""] * 4)[:4]],
+            it.get("on_hand") or 0, it.get("min_stock") or 0,
             STATE_LABEL.get(it.get("stock_state"), ""), it.get("note") or ""),
             tags=(it.get("stock_state") or "",))
 
@@ -1512,6 +1551,121 @@ class ComponentsTab(ttk.Frame):
     def selected_id(self):
         sel = self.tree.selection()
         return int(sel[0]) if sel else None
+
+    def _attr_order(self):
+        """属性列的先后:常用参数在前,其余按用户表里出现的顺序。
+
+        顺序直接取自 attrs 的建议表(和出入库那一列的排列用的是同一套口径),
+        不另外维护一份 —— 加品类建议时这里自动跟上。
+        """
+        out = []
+        for name in list(attrs.GENERIC) + [n for lst in attrs.SUGGESTIONS.values()
+                                          for n in lst]:
+            if name not in out:
+                out.append(name)
+        return out
+
+    def _auto_attr_cols(self, rows):
+        """自动挑:这一页里**真有值**的属性,常用参数优先,默认最多 2 个。
+
+        用户要的是「电容的耐压、精度直接就显示出来,不用点开」。列太宽会挤掉
+        库存那些数字,所以默认只露两个;想多看几个去「列…」里勾。
+        """
+        seen = {}
+        for it in rows:
+            for name, val in attrs.clean(it.get("params")).items():
+                if val:
+                    seen[name] = seen.get(name, 0) + 1
+        if not seen:
+            return []
+        order = {n: i for i, n in enumerate(self._attr_order())}
+        ranked = sorted(seen, key=lambda n: (order.get(n, 999), -seen[n], n))
+        return ranked[:2]
+
+    def _apply_attr_cols(self, rows):
+        """把这一页要露的属性列摆好(标题 + 显示哪些列)。"""
+        names = self._want_attrs
+        if names is None:
+            names = self._auto_attr_cols(rows)
+        self._attr_cols = list(names)[:4]
+        try:
+            all_cols = [str(c) for c in self.tree["columns"]]
+        except tk.TclError:
+            return
+        base = [c for c in all_cols if c not in ("a1", "a2", "a3", "a4")]
+        shown = base + [f"a{i + 1}" for i in range(len(self._attr_cols))]
+        for i in range(4):
+            key = f"a{i + 1}"
+            self.tree.heading(key, text=self._attr_cols[i] if i < len(self._attr_cols) else "")
+        try:
+            self.tree.configure(displaycolumns=shown)
+        except tk.TclError:
+            pass
+
+    def _attr_pool(self):
+        """「列…」里能勾的属性名:常用建议 + 这一页出现过的。"""
+        names = []
+        for name in self._attr_order():
+            if name not in names:
+                names.append(name)
+        for it in self._rows.values():
+            for name, val in attrs.clean(it.get("params")).items():
+                if val and name not in names:
+                    names.append(name)
+        return names[:16]
+
+    def _col_cfg_path(self):
+        """列设置存哪。放在**数据库文件旁边** —— 那个目录一定可写(程序就在那儿跑),
+        整个文件夹搬走时设置也跟着走,不会丢在别处的用户目录里。"""
+        try:
+            row = self.con.execute("PRAGMA database_list").fetchone()
+            path = row[2] if row else ""
+        except sqlite3.Error:
+            path = ""
+        if not path:
+            return None
+        return os.path.join(os.path.dirname(path), "ui_columns.json")
+
+    def _save_cols(self):
+        path = self._col_cfg_path()
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(db.dump_params({"attrs": self._want_attrs}))
+        except OSError:
+            pass              # 存不下就只影响"下次记住",不该弹错误打断人
+
+    def _load_cols(self):
+        path = self._col_cfg_path()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = db.parse_params(f.read())
+        except OSError:
+            return
+        want = cfg.get("attrs")
+        self._want_attrs = list(want) if isinstance(want, list) else None
+
+    def pick_columns(self):
+        """自己勾要显示哪几个属性列(一个都不勾 = 恢复自动挑)。"""
+        pool = self._attr_pool()
+        if not pool:
+            messagebox.showinfo(
+                "还没有属性",
+                "库里还没有任何元件填过自定义属性。\n\n"
+                "在元件编辑窗口的「其他属性」里加上「耐压」「精度」这类名字,"
+                "它们就会出现在这个列表里。", parent=self)
+            return
+        dlg = ColumnPickDialog(self, self._want_attrs, pool)
+        self.wait_window(dlg)
+        if not dlg.done:
+            return
+        self._want_attrs = dlg.result
+        self._save_cols()
+        self.reload()
+        self.app.set_status("列设置已保存,下次打开还是这样", 5)
 
     def _restore_selection(self, cid):
         """刷新之后把选中还回去。
@@ -1594,7 +1748,8 @@ class ComponentsTab(ttk.Frame):
         if dlg.done:
             self.app.refresh_all()
 
-    def batch_in(self):
+    def batch_in(self, out=False):
+        """库存页的批量入库/出库都走这里。"""
         dlg = BatchInDialog(self, self.app)
         self.app.wait_window(dlg)
         if dlg.done:
@@ -1639,6 +1794,56 @@ def category_options(con):
     """品类下拉的选项。统一从后端 meta 拿,免得界面上再维护第二份清单。"""
     meta = call(con, server.meta, quiet=True) or {}
     return list(meta.get("categories") or []) or ["其他"]
+
+
+class ColumnPickDialog(tk.Toplevel):
+    """勾选元件列表要显示哪些属性列。
+
+    一个都不勾 = 交给程序自动挑(这一页真有值的常用参数)。属性名是用户自己起的,
+    所以这里列的不是固定几项,而是「常用建议 + 库里真出现过的」。
+    """
+
+    def __init__(self, parent, current, pool):
+        super().__init__(parent)
+        self.title("显示哪些参数列")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.done = False
+        self.result = None
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="勾上想直接看到的参数(不勾 = 自动挑常用的两个):",
+                  style="Dim.TLabel").pack(anchor="w", pady=(0, 8))
+
+        self.vars = {}
+        cur = set(current or [])
+        grid = ttk.Frame(body)
+        grid.pack(fill="both", expand=True)
+        for i, name in enumerate(pool):
+            var = tk.BooleanVar(value=name in cur)
+            self.vars[name] = var
+            ttk.Checkbutton(grid, text=name, variable=var).grid(
+                row=i // 3, column=i % 3, sticky="w", padx=(0, 16), pady=2)
+
+        bar = ttk.Frame(self, padding=(12, 0, 12, 12))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="自动", command=self._auto).pack(side="left")
+        ttk.Button(bar, text="确定", command=self._ok).pack(side="right")
+        ttk.Button(bar, text="取消", command=self.destroy).pack(side="right", padx=6)
+        self.bind("<Return>", lambda _e: self._ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def _auto(self):
+        self.result = None
+        self.done = True
+        self.destroy()
+
+    def _ok(self):
+        picked = [n for n, v in self.vars.items() if v.get()]
+        self.result = picked or None      # 一个都不勾 = 自动
+        self.done = True
+        self.destroy()
 
 
 class CategoryStepBox(ttk.Frame):
@@ -2473,6 +2678,7 @@ class MoveForm(ttk.Frame):
                 "operator": self.who.get().strip() or "本地用户",
                 "note": self.note.get().strip(),
                 "project_id": self.project_id}
+        manual_note(body)          # 手动开的单:流水里标明来源
         res = call(self.con, server.stock_move, body=body, parent=self)
         if res is None:
             return
@@ -5122,20 +5328,25 @@ class BatchInDialog(tk.Toplevel):
     记进去」——几十条料进错地方,事后极难发现,所以宁可多停一步。
     """
 
-    def __init__(self, parent, app: App):
+    def __init__(self, parent, app: App, kind="IN"):
+        # IN = 批量入库,OUT = 批量出库(同一套粘贴框,服务端两条路都支持)
+        # 必须放在最前面:下面的标题、大标题都要按它来定
+        self.kind = kind
         super().__init__(parent)
         self.app = app
         self.con = app.con
         self.done = False
         self.rows = []
 
-        self.title("批量入库 —— 粘贴一整张单子")
+        self.title("批量入库 —— 粘贴一整张单子" if self.kind == "IN"
+                   else "批量出库 —— 粘贴一整张单子")
         self.transient(parent)
         self.geometry("960x700")
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(body, text="批量入库", style="Big.TLabel").pack(anchor="w")
+        ttk.Label(body, text=("批量入库" if self.kind == "IN" else "批量出库"),
+                  style="Big.TLabel").pack(anchor="w")
         ttk.Label(body, text="一行一个料,数量写成 x50;也可以直接从表格里"
                              "复制粘贴(最后一列是数字就当数量)。",
                   style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
@@ -5327,7 +5538,8 @@ class BatchInDialog(tk.Toplevel):
                     continue
                 cid = made["id"]
                 created += 1
-            body = {"kind": "IN", "component_id": cid, "qty": r["qty"]}
+            body = {"kind": self.kind, "component_id": cid, "qty": r["qty"]}
+            manual_note(body)      # 手动批量:流水里标明来源
             if loc:
                 body["location"] = loc
             if call(self.con, server.stock_move, body=body, parent=self) is None:
@@ -5337,7 +5549,8 @@ class BatchInDialog(tk.Toplevel):
             total += r["qty"]
         self.done = True
         self.app.set_status(
-            f"批量入库完成:{stocked} 种 / {total} 个(其中新建 {created} 个元件)", 8)
+            f"批量{'入库' if self.kind == 'IN' else '出库'}完成:"
+            f"{stocked} 种 / {total} 个(其中新建 {created} 个元件)", 8)
         msg = (f"入库 {stocked} 种,共 {total} 个。\n"
                + (f"其中新建了 {created} 个元件(只填了名称,归到「未分类」)。\n"
                   if created else ""))
@@ -5345,7 +5558,8 @@ class BatchInDialog(tk.Toplevel):
             msg += f"\n跳过 {len(blocked)} 行(多匹配未指定)。\n"
         if failed:
             msg += "\n失败:" + "、".join(failed[:8])
-        messagebox.showinfo("批量入库", msg, parent=self)
+        messagebox.showinfo("批量入库" if self.kind == "IN" else "批量出库",
+                            msg, parent=self)
         self.app.refresh_all()
         if not failed:
             self.destroy()
@@ -6252,6 +6466,7 @@ class QuickInDialog(tk.Toplevel):
             body["location"] = loc
         if self.project_id:
             body["project_id"] = self.project_id
+        manual_note(body)          # 快速入库:流水里标明来源
         if call(self.con, server.stock_move, body=body, parent=self) is None:
             return
 
@@ -6645,6 +6860,7 @@ class MoveDialog(tk.Toplevel):
                 "note": self.note.get().strip()}
         if self.kind.get() == "TRANSFER":
             body["to_location"] = self.to_loc.get().strip()
+        manual_note(body)          # 库存页右键的入库/出库/盘点/移库都是手动的
         if call(self.con, server.stock_move, body=body, parent=self) is not None:
             self.done = True
             self.destroy()

@@ -471,12 +471,17 @@ def main() -> int:
         app.update()
         got = gui.call(app.con, server.list_movements,
                        query={"project_id": str(pid0), "kind": "IN"})["items"]
-        check("在项目里开的入库单会落在这个项目名下",
-              got[0]["note"], "项目里开的入库单")
+        # 手动开的单会在备注前面盖「手动」章(#21):流水表没有 source 列,不盖章就
+        # 分不清这条是手动做的、还是别的什么没关联的项目动作
+        check("在项目里开的入库单会落在这个项目名下(并盖了「手动」来源章)",
+              got[0]["note"], "手动 项目里开的入库单")
+        check("盖的是前缀,不是把用户写的备注吃掉",
+              got[0]["note"].endswith("项目里开的入库单"), True)
         check("记录表立刻多一条", len(pr.pane_in.t_rec.get_children()), n_rec + 1)
         check("这边开的单也进了出入库页的入库流水",
               any(gui.call(app.con, server.list_movements, query={"kind": "IN"})
-                  ["items"][k]["note"] == "项目里开的入库单" for k in range(3)), True)
+                  ["items"][k]["note"] == "手动 项目里开的入库单"
+                  for k in range(3)), True)
 
         # 没选项目时不许开单 —— 记在谁名下都不清楚
         f_in.set_project(None)
@@ -2686,6 +2691,47 @@ def main() -> int:
         check("回到首页后面包屑清空", _crumb(tab37), [])
 
         app.refresh_all()
+        p("\n【39】元件列表直接显示自定义属性(耐压、精度),列还能自己勾")
+        
+        # 用户要的是「电容的耐压精度直接就显示出来,不用点开」。属性名是他自己起的,
+        # 所以列不写死:按这一页**真有值**的属性自动挑,也能在「列…」里自己勾。
+        t39 = app.tab_comp
+        check("自动挑:常用参数优先、最多两个",
+              t39._auto_attr_cols([
+                  {"params": {"功率": "0.1W", "耐压": "50V", "精度": "±5%"}}]),
+              ["耐压", "精度"])
+        check("一个属性都没填时,一列都不占",
+              t39._auto_attr_cols([{"params": {}}, {"params": None}]), [])
+        
+        t39._want_attrs = ["耐压", "精度"]
+        t39._apply_attr_cols([])
+        _heads39 = [str(t39.tree.heading("a%d" % k, "text")) for k in (1, 2, 3, 4)]
+        check("勾上的属性变成了列表的列标题", _heads39[:2], ["耐压", "精度"])
+        _shown39 = [str(c) for c in t39.tree["displaycolumns"]]
+        check("显示的是那两个槽", _shown39[-2:], ["a1", "a2"])
+        check("没勾的空槽不显示", "a3" in _shown39, False)
+        
+        # 值要真的落到那一行上
+        t39._attr_cols = ["耐压", "精度"]
+        t39._insert_component({"id": 990739, "name": "自检用", "package": "C0805",
+                               "value": "100nF",
+                               "params": {"耐压": "50V", "精度": "±5%"}})
+        _vals39 = [str(v) for v in t39.tree.item("990739", "values")]
+        check("行里带着耐压的值", "50V" in _vals39, True)
+        check("行里带着精度的值", "±5%" in _vals39, True)
+        t39.tree.delete("990739")
+        
+        # 设置要能记住(存在数据库旁边的 ui_columns.json)
+        _cfg39 = t39._col_cfg_path()
+        t39._save_cols()
+        check("列设置写到了数据库旁边", bool(_cfg39) and os.path.exists(_cfg39), True)
+        t39._want_attrs = None
+        t39._load_cols()
+        check("下次打开能读回来", t39._want_attrs, ["耐压", "精度"])
+        t39._want_attrs = None          # 恢复出厂:自动挑
+        t39._save_cols()
+        t39._apply_attr_cols([])
+        
         p("\n【38】刷新不能把选中和「最近流水」刷没")
         
         # 重建表格会让 Tk 发 <<TreeviewSelect>>,那一刻 selected_id() 是空的,
