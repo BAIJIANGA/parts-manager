@@ -33,6 +33,16 @@ def ck(label, got, want):
           + ("" if ok else f"  (期望 {want!r})"))
 
 
+def col_of(tree, title):
+    """按表头文字找列号。
+
+    绝不写死下标:给树加一列(比如「参数」)就会让后面所有列右移一位,
+    写死的断言会**照样通过/失败,只是在看别的格子**。
+    """
+    cols = [tree.heading(c)["text"] for c in tree.cget("columns")]
+    return cols.index(title)
+
+
 def snapshot(path):
     st = os.stat(path)
     with io.open(path, "rb") as f:
@@ -223,7 +233,8 @@ try:
     ck("父行的「还需要」立刻跟着减", pp.remain(bid0), rem0 - want)
     _vals = pp.tree.item(str(bid0), "values")
     # Treeview 里的单元格一律是字符串
-    ck("父行格子里写着还差多少", int(_vals[6]), pp.remain(bid0))
+    ck("父行格子里写着还差多少",
+       int(_vals[col_of(pp.tree, "还需要")]), pp.remain(bid0))
 
     _rb = gui.messagebox
     gui.messagebox = FakeBox()

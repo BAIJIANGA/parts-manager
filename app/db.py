@@ -24,7 +24,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 TABLES = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -44,6 +44,24 @@ CREATE TABLE IF NOT EXISTS project (
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 
+-- 品类(层级)。用户能自己加、改名、删,还能搭成
+-- 「电容 - 无极性陶瓷电容 - C0603」这样的多级。
+--
+-- 注意和 component.category 的分工:
+--   * component.category 是**文本**,永远是这棵树里那个节点的**最顶层祖先的名字**
+--     (也就是「大类」)。所有按品类分组的地方读的都是它,所以那些 SQL 一行没改。
+--   * component.category_id 才是指向树里具体那个节点的指针(可能是个子类)。
+-- 删品类时 ON DELETE SET NULL,而且 server 那边会先把元件挪到父节点上 ——
+-- 用户可以删掉一个品类,但**绝不会因为删品类而丢元件**。
+CREATE TABLE IF NOT EXISTS category (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER REFERENCES category(id) ON DELETE CASCADE,
+  name      TEXT NOT NULL,
+  sort      INTEGER NOT NULL DEFAULT 0,
+  note      TEXT,
+  UNIQUE (parent_id, name)
+);
+
 -- 元件主数据
 CREATE TABLE IF NOT EXISTS component (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +69,8 @@ CREATE TABLE IF NOT EXISTS component (
   mpn           TEXT,                           -- 厂家料号
   manufacturer  TEXT,                           -- 厂家
   name          TEXT NOT NULL,                  -- 显示名
-  category      TEXT NOT NULL DEFAULT '其他',
+  category      TEXT NOT NULL DEFAULT '其他',  -- 大类名(永远等于 category_id 那个节点的顶层名字)
+  category_id   INTEGER REFERENCES category(id) ON DELETE SET NULL, -- 树里具体那个节点
   value         TEXT,                           -- 1uF / 10k
   value_num     REAL,                           -- 由 value 解析出的数值,用来正确排序/筛选
   value_unit    TEXT,                           -- 解析出的单位(F / Ω / H …)
@@ -155,6 +174,12 @@ CREATE TABLE IF NOT EXISTS bom_substitute (
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_component_mpn ON component(mpn);
 CREATE INDEX IF NOT EXISTS idx_component_cat ON component(category);
+CREATE INDEX IF NOT EXISTS idx_component_catid ON component(category_id);
+CREATE INDEX IF NOT EXISTS idx_category_parent ON category(parent_id);
+-- 顶层品类名要唯一。UNIQUE(parent_id, name) 管不住 parent_id IS NULL 的行:
+-- SQLite 里 NULL 彼此不相等,所以「电容」能被建出两条来。这里用部分索引补上。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_category_root_name
+  ON category(name) WHERE parent_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_component_pkg ON component(package);
 CREATE INDEX IF NOT EXISTS idx_component_val ON component(value);
 CREATE INDEX IF NOT EXISTS idx_component_valnum ON component(value_num);
@@ -195,6 +220,8 @@ ADDED_COLUMNS = {
         # 把名字从 100nF 0603 改成 100nF,两个不同封装的 100nF 就会并成一条。
         # 拆开之后名字怎么改都不影响匹配。留 NULL 表示还没算过(启动时补)。
         "identity_key": "TEXT",
+        # 品类树里的位置。老库启动时由 reconcile_categories() 补上。
+        "category_id": "INTEGER REFERENCES category(id) ON DELETE SET NULL",
     },
     "location": {
         "parent_id": "INTEGER REFERENCES location(id) ON DELETE CASCADE",
@@ -274,6 +301,8 @@ def init_db(con: sqlite3.Connection) -> list:
     # 补列之后、用之前,把老数据的身份键补上 —— 否则老元件一条都匹配不上,
     # 重新导入 BOM 会把整块板重复长一遍。
     backfill_identity(con)
+    # 品类表要在元件都就位之后才对账:第 1 步的种子、第 2 步的挂靠都靠读 component
+    reconcile_categories(con)
     con.commit()
     return upgraded
 
@@ -376,6 +405,133 @@ def backfill_identity(con: sqlite3.Connection) -> tuple:
     if keys or names:
         con.commit()
     return keys, names
+
+
+# 品类树的起点。和 bom.CATEGORIES 一致 —— 新装的库打开就能直接挑,
+# 不用先在空列表里自己敲十六个品类出来。
+def category_seed() -> list:
+    import bom
+    return list(bom.CATEGORIES)
+
+
+def ensure_category(con: sqlite3.Connection, name, parent_id=None):
+    """按名字拿品类行的 id;没有就建。名字为空返回 None。
+
+    顶层行的名字就是 component.category 那一列的值,所以「元件填了个没见过的
+    品类」= 「品类表里多一个顶层节点」,两件事本来就是一件事。
+    """
+    name = str(name or "").strip()
+    if not name:
+        return None
+    if parent_id is None:
+        row = con.execute(
+            "SELECT id FROM category WHERE parent_id IS NULL AND name=?", (name,)
+        ).fetchone()
+    else:
+        row = con.execute(
+            "SELECT id FROM category WHERE parent_id=? AND name=?", (parent_id, name)
+        ).fetchone()
+    if row is not None:
+        return row["id"]
+    nxt = con.execute(
+        "SELECT COALESCE(MAX(sort), 0) + 1 AS n FROM category "
+        "WHERE parent_id IS ?", (parent_id,)).fetchone()["n"]
+    cur = con.execute("INSERT INTO category(parent_id, name, sort) VALUES(?,?,?)",
+                      (parent_id, name, nxt))
+    return cur.lastrowid
+
+
+def category_path(con: sqlite3.Connection, cat_id) -> str:
+    """把品类拼成 '电容 / 无极性陶瓷电容 / C0603' 这样的全路径。"""
+    parts, cur, guard = [], cat_id, 0
+    while cur and guard < 32:
+        row = con.execute("SELECT id, parent_id, name FROM category WHERE id=?",
+                          (cur,)).fetchone()
+        if row is None:
+            break
+        parts.append(row["name"])
+        cur, guard = row["parent_id"], guard + 1
+    return " / ".join(reversed(parts))
+
+
+def category_root(con: sqlite3.Connection, cat_id):
+    """往上走到顶层。顶层节点的名字就是 component.category 该有的值。"""
+    cur, guard, last = cat_id, 0, None
+    while cur and guard < 32:
+        row = con.execute("SELECT id, parent_id, name FROM category WHERE id=?",
+                          (cur,)).fetchone()
+        if row is None:
+            break
+        last = row
+        cur, guard = row["parent_id"], guard + 1
+    return last
+
+
+def reconcile_categories(con: sqlite3.Connection) -> int:
+    """把品类表和 component 对齐。每次启动都跑,幂等。返回挂上的元件数。
+
+    做三件事:
+      1. 内置品类 + 库里已经在用的品类文本 -> 品类表的顶层行
+         (老库升上来时,这一步就是「把 DISTINCT category 变成真正的行」)
+      2. 没挂 category_id 的元件 -> 挂到同名的顶层行
+      3. category_id 挂着但和文本对不上的 -> 以文本为准改挂
+
+    第 3 条是给「用户直接改了文本」「从别处导入的数据」兜底的。判断只做一层
+    (category 是顶层名),因为再往下分不出用户当初想挂在哪个子类上 ——
+    猜错还不如老实挂在顶层,让他自己在界面里挪。
+    """
+    for i, name in enumerate(category_seed()):
+        if not str(name).strip():
+            continue
+        row = con.execute(
+            "SELECT id FROM category WHERE parent_id IS NULL AND name=?", (name,)
+        ).fetchone()
+        if row is None:
+            con.execute("INSERT INTO category(parent_id, name, sort) VALUES(NULL,?,?)",
+                        (name, i))
+    # 库里在用的、但不在内置清单里的品类(用户自己敲的)
+    used = [r["category"] for r in con.execute(
+        "SELECT DISTINCT category FROM component "
+        "WHERE category IS NOT NULL AND TRIM(category) <> ''")]
+    for name in used:
+        ensure_category(con, name)
+
+    fixed = 0
+    rows = con.execute(
+        "SELECT c.id, c.category, c.category_id, "
+        "       (SELECT r.name FROM category r WHERE r.id = c.category_id) AS node_name, "
+        "       (SELECT r.parent_id FROM category r WHERE r.id = c.category_id) AS node_parent "
+        "  FROM component c").fetchall()
+    for r in rows:
+        want = str(r["category"] or "").strip()
+        if r["category_id"] is None:
+            if not want:
+                continue
+            cid = ensure_category(con, want)
+        else:
+            # 节点还在、而且它就是个顶层节点、名字也对 -> 不用动
+            if r["node_name"] is not None and r["node_parent"] is None \
+                    and r["node_name"] == want:
+                continue
+            if r["node_name"] is None:
+                # 节点被删了(FK 本该置空,这里是兜底)
+                if not want:
+                    continue
+                cid = ensure_category(con, want)
+            else:
+                # 挂在子类上是对的,不动;挂在别的顶层下才要按文本改挂
+                root = category_root(con, r["category_id"])
+                if root is not None and (root["name"] or "") == want:
+                    continue
+                if not want:
+                    continue
+                cid = ensure_category(con, want)
+        if cid != r["category_id"]:
+            con.execute("UPDATE component SET category_id=? WHERE id=?", (cid, r["id"]))
+            fixed += 1
+    if fixed:
+        con.commit()
+    return fixed
 
 
 def backfill_values(con: sqlite3.Connection) -> int:

@@ -23,7 +23,7 @@ function Step($n, $t) { Write-Host "[$n] $t" -ForegroundColor Cyan }
 New-Item -ItemType Directory -Force -Path $Cache | Out-Null
 
 # ---------------------------------------------------------------- 1
-Step '1/7' '清理旧版遗留在 dist\ 里的中间产物'
+Step '1/8' '清理旧版遗留在 dist\ 里的中间产物'
 # 早期版本把内嵌运行时、编译出的 exe、zip 也放在 dist\,和真正的产物混在一起,
 # 一眼看不出哪个才是该双击的东西。这里只清【构建脚本自己产生过】的名字,
 # 绝不碰用户自己解压出来的目录(那里面可能有正在运行的程序和数据库)。
@@ -41,11 +41,11 @@ Get-ChildItem $Dist -Filter '*.zip' -File -EA SilentlyContinue | ForEach-Object 
 }
 
 # ---------------------------------------------------------------- 2
-Step '2/7' '检查编译器'
+Step '2/8' '检查编译器'
 if (-not (Test-Path $Csc)) { throw "找不到 csc.exe: $Csc (.NET Framework 4 应随 Windows 自带)" }
 
 # ---------------------------------------------------------------- 3
-Step '3/7' '准备内嵌 Python 运行时,并注入 tkinter'
+Step '3/8' '准备内嵌 Python 运行时,并注入 tkinter'
 if (-not (Test-Path (Join-Path $Embed 'python.exe'))) {
     Write-Host "  下载 $PY_URL"
     # PowerShell 的 Invoke-WebRequest 在部分机器上抓不到 python.org(TLS 会被断),
@@ -131,7 +131,7 @@ if ($LASTEXITCODE -ne 0) { throw "内嵌运行时里 tkinter 不可用:`n$probe"
 Write-Host "  $probe   <- 运行时自检通过" -ForegroundColor Green
 
 # ---------------------------------------------------------------- 4
-Step '4/7' '生成图标'
+Step '4/8' '生成图标'
 $pillowPy = $null
 foreach ($c in @(
         (Join-Path $env:USERPROFILE '.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'),
@@ -145,7 +145,7 @@ if ($pillowPy) { & $pillowPy (Join-Path $Build 'make_icon.py') (Join-Path $Build
 else { Write-Host '  没有带 Pillow 的 Python,跳过图标(不影响功能)' -ForegroundColor Yellow }
 
 # ---------------------------------------------------------------- 5
-Step '5/7' '编译启动器'
+Step '5/8' '编译启动器'
 $iconArg = @()
 if (Test-Path (Join-Path $Build 'app.ico')) { $iconArg = @("/win32icon:$(Join-Path $Build 'app.ico')") }
 & $Csc /nologo /target:winexe /r:System.Windows.Forms.dll @iconArg `
@@ -153,7 +153,7 @@ if (Test-Path (Join-Path $Build 'app.ico')) { $iconArg = @("/win32icon:$(Join-Pa
 if ($LASTEXITCODE -ne 0) { throw 'csc 编译失败' }
 
 # ---------------------------------------------------------------- 6
-Step '6/7' '发货前自检:业务 / 界面 / 排版 / 旧库迁移'
+Step '6/8' '发货前自检:业务 / 界面 / 排版 / 路由 / 旧库迁移 / 品类迁移'
 # 打包前先跑一遍自检。发出去一个坏包,比晚几分钟打包糟糕得多 ——
 # 尤其是「迁移」那一步:包到了用户手上才会在他那个库上跑 ALTER TABLE,没有回头路。
 $selfPy = $null
@@ -166,7 +166,8 @@ if (-not $selfPy) {
     Write-Host '  找不到可用的 Python,跳过自检(建议先手动跑一遍)' -ForegroundColor Yellow
 } else {
     foreach ($t in @('test_api.py', 'test_gui.py', 'check_layout.py',
-                     'checks\migrate_probe.py')) {
+                     'checks\check_routes.py', 'checks\migrate_probe.py',
+                     'checks\probe_cat.py')) {
         & $selfPy (Join-Path $Build $t) $Root | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "自检没过:build\$t —— 报告在 build\cache\ 里,先看清楚再发包"
@@ -176,7 +177,7 @@ if (-not $selfPy) {
 }
 
 # ---------------------------------------------------------------- 6
-Step '7/7' '组装 dist\元器件物料管理'
+Step '7/8' '组装 dist\元器件物料管理'
 # 程序正从目标目录运行的话,重建会删一半卡在占用的文件上,留下一个残缺目录 —— 先拦住
 $busy = Get-Process -Name '元器件物料管理', 'pythonw' -EA SilentlyContinue |
         Where-Object { $_.Path -and $_.Path -like "$Pkg\*" }
@@ -222,6 +223,42 @@ if (Test-Path $dataKeep) {
     }
 }
 Copy-Item (Join-Path $Build '使用说明.txt') $Pkg -Force -EA SilentlyContinue
+
+# ---------------------------------------------------------------- 8
+Step '8/8' '成品包实地自检(用包里那个运行时跑)'
+# 前面 6 项跑的是源码;这一步跑的是**刚组装出来的这个包**。差一个文件、
+# runtime 里少一个模块、app\ 没拷全,只有到这一步才看得出来。
+#
+# 只放能在空库上跑的:step2/3/4 断言「用户那个项目还在」,包里还没录过项目的
+# 时候必然失败 —— 把它们塞进打包流程,只会让那种情况永远打不出包。
+$pkgPy = Join-Path $Pkg 'runtime\python.exe'
+if (Test-Path $pkgPy) {
+    # 探针会用包里的 Python 去 import app\*.py —— 不拦着的话,跑完包里就多出
+    # 十来个 __pycache__\.pyc(前面那次清理在第 7 步,清了个寂寞),
+    # 成品体积凭空涨 1MB,文件数也从 258 变成 273
+    $oldBytecode = $env:PYTHONDONTWRITEBYTECODE
+    $env:PYTHONDONTWRITEBYTECODE = '1'
+    try {
+        foreach ($t in @('probe_pkg_step1.py', 'probe_pkg_r4.py')) {
+            Push-Location $Pkg
+            try {
+                & $pkgPy (Join-Path $Build "checks\$t") | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "成品包自检没过:build\checks\$t —— 这个包不能发"
+                }
+                Write-Host "  $t 通过" -ForegroundColor Green
+            } finally { Pop-Location }
+        }
+    } finally {
+        if ($null -eq $oldBytecode) { Remove-Item Env:\PYTHONDONTWRITEBYTECODE -EA SilentlyContinue }
+        else { $env:PYTHONDONTWRITEBYTECODE = $oldBytecode }
+    }
+    # 兜底:真漏了也在这儿扫掉
+    Get-ChildItem $Pkg -Recurse -Directory -Force -Filter '__pycache__' -EA SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -EA SilentlyContinue }
+} else {
+    Write-Host '  包里没有 runtime\python.exe,跳过成品自检' -ForegroundColor Yellow
+}
 
 # ---------------------------------------------------------------- 汇报
 $files = Get-ChildItem $Pkg -Recurse -File

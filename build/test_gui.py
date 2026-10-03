@@ -69,6 +69,17 @@ def buttons_of(root):
     return out
 
 
+def col_of(pane, key):
+    """按列名找列号。
+
+    收料清单和出库分配树的列是会变的(加「参数」那一列就是这样)。断言里写死
+    `values[8]` 的话,加一列就全部串位 —— 而串位之后**断言往往还是「通过」的**,
+    只是它验的已经不是原来那件事了,那比直接失败更糟。所以这两张表一律按列名取。
+    列名找不到时直接抛异常,不静默算出一个错的列号。
+    """
+    return [c[0] for c in pane.COLS].index(key)
+
+
 def card_labels(card):
     """把一张大类卡片上所有 Label 的文字取出来(卡片是 tk.Frame)。"""
     out = []
@@ -677,17 +688,49 @@ def main() -> int:
         check("可用量 = 本件现有 + 替代料现有",
               line_after["available"], line_after["on_hand"] + line_after["sub_qty"])
 
-        p("\n【12】元件弹窗:新字段与参数解析")
+        p("\n【12】元件弹窗:新字段与属性小表")
         d3 = gui.ComponentDialog(app, app, cid0)
         d3.update()
         for key in ("unit_price", "min_stock", "reorder_qty", "supplier", "default_loc_id"):
             check(f"弹窗有「{key}」字段", key in d3.vars, True)
-        d3.params.delete("1.0", "end")
-        d3.params.insert("1.0", "耐压=50V\n精度=1%\n没有等号的行\n\n温度= -40~85C")
+
+        # 属性以前是一个 tk.Text,要用户背「一行一个,写成 耐压=50V」这个语法:
+        # 键名打错一个字不报错,只是静默多出一条属性,想删一条也只能整块重打。
+        # 现在是一张「名称 / 值」的小表。
+        check("属性是结构化的行,不再是一个要背语法的文本框",
+              hasattr(d3, "attr_rows"), True)
+        check("没把 tk.Text 那个老控件留在身上", hasattr(d3, "params"), False)
+        n0 = len(d3.attr_rows)
+        d3.attr_add("耐压", "50V")
+        d3.attr_add("温度", "-40~85C")
+        d3.attr_add("", "点了加号又没填名称的一行")
+        app.update()
+        check("能加行", len(d3.attr_rows), n0 + 3)
         parsed = d3._parse_params()
-        check("参数按 key=value 解析", parsed.get("耐压"), "50V")
-        check("参数值两边空格被去掉", parsed.get("温度"), "-40~85C")
-        check("没有等号的行被忽略", len(parsed), 3)
+        check("按「名称 / 值」解析", parsed.get("耐压"), "50V")
+        check("值两边空格被去掉", parsed.get("温度"), "-40~85C")
+        check("名称空着的那一行被丢掉(点错了不该存成一条空名字的属性)",
+              "" in parsed, False)
+        d3.attr_del(d3.attr_rows[-1][0])
+        app.update()
+        check("能删行", len(d3.attr_rows), n0 + 2)
+        check("删掉之后解析里也没有它", d3._parse_params().get("耐压"), "50V")
+        d3.attr_add("  耐压  ", "100V")
+        check("名称两边多打了空格,归一化后算同一个名字(不该变成两条)",
+              (d3._parse_params().get("耐压"), len([k for k in d3._parse_params()
+                                                    if "耐压" in k])), ("100V", 1))
+        check("空值也留着 ——「还没填」和「没这个属性」是两件事",
+              "空值测试" not in d3._parse_params(), True)
+        d3.attr_add("空值测试", "")
+        check("值空着仍然出现在解析结果里",
+              "空值测试" in d3._parse_params(), True)
+        check("属性名有候选", len(d3.attr_options()) > 0, True)
+        d3.vars["category"].set("电感")
+        opts = d3.attr_options()
+        check("换了品类,候选跟着换(电感能看到饱和电流)", "饱和电流" in opts, True)
+        check("只是个建议,不是白名单 —— 输入框仍然能自己打字",
+              (isinstance(d3.attr_rows[0][1], gui.ttk.Combobox)
+               and "readonly" not in d3.attr_rows[0][1].state()), True)
         d3.destroy()
 
         p("\n【13】元件选择器")
@@ -1546,11 +1589,14 @@ def main() -> int:
               "品类" in cols, True)
         check("勾选框那一列排在最前面", cols[0], "选")
         rows = {int(i): rp.tree.item(i, "values") for i in rp.tree.get_children()}
-        check("每行都写着品类", sorted(r[2] for r in rows.values()), ["\u7535\u5bb9", "\u7535\u963b"])
+        check("每行都写着品类",
+              sorted(r[col_of(rp, "category")] for r in rows.values()),
+              ["\u7535\u5bb9", "\u7535\u963b"])
         check("数量默认取 BOM 需求,不用自己填",
-              sorted(int(r[8]) for r in rows.values()), [4, 7])
+              sorted(int(r[col_of(rp, "qty")]) for r in rows.values()), [4, 7])
         check("默认一个都没勾(勾了才是收到了)", len(rp.picked), 0)
-        check("每条最前面都是空框", sorted(set(r[0] for r in rows.values())),
+        check("每条最前面都是空框",
+              sorted(set(r[col_of(rp, "pick")] for r in rows.values())),
               [gui.CHECK_OFF])
 
         # 走真实的点击路径,而不是直接调 toggle —— 「点不上」正是要防的毛病
@@ -1566,8 +1612,8 @@ def main() -> int:
             rp.on_click(ev)
             app.update()
         check("点「选」那一格就勾上了", b27a in rp.picked, True)
-        check("勾上之后格子里是打钩", rp.tree.item(str(b27a), "values")[0],
-              gui.CHECK_ON)
+        check("勾上之后格子里是打钩",
+              rp.tree.item(str(b27a), "values")[col_of(rp, "pick")], gui.CHECK_ON)
         rp.on_click(ev)
         app.update()
         check("再点一下取消勾选", b27a in rp.picked, False)
@@ -1583,7 +1629,8 @@ def main() -> int:
             app.update()
         finally:
             gui.ask_text = _ask27
-        check("双击能改这一行的数量", int(rp.tree.item(str(b27b), "values")[8]), 5)
+        check("双击能改这一行的数量",
+              int(rp.tree.item(str(b27b), "values")[col_of(rp, "qty")]), 5)
         check("改了数量就顺手勾上(不然改了也不算)", b27b in rp.picked, True)
 
         _ask27b = gui.ask_text
@@ -1594,7 +1641,7 @@ def main() -> int:
         finally:
             gui.ask_text = _ask27b
         check("填了不是数字的东西,数量不变",
-              int(rp.tree.item(str(b27b), "values")[8]), 5)
+              int(rp.tree.item(str(b27b), "values")[col_of(rp, "qty")]), 5)
 
         rp.check_all(True)
         app.update()
@@ -1694,22 +1741,26 @@ def main() -> int:
               sorted(pp.tree.get_children(parent)),
               sorted([pp.child_iid(b28, c28a), pp.child_iid(b28, c28c)]))
         check("父行上写着还差多少", "\u8fd8\u5dee 10" in pp.tree.item(parent, "text"), True)
-        check("父行也带品类", pp.tree.item(parent, "values")[1], "\u7535\u5bb9")
+        check("父行也带品类",
+              pp.tree.item(parent, "values")[col_of(pp, "category")], "\u7535\u5bb9")
         check("子行默认没勾",
-              pp.tree.item(pp.child_iid(b28, c28a), "values")[0], gui.CHECK_OFF)
+              pp.tree.item(pp.child_iid(b28, c28a),
+                           "values")[col_of(pp, "pick")], gui.CHECK_OFF)
 
         # ------- 用户要的就是这一件事:0603 出 8 个之后,0805 那边自动变成还差 2
         pp.toggle(pp.child_iid(b28, c28a))
         app.update()
         check("勾上 0603 那颗,默认把它 8 个库存全出", pp.alloc[(b28, c28a)], 8)
         check("父行的「还需要」立刻从 10 变成 2",
-              int(pp.tree.item(parent, "values")[6]), 2)
+              int(pp.tree.item(parent, "values")[col_of(pp, "left")]), 2)
         check("0805 那行的「还需要」也变成 2",
-              int(pp.tree.item(pp.child_iid(b28, c28c), "values")[6]), 2)
+              int(pp.tree.item(pp.child_iid(b28, c28c),
+                               "values")[col_of(pp, "left")]), 2)
         pp.toggle(pp.child_iid(b28, c28c))
         app.update()
         check("再勾 0805,默认正好补上剩下的 2 个", pp.alloc[(b28, c28c)], 2)
-        check("父行的「还需要」归零", int(pp.tree.item(parent, "values")[6]), 0)
+        check("父行的「还需要」归零",
+              int(pp.tree.item(parent, "values")[col_of(pp, "left")]), 0)
         check("父行上说「齐了」", "\u9f50\u4e86" in pp.tree.item(parent, "text"), True)
 
         _mb28 = gui.messagebox
@@ -2010,6 +2061,422 @@ def main() -> int:
         solo31 = [t for t in texts31 if "SELFTEST-A" in t]
         check("没撞车的那条不带封装(封装有单独的列,不重复)",
               bool(solo31) and "0603" not in solo31[0], True)
+
+        p("\n【32】删掉最后一个项目之后,屏幕上的 BOM 明细不能留着")
+        # 实测过:数据库那一层一直是好的 —— project_bom.project_id 声明了
+        # ON DELETE CASCADE,db.connect() 里也有 PRAGMA foreign_keys = ON,
+        # 删掉项目之后 project_bom 一行不剩。残影全在界面:
+        # load_bom() 第一句就是 `if not self._pid: return`,没有项目的时候它
+        # 压根不会被调用,于是表格、标题、缺料标签、详情面板一起停在旧内容上,
+        # 用户看到的就是「项目删了,BOM 明细没删」。
+        # 先把库里其它项目清掉,好造出「删的正好是最后一个」这个情形。
+        for _row in list(app_con.execute("SELECT id FROM project").fetchall()):
+            API(server.delete_project, match=(_row[0],))
+        pid32 = API(server.create_project,
+                    body={"name": "SELFTEST-删最后", "qty": 2})["id"]
+        c32 = API(server.create_component, body={
+            "name": "SELFTEST-C32", "category": "电容",
+            "value": "330nF", "package": "0805"})["id"]
+        API(server.add_bom_line, match=(pid32,),
+            body={"component_id": c32, "required_qty": 5})
+        app.refresh_all()
+        app.update()
+        app.nb.select(app.tab_proj)
+        pr.t_proj.selection_set(str(pid32))
+        app.update()
+        check("删除前:这一页确实有内容(不然下面的断言等于没测)",
+              len(pr.t_bom.get_children()) > 0, True)
+        check("删除前:选中的就是这个项目", pr._pid, pid32)
+
+        _mb32 = gui.messagebox
+        box32 = FakeBox()
+        gui.messagebox = box32
+        try:
+            pr.delete_project()
+            app.update()
+        finally:
+            gui.messagebox = _mb32
+
+        check("删之前问过确认(不能默默删)", len(box32.asks), 1)
+        check("数据库里这个项目没了",
+              app_con.execute("SELECT COUNT(*) FROM project WHERE id=?",
+                              (pid32,)).fetchone()[0], 0)
+        check("数据库里它的 BOM 明细也没了(CASCADE 本来就好的)",
+              app_con.execute("SELECT COUNT(*) FROM project_bom WHERE project_id=?",
+                              (pid32,)).fetchone()[0], 0)
+        check("★ 界面上 BOM 明细表也清空了(以前这里会留着已删项目的行)",
+              len(pr.t_bom.get_children()), 0)
+        check("★ 内部那份 _lines 也清了", len(pr._lines), 0)
+        check("标题不再写着已删项目的名字",
+              pr.title.get(), "（左侧选一个项目）")
+        check("缺料标签清空", pr.shortage.get(), "")
+        check("入库区不再挂着已删项目", pr.pane_in.project_id, None)
+        check("出库区不再挂着已删项目", pr.pane_out.project_id, None)
+        check("入库收料清单清空", len(pr.pane_in.bom_form.lines), 0)
+        check("出库分配树清空", len(pr.pane_out.bom_form.lines), 0)
+        check("详情面板回到「先点一行」", "先在左边点一行" in pr.detail.tip.get(), True)
+        check("全库没有指向已删项目的孤儿 BOM 行",
+              app_con.execute("SELECT COUNT(*) FROM project_bom b LEFT JOIN project p"
+                              " ON p.id=b.project_id WHERE p.id IS NULL").fetchone()[0], 0)
+        check("删项目不该把元件一起带走",
+              app_con.execute("SELECT COUNT(*) FROM component WHERE id=?",
+                              (c32,)).fetchone()[0], 1)
+
+        p("\n【33】用户自定义的属性:录入 -> 落库 -> 在入库/出库都看得见")
+        # 属性名和值都由用户定(电容的耐压/精度、电阻的精度/功率、电感的额定/饱和电流…),
+        # 存法是 component.params 那个 JSON 列。这里要测的不是「能存」——
+        # 那本来就能存 —— 而是「填完之后在收料清单和出库分配树上真的看得见」。
+        pid33 = API(server.create_project,
+                    body={"name": "SELFTEST-属性", "qty": 1})["id"]
+        cid33 = API(server.create_component, body={
+            "name": "SELFTEST-C33", "category": "电容", "value": "100nF",
+            "package": "0603", "params": {"耐压": "50V", "精度": "±5%"}})["id"]
+        cid33b = API(server.create_component, body={
+            "name": "SELFTEST-C33B", "category": "电阻", "value": "10k",
+            "package": "0603"})["id"]          # 故意一个属性都不填
+        b33 = API(server.add_bom_line, match=(pid33,),
+                  body={"component_id": cid33, "required_qty": 4})["id"]
+        b33b = API(server.add_bom_line, match=(pid33,),
+                   body={"component_id": cid33b, "required_qty": 2})["id"]
+        loc33 = API(server.create_location,
+                    body={"code": "属性抽屉", "name": "属性抽屉"})["id"]
+        API(server.stock_move, body={"kind": "IN", "component_id": cid33,
+                                     "qty": 20, "location": "属性抽屉"})
+        app.refresh_all()
+        app.update()
+
+        app.nb.select(app.tab_proj)
+        pr.t_proj.selection_set(str(pid33))
+        pr.sub.select(pr.pane_in)
+        pr.pane_in.show_bom()
+        app.update()
+        rp33 = pr.pane_in.bom_form
+        rp33.set_project(pid33)
+        app.update()
+        i_p = col_of(rp33, "params")
+        got_p = rp33.tree.item(str(b33), "values")[i_p]
+        check("收料清单里能看到这颗电容的属性", got_p, "50V · ±5%")
+        check("没填属性的那颗料是空白,不是一个空的 {}",
+              rp33.tree.item(str(b33b), "values")[i_p], "")
+        check("搜属性值也能筛出来(仓库里认料就靠这个)",
+              (rp33.q.set("50V"), rp33.render(), len(rp33.tree.get_children()))[-1], 1)
+        rp33.q.set("")
+        rp33.render()
+        app.update()
+
+        # 出库那一边:分配树里的候选料要能看到属性 ——
+        # 值封装都一样、耐压不同的两颗料,正是这里最容易发错货
+        pr.sub.select(pr.pane_out)
+        pr.pane_out.show_bom()
+        app.update()
+        pp33 = pr.pane_out.bom_form
+        pp33.set_project(pid33)
+        app.update()
+        child33 = pp33.child_iid(b33, cid33)
+        check("分配树里有这颗料", pp33.tree.exists(child33), True)
+        j_p = col_of(pp33, "params")
+        check("分配树的候选行也显示属性",
+              pp33.tree.item(child33, "values")[j_p], "50V · ±5%")
+        check("需求那一行(父行)也带上属性",
+              pp33.tree.item(str(b33), "values")[j_p], "50V · ±5%")
+        child33b = pp33.child_iid(b33b, cid33b)
+        if pp33.tree.exists(child33b):
+            check("没属性的候选行是空白", pp33.tree.item(child33b, "values")[j_p], "")
+
+        # 属性名要能按品类建议出来(候选,不是白名单)
+        mt33 = API(server.meta)
+        check("meta 说出了库里在用的属性名",
+              "耐压" in (mt33.get("attrs_all") or []), True)
+        check("而且是按品类归的(电容下面的属性名)",
+              "耐压" in (mt33.get("attrs_by_category") or {}).get("电容", []), True)
+        check("内置建议表也发了(电容 -> 耐压)",
+              "耐压" in ((mt33.get("attrs_builtin") or {}).get("电容") or []), True)
+
+        # 弹窗:读得回来、改得动、存得住
+        d33 = gui.ComponentDialog(app, app, cid33)
+        d33.update()
+        names33 = [t[2].get() for t in d33.attr_rows]
+        check("弹窗把已有的属性读成了行", sorted(names33), ["精度", "耐压"])
+        check("值也读回来了", d33._parse_params().get("耐压"), "50V")
+        for _r, _cb, vn, vv in d33.attr_rows:
+            if vn.get() == "耐压":
+                vv.set("100V")
+        d33.attr_add("温度系数", "X7R")
+        d33.save()
+        app.update()
+        app.refresh_all()
+        app.update()
+        got33 = API(server.get_component, match=(cid33,))
+        check("改过的属性值存下来了", got33["params"].get("耐压"), "100V")
+        check("新加的属性也存下来了", got33["params"].get("温度系数"), "X7R")
+        check("没动的那条还在", got33["params"].get("精度"), "±5%")
+
+        rp33.set_project(pid33)
+        app.update()
+        # 顺序不是字典序,是 attrs 里那份「重要度」顺序(耐压/精度 在 GENERIC 里,
+        # 排在 温度系数 前面)—— 用户扫一眼先看到的是耐压和精度,那才是关键参数
+        check("改完再回收料清单,显示的是新值(顺序按重要度,不是字典序)",
+              rp33.tree.item(str(b33), "values")[i_p], "100V · ±5% · X7R")
+        check("而字典序下 温度系数 会跑到前面 —— 那正是我们不想要的",
+              "100V · X7R" not in rp33.tree.item(str(b33), "values")[i_p], True)
+
+        p("\n【34】库存四级菜单:大类 -> 子类(可多级)-> 封装 -> 元件")
+
+        # 搭一棵两层的品类树:菜单测试类 -> {子A, 子B}
+        top34 = API(server.create_category, body={"name": "菜单测试类"})["id"]
+        subA = API(server.create_category,
+                   body={"name": "子A", "parent_id": top34})["id"]
+        subB = API(server.create_category,
+                   body={"name": "子B", "parent_id": top34})["id"]
+        made34 = []
+        for nm, cid34, pkg in (("菜单A-0603", subA, "0603"), ("菜单A-0805", subA, "0805"),
+                               ("菜单B-0603", subB, "0603")):
+            row34 = API(server.create_component, body={
+                "name": nm, "category_id": cid34, "value": nm, "package": pkg})
+            API(server.stock_move, body={"kind": "IN", "component_id": row34["id"],
+                                         "qty": 5, "location": "未分类"})
+            made34.append(row34["id"])
+        # 一个大类,刻意一个子类都不加
+        API(server.create_category, body={"name": "无子类测试"})
+        lone34 = API(server.create_component, body={
+            "name": "无子类料", "category": "无子类测试", "value": "x",
+            "package": "SOT-23"})
+        API(server.stock_move, body={"kind": "IN", "component_id": lone34["id"],
+                                     "qty": 3, "location": "未分类"})
+        app.refresh_all()
+        app.update()
+        app.nb.select(app.tab_comp)
+        app.update()
+
+        cols34 = [tab.tree.heading(c)["text"] for c in tab.tree["columns"]]
+        k_nm34 = cols34.index("名称")
+
+        def names34():
+            return sorted(tab.tree.item(i, "values")[k_nm34]
+                          for i in tab.tree.get_children())
+
+        check("用户自建的顶层品类也出现在首页卡片上(加完总得有入口)",
+              "菜单测试类" in tab.cards, True)
+
+        # ---- 有子类 -> 先进中间页选子类
+        gui.clear_tree(tab.tree)
+        tab.open_category("菜单测试类")
+        app.update()
+        check("有子类的大类先让你选子类,不把几个子类混在一张表里", tab.view, "pick")
+        check("中间页真的显示出来了", bool(tab.page_pick.winfo_ismapped()), True)
+        check("列表页收起来了", bool(tab.page_cat.winfo_ismapped()), False)
+        check("这时候明细表是空的(不是偷偷把全部堆出来)",
+              len(tab.tree.get_children()), 0)
+        check("中间页上就是这个大类的 2 个子类",
+              sorted(tab._pick_items and [c["name"] for c in tab._pick_items]),
+              ["子A", "子B"])
+        check("面包屑这时只有一级", [c["name"] for c in tab.crumb], ["菜单测试类"])
+        check("中间页的卡片键就是子类 id",
+              sorted(tab.pick_board.cards), sorted([str(subA), str(subB)]))
+
+        # ---- 选子类 -> 进列表页,而且只显示这一支的料
+        tab._pick_one(str(subA))
+        app.update()
+        check("选了子类之后进列表页", tab.view, "cat")
+        check("只显示这个子类下的料,不是整个大类混在一起",
+              names34(), ["菜单A-0603", "菜单A-0805"])
+        check("面包屑变成两级(大类 / 子类)",
+              [c["name"] for c in tab.crumb], ["菜单测试类", "子A"])
+        check("标题是当前这一级,图标配色跟大类走(不然一家子看不出是一家)",
+              tab.cat_title.get(), "子A")
+
+        # ---- 封装这一级(菜单第三级)
+        check("封装这一级的芯片列出来了(含「全部」)",
+              sorted(k for k in tab.pkg_chips if k != "__many__"), ["", "0603", "0805"])
+        tab.pick_package("0603")
+        app.update()
+        check("点了 0603 的芯片之后只剩 0603 的料", names34(), ["菜单A-0603"])
+        check("面包屑补上了封装这一级",
+              [(c["kind"], c["name"]) for c in tab.crumb],
+              [("cat", "菜单测试类"), ("cat", "子A"), ("pkg", "0603")])
+        check("选中的芯片用 ● 标出来(ttk 按钮没有按下态,得自己标)",
+              tab.pkg_chips["0603"].cget("text").startswith("●"), True)
+        check("没选的芯片没有 ●",
+              tab.pkg_chips["0805"].cget("text").startswith("●"), False)
+
+        # ---- 面包屑可以点着往回走
+        tab.crumb_to(1)
+        app.update()
+        check("点面包屑的「子A」退到子类这一层,封装筛选被清掉",
+              (tab.view, tab._facet_value(tab.f_pkg)), ("cat", ""))
+        check("退回之后两级的料都回来了", names34(), ["菜单A-0603", "菜单A-0805"])
+        tab.crumb_to(0)
+        app.update()
+        check("点面包屑的大类退回选子类那一层", tab.view, "pick")
+
+        # ---- 没有子类就不多这一页
+        tab.go_home()
+        app.update()
+        tab.open_category("无子类测试")
+        app.update()
+        check("没有子类的大类跳过中间页,直接进列表", tab.view, "cat")
+        check("而且面包屑只有一级 —— 没有凭空多出来的第二级",
+              [c["name"] for c in tab.crumb], ["无子类测试"])
+        check("它自己的料正常显示", names34(), ["无子类料"])
+
+        # ---- 钻到第三级之后刷新,要留在原地
+        tab.go_home()
+        app.update()
+        tab.open_category("菜单测试类")
+        app.update()
+        tab._pick_one(str(subA))
+        app.update()
+        tab.pick_package("0805")
+        app.update()
+        check("先钻到第三级", [c["name"] for c in tab.crumb], ["菜单测试类", "子A", "0805"])
+        app.refresh_all()
+        app.update()
+        check("刷新之后还留在原来那三级 —— 不弹回首页",
+              (tab.view, [c["name"] for c in tab.crumb]),
+              ("cat", ["菜单测试类", "子A", "0805"]))
+        check("表里还是筛过的那一行", names34(), ["菜单A-0805"])
+
+        # ---- 品类管理窗口
+        dlg34 = gui.CategoryManagerDialog(app, app)
+        dlg34.update()
+        # _flat 的键是 int(id)。这里写 str 的话永远 False —— 断言会「失败」
+        # 还好,怕的是写成「期望 False」的那条:它会通过,但什么都没验到。
+        check("品类管理窗口把树列出来了", top34 in dlg34._flat, True)
+        check("窗口里的树是分层的(子类挂在父类下面)",
+              dlg34.tree.parent(str(subA)), str(top34))
+        check("每个节点的全路径拼好了", dlg34._flat[subA]["path"], "菜单测试类 / 子A")
+        check("含子类的元件数统计出来了(删之前要靠它告诉用户会牵连多少)",
+              int(dlg34._flat[top34]["total"]) >= 2, True)
+
+        _ask34 = gui.ask_text
+        gui.ask_text = lambda *a, **k: "菜单测试类(新增)"
+        try:
+            dlg34.add_root()
+            dlg34.update()
+        finally:
+            gui.ask_text = _ask34
+        check("窗口里能加顶级品类",
+              "菜单测试类(新增)" in [n["path"] for n in dlg34._flat.values()], True)
+
+        _ask34b = gui.ask_text
+        gui.ask_text = lambda *a, **k: "子C"
+        try:
+            dlg34.tree.selection_set(str(subB))
+            dlg34.add_child()
+            dlg34.update()
+        finally:
+            gui.ask_text = _ask34b
+        check("窗口里能给选中的节点加子品类",
+              "菜单测试类 / 子B / 子C" in [n["path"] for n in dlg34._flat.values()], True)
+
+        # ---- 删品类:元件一个都不能少
+        n_before34 = API(server.list_components, query={"limit": "0"})["total"]
+        _mb34 = gui.messagebox
+        asked34 = {}
+
+        class _Box34:
+            @staticmethod
+            def askyesno(title, msg, **kw):
+                asked34["title"] = title
+                asked34["msg"] = msg
+                return True
+
+        gui.messagebox = _Box34
+        try:
+            dlg34.tree.selection_set(str(subA))
+            dlg34.remove()
+            dlg34.update()
+        finally:
+            gui.messagebox = _mb34
+        check("删之前问了一句", asked34.get("title"), "确认删除")
+        check("而且说清了元件不会被删(用户最怕的就是这个)",
+              "不会被删除" in asked34.get("msg", ""), True)
+        check("还说了有几个元件会被挪走", "2 个元件" in asked34.get("msg", ""), True)
+        check("删完之后元件一个都没少",
+              API(server.list_components, query={"limit": "0"})["total"], n_before34)
+        left34 = API(server.list_components, query={"limit": "0"})["items"]
+        moved34 = [c for c in left34 if c["id"] in made34[:2]]
+        check("原来挂在「子A」下面的两颗料挪到了大类下面",
+              sorted(c["category"] for c in moved34), ["菜单测试类", "菜单测试类"])
+        check("子A这一级真的没了", subA in dlg34._flat, False)
+        dlg34.destroy()
+        app.update()
+
+        # ---- 正在看的那一级被删掉:刷新要退到一个还存在的层级,而不是空页
+        app.refresh_all()
+        app.update()
+        check("被删掉的那一级不会把菜单卡住(自动退回还存在的层级)",
+              (tab.view, [c["name"] for c in tab.crumb]), ("pick", ["菜单测试类"]))
+        check("而且还能继续选剩下的子类",
+              sorted(c["name"] for c in tab._pick_items), ["子B"])
+        check("首页卡片没被这通增删弄丢", "菜单测试类" in tab.cards, True)
+        tab.go_home()
+        app.update()
+
+        p("\n【35】品类下拉要认得子类(而且别把子类归属冲掉)")
+
+        sub35 = API(server.create_category,
+                    body={"name": "下拉子类", "parent_id": top34})["id"]
+        c35 = API(server.create_component, body={
+            "name": "下拉测试料", "category_id": sub35, "value": "1uF",
+            "package": "0603"})
+        got35 = API(server.get_component, match=(c35["id"],))
+        check("元件记下了它挂在树上哪个节点", got35["category_id"], sub35)
+        check("而文本列仍旧写着顶层大类名(按品类分组的 SQL 全靠这一列)",
+              got35["category"], "菜单测试类")
+
+        d35 = gui.ComponentDialog(app, app, c35["id"])
+        d35.update()
+        check("编辑窗口的品类下拉里能看到子类的全路径",
+              "菜单测试类 / 下拉子类" in list(d35.cb_cat.cget("values")), True)
+        check("打开时显示的就是全路径,不是大类名",
+              d35.vars["category"].get(), "菜单测试类 / 下拉子类")
+        check("顶层仍旧只显示光名字(不然一屏全是「电阻 / ...」)",
+              "电阻" in list(d35.cb_cat.cget("values")), True)
+
+        # 关键回归:什么都不动直接保存,子类归属不能被冲回大类
+        d35.save()
+        app.update()
+        check("不动品类直接保存,仍然挂在子类上",
+              API(server.get_component, match=(c35["id"],))["category_id"], sub35)
+
+        d35b = gui.ComponentDialog(app, app, c35["id"])
+        d35b.update()
+        d35b.vars["category"].set("菜单测试类 / 子B")
+        d35b.save()
+        app.update()
+        got35b = API(server.get_component, match=(c35["id"],))
+        check("下拉里换成另一个子类,保存后真的挪过去了", got35b["category_id"], subB)
+        check("文本列跟着更新成大类的名字", got35b["category"], "菜单测试类")
+
+        d35c = gui.ComponentDialog(app, app, c35["id"])
+        d35c.update()
+        d35c.vars["category"].set("下拉手打新类")
+        d35c.save()
+        app.update()
+        got35c = API(server.get_component, match=(c35["id"],))
+        check("认不出来的品类仍然能自己打字填(这条路不能被堵死)",
+              got35c["category"], "下拉手打新类")
+        flat35 = API(server.list_categories)["flat"]
+        check("而且是建成顶层节点,不是挂到谁下面",
+              [n["parent_id"] for n in flat35 if n["name"] == "下拉手打新类"], [None])
+
+        # BOM 明细那块面板也要认得子类
+        det35 = pr.detail
+        det35.show({"component_id": c35["id"], "bom_id": None})
+        app.update()
+        check("BOM 明细面板的品类下拉也列出子类全路径",
+              "菜单测试类 / 子B" in det35.category_options(), True)
+        det35.cat.set("菜单测试类 / 下拉子类")
+        det35.save_category()
+        app.update()
+        check("面板上把品类改成子类,真的挂到了那个子类上(不是同名的大类)",
+              API(server.get_component, match=(c35["id"],))["category_id"], sub35)
+        check("面板上回填的是子类全路径,不是大类名",
+              (det35.show({"component_id": c35["id"], "bom_id": None}),
+               det35.cat.get())[1], "菜单测试类 / 下拉子类")
+        det35.clear()
+        app.update()
 
         app.refresh_all()
         app.update()

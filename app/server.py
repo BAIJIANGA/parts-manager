@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import attrs  # noqa: E402
 import bom  # noqa: E402
 import db  # noqa: E402
 import values  # noqa: E402
@@ -84,6 +85,9 @@ def start_idle_watchdog(seconds: int) -> None:
 # 哪些品类」的唯一来源,两处各维护一份的话,上游认出来的词在界面上会选不到。
 # 后面几个是手工录入才会用到的(推断不出来,只能人填)。
 CATEGORY_SUGGESTIONS = list(bom.CATEGORIES) + ["传感器", "模块", "结构件"]
+# 没品类的地方统一显示成这个。删掉一个顶层品类时,底下的元件也落到它这儿 ——
+# 界面、报表、这里必须是同一个词,不然用户会在两个名字之间来回找。
+UNCATEGORIZED = "未分类"
 
 ROUTES: list[tuple[str, re.Pattern, Callable]] = []
 
@@ -370,6 +374,16 @@ def list_components(ctx: Ctx, m):
     if ctx.q("category"):
         base_where.append("c.category = ?")
         base_args.append(ctx.q("category"))
+    # category_id:按**整棵子树**筛。菜单上点「电容」该看到它底下所有子类的料,
+    # 点「无极性陶瓷电容」则只看那一支。文本列做不到这件事 —— 挂在子类下的元件,
+    # 文本仍然写着「电容」,光看文本分不出是挂在子类还是直接挂在顶层。
+    if ctx.q("category_id"):
+        _sub = _category_subtree(ctx, ctx.qi("category_id", 0) or 0)
+        if _sub:
+            base_where.append("c.category_id IN (%s)" % ",".join("?" * len(_sub)))
+            base_args.extend(_sub)
+        else:
+            base_where.append("1 = 0")      # 节点不存在 = 什么都别给,别退化成「全部」
     if ctx.q("manufacturer"):
         base_where.append("c.manufacturer LIKE ?")
         base_args.append(f"%{ctx.q('manufacturer')}%")
@@ -531,14 +545,17 @@ def get_component(ctx: Ctx, m):
 @route("POST", r"/api/components")
 def create_component(ctx: Ctx, m):
     name = ctx.require("name")
+    # 品类可以给 id(树上具体那个节点)或名字。给名字时顺带把品类行建出来 ——
+    # 用户敲一个没见过的品类名,本来就该是「品类表里多一个顶层节点」。
+    cat_text, cat_id = _resolve_category(ctx)
     cur = ctx.con.execute(
-        """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, value, package,
-                                marking, params, datasheet_url, product_url, unit, min_stock,
-                                reorder_qty, supplier, unit_price, default_loc_id, note,
-                                identity_key)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, category_id,
+                                value, package, marking, params, datasheet_url,
+                                product_url, unit, min_stock, reorder_qty, supplier,
+                                unit_price, default_loc_id, note, identity_key)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ctx.b("lcsc_pn"), ctx.b("mpn"), ctx.b("manufacturer"), name,
-         ctx.b("category") or "其他", ctx.b("value"), ctx.b("package"),
+         cat_text, cat_id, ctx.b("value"), ctx.b("package"),
          ctx.b("marking"), db.dump_params(ctx.b("params")),
          ctx.b("datasheet_url"), ctx.b("product_url"),
          ctx.b("unit") or "个", ctx.bi("min_stock", 0) or 0,
@@ -563,7 +580,7 @@ def update_component(ctx: Ctx, m):
     fields = {
         "lcsc_pn": ctx.b("lcsc_pn"), "mpn": ctx.b("mpn"),
         "manufacturer": ctx.b("manufacturer"), "name": ctx.b("name"),
-        "category": ctx.b("category"), "value": ctx.b("value"),
+        "value": ctx.b("value"),
         "package": ctx.b("package"), "marking": ctx.b("marking"),
         "datasheet_url": ctx.b("datasheet_url"),
         "product_url": ctx.b("product_url"), "unit": ctx.b("unit"), "note": ctx.b("note"),
@@ -573,6 +590,14 @@ def update_component(ctx: Ctx, m):
         if v is not None:
             sets.append(f"{k}=?")
             args.append(v if not isinstance(v, str) or v.strip() else None)
+    # 品类:category_id 优先(树上具体节点),否则按名字。两者一起写,
+    # 绝不出现「文本说电容、id 指着电阻」这种自相矛盾的状态。
+    if "category_id" in ctx.body or "category" in ctx.body:
+        cat_text, cat_id = _resolve_category(ctx, fallback=row["category"])
+        sets.append("category=?")
+        args.append(cat_text)
+        sets.append("category_id=?")
+        args.append(cat_id)
     if "params" in ctx.body:
         sets.append("params=?")
         args.append(db.dump_params(ctx.body["params"]))
@@ -628,6 +653,225 @@ def delete_component(ctx: Ctx, m):
     return 200, {"ok": True}
 
 
+# ---------------------------------------------------------------- 品类
+
+
+def _resolve_category(ctx: Ctx, fallback=None):
+    """算出该写进 component 的 (category 文本, category_id)。
+
+    规则见文件头。category_id 优先:界面上用户选的是树上哪个节点,就该挂在那儿;
+    只给名字时(导入、命令行、老界面)顺带把顶层行建出来。
+    """
+    raw = ctx.b("category_id")
+    if raw not in (None, "", 0, "0"):
+        cid = ctx.bi("category_id", 0) or 0
+        if not ctx.con.execute("SELECT 1 FROM category WHERE id=?", (cid,)).fetchone():
+            raise ApiError(400, "品类不存在")
+        root = db.category_root(ctx.con, cid)
+        return (root["name"] if root else (fallback or "其他")), cid
+    name = str(ctx.b("category") or "").strip()
+    if name:
+        cid = db.ensure_category(ctx.con, name)
+        return name, cid
+    return (fallback or "其他"), None
+
+
+def _category_row(ctx: Ctx, cid):
+    row = ctx.con.execute("SELECT * FROM category WHERE id=?", (cid,)).fetchone()
+    if row is None:
+        raise ApiError(404, "品类不存在")
+    return row
+
+
+def _category_subtree(ctx: Ctx, cid) -> list:
+    """这个节点和它的所有子孙的 id。删/挪之前都要先知道会牵连到哪些节点。"""
+    rows = ctx.con.execute(
+        """WITH RECURSIVE sub(id) AS (
+               SELECT id FROM category WHERE id=?
+               UNION ALL
+               SELECT c.id FROM category c JOIN sub ON c.parent_id = sub.id)
+           SELECT id FROM sub""", (cid,)).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _category_sort_tail(ctx: Ctx, parent_id):
+    row = ctx.con.execute(
+        "SELECT COALESCE(MAX(sort), 0) + 1 AS n FROM category WHERE parent_id IS ?",
+        (parent_id,)).fetchone()
+    return int(row["n"])
+
+
+def _category_taken(ctx: Ctx, name, parent_id, exclude=None) -> bool:
+    sql = "SELECT id FROM category WHERE name=? AND parent_id IS ?"
+    args = [name, parent_id]
+    if exclude is not None:
+        sql += " AND id <> ?"
+        args.append(exclude)
+    return ctx.con.execute(sql, args).fetchone() is not None
+
+
+@route("GET", r"/api/categories")
+def list_categories(ctx: Ctx, m):
+    """品类树。界面拿它画库存菜单和品类管理窗口。
+
+    own / total 分开:一个是「直接挂在这个节点下的元件」,一个是「含子孙」。
+    删品类、改品类名之前要告诉用户会影响多少个元件,靠的就是 total。
+    """
+    rows = [db.row_to_dict(r) for r in ctx.con.execute(
+        "SELECT * FROM category ORDER BY sort, name")]
+    by_id = {r["id"]: r for r in rows}
+    for r in rows:
+        r["children"] = []
+        r["own"] = 0
+        r["total"] = 0
+    for r in ctx.con.execute(
+            "SELECT category_id AS cid, COUNT(*) AS n FROM component "
+            "WHERE category_id IS NOT NULL AND merged_into IS NULL "
+            "GROUP BY category_id"):
+        if r["cid"] in by_id:
+            by_id[r["cid"]]["own"] = int(r["n"])
+    roots = []
+    for r in rows:
+        pid = r["parent_id"]
+        if pid in by_id:
+            by_id[pid]["children"].append(r)
+        else:
+            roots.append(r)
+
+    def roll(node):
+        node["total"] = node["own"] + sum(roll(c) for c in node["children"])
+        return node["total"]
+
+    for r in roots:
+        roll(r)
+    # path 给界面直接用,省得它自己拼(自己拼迟早和这里的规则不一致)
+    for r in rows:
+        r["path"] = db.category_path(ctx.con, r["id"])
+    # 没挂品类行的元件也要报个数:它们不在树上,用户得知道有这些,
+    # 否则会在菜单里「找不到那颗料」而不知道去哪儿找
+    loose = ctx.con.execute(
+        "SELECT COUNT(*) AS n FROM component "
+        "WHERE category_id IS NULL AND merged_into IS NULL").fetchone()["n"]
+    return 200, {"items": roots, "flat": rows, "loose": int(loose)}
+
+
+@route("POST", r"/api/categories")
+def create_category(ctx: Ctx, m):
+    name = str(ctx.require("name")).strip()
+    raw = ctx.b("parent_id")
+    parent_id = None
+    if raw not in (None, "", 0, "0"):
+        parent_id = ctx.bi("parent_id", 0) or 0
+        _category_row(ctx, parent_id)          # 父节点不存在就 404
+    if _category_taken(ctx, name, parent_id):
+        raise ApiError(400, f"「{name}」已经存在了")
+    cur = ctx.con.execute(
+        "INSERT INTO category(parent_id, name, sort, note) VALUES(?,?,?,?)",
+        (parent_id, name, _category_sort_tail(ctx, parent_id), ctx.b("note")))
+    ctx.con.commit()
+    cid = int(cur.lastrowid)
+    return 201, {"id": cid, "path": db.category_path(ctx.con, cid)}
+
+
+@route("PUT", r"/api/categories/(\d+)")
+def update_category(ctx: Ctx, m):
+    cid = int(m.group(1))
+    row = _category_row(ctx, cid)
+    parent_id = row["parent_id"]
+    sets, args = [], []
+    moved = False
+
+    if "name" in ctx.body:
+        name = str(ctx.b("name") or "").strip()
+        if not name:
+            raise ApiError(400, "品类名不能空")
+        if _category_taken(ctx, name, parent_id, exclude=cid):
+            raise ApiError(400, f"「{name}」已经存在了")
+        sets.append("name=?")
+        args.append(name)
+
+    if "parent_id" in ctx.body:
+        raw = ctx.b("parent_id")
+        new_parent = None
+        if raw not in (None, "", 0, "0"):
+            new_parent = ctx.bi("parent_id", 0) or 0
+            _category_row(ctx, new_parent)
+            # 挪到自己下面会让这棵树成环,之后谁也走不到顶,直接拒
+            if new_parent == cid or new_parent in _category_subtree(ctx, cid):
+                raise ApiError(400, "不能把品类挪到它自己或它的子品类下面")
+        if new_parent != parent_id:
+            if _category_taken(ctx, str(ctx.b("name") or row["name"]).strip(),
+                               new_parent, exclude=cid):
+                raise ApiError(400, "目标位置下已经有同名品类了")
+            sets.append("parent_id=?")
+            args.append(new_parent)
+            sets.append("sort=?")
+            args.append(_category_sort_tail(ctx, new_parent))
+            moved = True
+
+    if "note" in ctx.body:
+        sets.append("note=?")
+        args.append(ctx.b("note") or None)
+    if "sort" in ctx.body:
+        sets.append("sort=?")
+        args.append(ctx.bi("sort", 0) or 0)
+
+    if not sets:
+        return 200, {"ok": True, "unchanged": True}
+    args.append(cid)
+    ctx.con.execute(f"UPDATE category SET {', '.join(sets)} WHERE id=?", args)
+
+    # 改名或挪窝都可能改变「谁是顶层、叫什么」,所以整棵子树下元件的文本列
+    # 一律重算一遍。只改顶层那一条是不够的:挪动之后顶层名字也会变。
+    subtree = _category_subtree(ctx, cid)
+    new_root = db.category_root(ctx.con, cid)
+    new_root_name = new_root["name"] if new_root else "其他"
+    marks = ",".join("?" * len(subtree))
+    touched = ctx.con.execute(
+        f"UPDATE component SET category=? WHERE category_id IN ({marks}) AND category <> ?",
+        [new_root_name] + subtree + [new_root_name]).rowcount
+    ctx.con.commit()
+    return 200, {"ok": True, "renamed_components": max(int(touched), 0), "moved": moved,
+                 "path": db.category_path(ctx.con, cid)}
+
+
+@route("DELETE", r"/api/categories/(\d+)")
+def delete_category(ctx: Ctx, m):
+    """删品类。**绝不删元件** —— 先把元件挪到上一级,再删节点。
+
+    用户的诉求是「库存种类也要能够添加和修改」,不是「删掉一个品类顺手清掉
+    底下所有料」。所以这里默认是「扁平化」:删掉「电容/无极性陶瓷电容」之后,
+    原来挂在它下面的料落到「电容」下面,一颗不少。
+    """
+    cid = int(m.group(1))
+    row = _category_row(ctx, cid)
+    subtree = _category_subtree(ctx, cid)
+    marks = ",".join("?" * len(subtree))
+    n_comp = ctx.con.execute(
+        f"SELECT COUNT(*) AS n FROM component WHERE category_id IN ({marks})",
+        subtree).fetchone()["n"]
+
+    if row["parent_id"] is None:
+        # 顶层节点被删:底下的料落到「未分类」。这是唯一一个「大类」级的兜底,
+        # 和界面里显示「未分类」的地方是同一个词。
+        dest_id = db.ensure_category(ctx.con, UNCATEGORIZED)
+        dest_path = UNCATEGORIZED
+    else:
+        dest_id = row["parent_id"]
+        dest_path = db.category_path(ctx.con, dest_id)
+    dest_root = db.category_root(ctx.con, dest_id) if dest_id else None
+    dest_text = dest_root["name"] if dest_root else UNCATEGORIZED
+
+    if n_comp:
+        ctx.con.execute(
+            f"UPDATE component SET category_id=?, category=? "
+            f"WHERE category_id IN ({marks})", [dest_id, dest_text] + subtree)
+    ctx.con.execute("DELETE FROM category WHERE id=?", (cid,))
+    ctx.con.commit()
+    return 200, {"ok": True, "moved_components": int(n_comp), "to": dest_path,
+                 "deleted_nodes": len(subtree)}
+
+
 @route("GET", r"/api/meta")
 def meta(ctx: Ctx, m):
     cats = [r["category"] for r in ctx.con.execute(
@@ -639,8 +883,42 @@ def meta(ctx: Ctx, m):
     mfrs = [r["manufacturer"] for r in ctx.con.execute(
         "SELECT DISTINCT manufacturer FROM component WHERE manufacturer IS NOT NULL "
         "AND manufacturer<>'' AND merged_into IS NULL ORDER BY manufacturer LIMIT 200")]
+
+    # 属性名:把「库里每个品类下已经在用的属性名」现算出来,给编辑元件窗口的
+    # 属性名下拉当候选。用户自己起过的名字要排在内置建议前面(见 attrs.suggest),
+    # 所以这里单独按品类收集,而不是把整库的属性名混成一个列表。
+    attrs_by_cat: dict = {}
+    for r in ctx.con.execute(
+            "SELECT category, params FROM component WHERE params IS NOT NULL "
+            "AND params <> '' AND params <> '{}' AND merged_into IS NULL"):
+        bucket = attrs_by_cat.setdefault((r["category"] or "").strip(), [])
+        for nm in attrs.clean(db.parse_params(r["params"])):
+            if nm and nm not in bucket:
+                bucket.append(nm)
+    for names in attrs_by_cat.values():
+        names.sort()
+    # 全部属性名合起来也留一份:编辑元件时品类常常还没定,下拉不该是空的
+    attrs_all: list = []
+    for names in attrs_by_cat.values():
+        for nm in names:
+            if nm not in attrs_all:
+                attrs_all.append(nm)
+    attrs_all.sort()
+
+    # 品类树的全部节点,带全路径。编辑元件时的品类下拉用它 ——
+    # 用户能在树上搭出「电容 / 无极性陶瓷电容」这种二级,选的时候也得能选到。
+    cat_paths = [{"id": r["id"], "name": r["name"], "parent_id": r["parent_id"],
+                  "path": db.category_path(ctx.con, r["id"])}
+                 for r in ctx.con.execute("SELECT * FROM category ORDER BY sort, name")]
+    roots = [p["path"] for p in cat_paths if p["parent_id"] is None]
     return 200, {
-        "categories": sorted(set(cats) | set(CATEGORY_SUGGESTIONS)),
+        "categories": sorted(set(cats) | set(roots) | set(CATEGORY_SUGGESTIONS)),
+        "category_paths": cat_paths,
+        "attrs_by_category": attrs_by_cat,
+        "attrs_all": attrs_all,
+        # 内置建议表也发一份,省得界面那边再和 app/attrs.py 对不上
+        "attrs_builtin": attrs.SUGGESTIONS,
+        "attrs_generic": attrs.GENERIC,
         "filters": {"categories": cats, "packages": pkgs, "manufacturers": mfrs},
         "locations": [dict(db.row_to_dict(r),
                            path=db.location_path(ctx.con, r["id"]))
@@ -1424,6 +1702,10 @@ def merge_components(ctx: Ctx, m):
             keeper = con.execute("SELECT * FROM component WHERE id=?", (keep,)).fetchone()
         # 合并前把数值列重算一遍:补进来的 value 可能来自被并的那条
         db.set_value_num(con, keep, keeper["value"])
+        # 品类文本也可能是刚补进来的,它在树里的位置得跟着重算 ——
+        # 否则会出现「文本是电阻、category_id 还指着电容」这种自相矛盾的状态
+        if any(s.startswith("category=") for s in fill):
+            db.reconcile_categories(con)
         # 身份键同理:上面刚把被并那条的 lcsc_pn / mpn / value / package 补了进来,
         # 不重算的话保留的这条会顶着一个过期的键,下次导入认不出它。
         con.execute(

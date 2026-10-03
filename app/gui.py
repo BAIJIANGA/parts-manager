@@ -26,6 +26,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+import attrs       # noqa: E402  ← 属性名的建议、归一化和显示格式
 import db          # noqa: E402
 import server      # noqa: E402  ← 复用全部业务逻辑
 import values      # noqa: E402  ← 值区间筛选要把 1k 这种写法解析成数值
@@ -639,9 +640,19 @@ class ComponentsTab(ttk.Frame):
         self.holder.pack(fill="both", expand=True)
         self.page_home = ttk.Frame(self.holder)
         self.page_cat = ttk.Frame(self.holder)
+        self.page_pick = ttk.Frame(self.holder)     # 中间页:选下一级子类
+
+        # 面包屑放在 holder **上面**,三个页面共用同一条 —— 切页时它不该跟着消失,
+        # 而且它是「我在树的哪一层」唯一持续可见的答案。
+        self.crumb_bar = ttk.Frame(self)
+        self.crumb = []            # [{"kind":"cat","id":..,"name":..}, {"kind":"pkg",...}]
+        self._cat_flat = {}        # 品类 id -> 节点(带 children / own / total / path)
+        self._pick_items = []      # 中间页当前列出的子类
+        self.pkg_chips = {}        # 封装芯片,自检要数它们
 
         self._build_home()
         self._build_cat()
+        self._build_pick()
         self.go_home()
 
     # ---- 给自检用的快捷入口
@@ -666,6 +677,9 @@ class ComponentsTab(ttk.Frame):
         ttk.Button(head, text="⚡ 快速入库", command=self.quick_in).pack(side="right")
         ttk.Button(head, text="📋 批量入库", command=self.batch_in).pack(side="right", padx=6)
         ttk.Button(head, text="🔍 查重", command=self.app.dedupe).pack(side="right", padx=6)
+        # 品类管理放在首页顶栏:想加一个新的库存种类时,人就在这个页面上
+        ttk.Button(head, text="🗂 品类管理", command=self.manage_categories).pack(
+            side="right", padx=6)
         ttk.Button(head, text="＋ 新增元件", command=self.add).pack(side="right", padx=6)
         ttk.Button(head, text="刷新", command=self.reload).pack(side="right", padx=6)
 
@@ -701,6 +715,11 @@ class ComponentsTab(ttk.Frame):
         ttk.Button(head, text="＋ 新增元件", command=self.add).pack(side="right")
         ttk.Button(head, text="编辑", command=self.edit).pack(side="right", padx=6)
         ttk.Button(head, text="删除", command=self.delete).pack(side="right")
+
+        # 封装这一级(菜单的第三级)。做成一行可点的芯片,而不是又一页:
+        # 同一个大类里封装通常只有两三种,为它单开一页会把「看一眼料」变成三次点击。
+        self.pkg_bar = ttk.Frame(self.page_cat)
+        self.pkg_bar.pack(fill="x", pady=(0, 4))
 
         # 筛选栏。回答的是「我这个大类里到底有没有某一档的东西」——
         # 比如「0805 的电阻里有没有 1k~10k 的」。比的是解析出来的数值,不是字符串。
@@ -792,6 +811,118 @@ class ComponentsTab(ttk.Frame):
         f2.pack(fill="both", expand=True)
         pane.add(bottom, weight=2)
 
+    # ------------------------------------------------------ 页面:选下一级
+
+    def _build_pick(self):
+        head = ttk.Frame(self.page_pick)
+        head.pack(fill="x", pady=(0, 8))
+        ttk.Button(head, text="← 返回", command=self.go_back, width=9).pack(
+            side="left", padx=(0, 10))
+        self.pick_title = tk.StringVar()
+        ttk.Label(head, textvariable=self.pick_title, style="H1.TLabel").pack(side="left")
+        self.pick_count = tk.StringVar()
+        ttk.Label(head, textvariable=self.pick_count, style="Dim.TLabel").pack(
+            side="left", padx=12)
+        ttk.Button(head, text="🗂 品类管理", command=self.manage_categories).pack(side="right")
+        ttk.Label(self.page_pick,
+                  text="这一级是品类树里的子类。要加新的子类,点右上角「品类管理」。",
+                  style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
+        self.pick_board = CardBoard(self.page_pick, self._pick_one)
+        self.pick_board.pack(fill="both", expand=True)
+
+    def _load_cat_tree(self):
+        """把品类树拉下来,存成 id -> 节点。菜单的每一层都从它来。"""
+        data = call(self.con, server.list_categories, quiet=True) or {}
+        self._cat_flat = {}
+        for n in data.get("flat") or []:
+            self._cat_flat[n["id"]] = n
+        return data
+
+    def _last_cat(self):
+        for c in reversed(self.crumb):
+            if c["kind"] == "cat":
+                return c
+        return None
+
+    def _render_crumb(self):
+        """面包屑:点哪一级就退回哪一级。"""
+        for w in self.crumb_bar.winfo_children():
+            w.destroy()
+        if not self.crumb:
+            self.crumb_bar.pack_forget()
+            return
+        self.crumb_bar.pack(fill="x", pady=(0, 6), before=self.holder)
+        ttk.Button(self.crumb_bar, text="🏠 全部库存", width=12,
+                   command=self.go_home).pack(side="left", padx=(0, 2))
+        for i, c in enumerate(self.crumb):
+            ttk.Label(self.crumb_bar, text="›", style="Dim.TLabel").pack(side="left", padx=1)
+            if i == len(self.crumb) - 1:
+                # 当前这一级不是按钮 —— 点它没有去处,做成按钮只会让人白点一次
+                ttk.Label(self.crumb_bar, text=c["name"],
+                          font=("Microsoft YaHei UI", 9, "bold")).pack(side="left", padx=2)
+            else:
+                ttk.Button(self.crumb_bar, text=c["name"], width=max(4, len(c["name"]) + 2),
+                           command=lambda n=i: self.crumb_to(n)).pack(side="left", padx=2)
+
+    def crumb_to(self, i):
+        self.crumb = self.crumb[:i + 1]
+        if not any(c["kind"] == "pkg" for c in self.crumb):
+            self.f_pkg.set(self.ALL)
+        self._descend()
+
+    def go_back(self):
+        if len(self.crumb) <= 1:
+            self.go_home()
+            return
+        self.crumb_to(len(self.crumb) - 2)
+
+    def _pick_one(self, key):
+        node = self._cat_flat.get(int(key))
+        if node is None:
+            self.reload()
+            return
+        self.crumb.append({"kind": "cat", "id": node["id"], "name": node["name"],
+                           "path": node["path"]})
+        self._descend()
+
+    def pick_package(self, pkg):
+        """点封装的芯片 —— 这是最后一级之前的那一步。"""
+        self.f_pkg.set(pkg or self.ALL)
+        self.crumb = [c for c in self.crumb if c["kind"] != "pkg"]
+        if pkg:
+            self.crumb.append({"kind": "pkg", "name": pkg})
+        self.load_category()
+
+    def _show_pick(self, node):
+        self.view = "pick"
+        self._pick_items = list(node.get("children") or [])
+        specs = []
+        for ch in self._pick_items:
+            glyph, color = CATEGORY_STYLE.get(ch["name"], DEFAULT_CAT_STYLE)
+            n = int(ch.get("total") or 0)
+            specs.append((str(ch["id"]), ch["name"], glyph, color,
+                          f"{n} 种在库" if n else "暂无库存", not n))
+        self.pick_title.set(node["name"])
+        total = sum(int(c.get("total") or 0) for c in self._pick_items)
+        self.pick_count.set(f"{len(specs)} 个子类" + (f",共 {total} 种在库" if total else ""))
+        self.pick_board.render(specs, empty_text="这个品类下面还没有子类。")
+        self._render_crumb()
+        self._swap(self.page_pick)
+
+    def _descend(self):
+        """按当前路径决定该显示哪一页。"""
+        node = self._last_cat()
+        if node is None:
+            self.go_home()
+            return
+        live = self._cat_flat.get(node.get("id"))
+        if live is not None and (live.get("children") or []):
+            # 有子类就必须先选子类 —— 但只在这里跳,没子类的大类直接进列表,
+            # 不让用户点一个只有一项的页面
+            self._show_pick(live)
+            return
+        self.load_category()
+
     # ------------------------------------------------------ 页面切换
 
     def _swap(self, page):
@@ -802,13 +933,37 @@ class ComponentsTab(ttk.Frame):
     def go_home(self):
         self.view = "home"
         self.current_category = None
+        self.crumb = []
+        self._render_crumb()
         self._swap(self.page_home)
 
     def open_category(self, name):
-        self.view = "cat"
+        """点一张大类卡片。"""
         self.current_category = name
+        self._load_cat_tree()
+        node = None
+        for n in self._cat_flat.values():
+            if n["parent_id"] is None and n["name"] == name:
+                node = n
+                break
+        self.view = "cat"
         self.clear_filters(redraw=False)
-        self.load_category()
+        if node is None:
+            # 品类表里没有这个大类。理论上不该发生(卡片就是从树上来的),
+            # 但真发生了也不能让用户点着一张卡片却什么都没发生 ——
+            # 退化成老行为:按文本筛。
+            self.crumb = [{"kind": "cat", "id": None, "name": name, "path": name}]
+            self.load_category()
+            return
+        self.crumb = [{"kind": "cat", "id": node["id"], "name": node["name"],
+                       "path": node["path"]}]
+        self._descend()
+
+    def manage_categories(self):
+        """开品类管理窗口;关掉之后菜单要按新的树重画。"""
+        dlg = CategoryManagerDialog(self, self.app)
+        self.wait_window(dlg)
+        self.reload()
 
     # ------------------------------------------------------ 二级页的筛选
 
@@ -857,10 +1012,29 @@ class ComponentsTab(ttk.Frame):
         在内存里拿字符串比,「100k」会被当成比「10k」小,区间就完全不对了。
         分面选项(封装/单位)也是后端按当前范围算的,只列真有的。
         """
-        name = self.current_category
-        if not name:
+        node = self._last_cat()
+        if node is None and self.current_category:
+            node = {"id": None, "name": self.current_category}
+        if node is None:
             return
-        query = {"category": name, "stocked": "1", "limit": "0", "sort": "value"}
+        # 进列表页就是 cat 模式。以前这一句写在 open_category 里,因为那时只有
+        # 它一条路会走到这儿;现在中间页也会,漏在这儿 refresh 之后就会按错的
+        # 模式去恢复路径(页面是列表页,view 却还写着 pick)。
+        self.view = "cat"
+        name = node["name"]
+        # 面包屑里的「封装」这一级要和实际筛选一致:点芯片和直接改下拉框是两条路,
+        # 但走过的路必须是同一条 —— 否则面包屑会写着 0603、表里却是全部
+        pkg_now = self._facet_value(self.f_pkg)
+        self.crumb = [c for c in self.crumb if c["kind"] != "pkg"]
+        if pkg_now:
+            self.crumb.append({"kind": "pkg", "name": pkg_now})
+        # 按 category_id 筛**整棵子树**:挂在子类下的元件文本仍然写着大类名,
+        # 只按文本筛的话,「挂在子类」和「直接挂在顶层」根本分不出来
+        query = {"stocked": "1", "limit": "0", "sort": "value"}
+        if node["id"] is None:
+            query["category"] = name
+        else:
+            query["category_id"] = str(node["id"])
         pkg, unit = self._facet_value(self.f_pkg), self._facet_value(self.f_unit)
         if pkg:
             query["package"] = pkg
@@ -884,8 +1058,12 @@ class ComponentsTab(ttk.Frame):
         facets = data.get("facets") or {}
         self._set_facet(self.cmb_pkg, facets.get("packages") or [], self.f_pkg)
         self._set_facet(self.cmb_unit, facets.get("units") or [], self.f_unit)
+        self._render_pkg_chips(facets.get("packages") or [])
 
-        glyph, color = CATEGORY_STYLE.get(name, DEFAULT_CAT_STYLE)
+        # 图标和颜色跟着**大类**走,子类沿用父类的 —— 否则同一支下面的
+        # 每个子类一个颜色,反而看不出它们是一家
+        root_name = self.crumb[0]["name"] if self.crumb else name
+        glyph, color = CATEGORY_STYLE.get(root_name, DEFAULT_CAT_STYLE)
         self.cat_badge.configure(text=glyph, bg=color if rows else DIM_BADGE)
         self.cat_title.set(name)
         summary = self._filter_summary()
@@ -895,8 +1073,37 @@ class ComponentsTab(ttk.Frame):
         else:
             # 空态要分清「这个大类本来就没货」和「是你筛掉了」
             self.cat_count.set(summary if summary else "暂无库存元件")
+        self._render_crumb()
         self._swap(self.page_cat)
         self._fill(rows)
+
+    def _render_pkg_chips(self, pkgs):
+        """封装这一级的菜单。选中的那个用 ● 标出来 —— ttk 按钮没有「按下」态,
+        而「我现在筛的是哪个封装」必须一眼看得到,不能只靠下拉框里那一行小字。"""
+        for w in self.pkg_bar.winfo_children():
+            w.destroy()
+        self.pkg_chips = {}
+        ttk.Label(self.pkg_bar, text="封装", style="Dim.TLabel").pack(side="left",
+                                                                    padx=(0, 6))
+        cur = self._facet_value(self.f_pkg)
+        if len(pkgs) > 14:
+            # 封装特别多的时候不给芯片了:一行几十个按钮比下拉框还难找
+            ttk.Label(self.pkg_bar, text=f"{len(pkgs)} 种封装,用右边的下拉框筛",
+                      style="Dim.TLabel").pack(side="left")
+            self.pkg_chips["__many__"] = None
+            return
+
+        def chip(label, value):
+            active = (cur == value)
+            btn = ttk.Button(self.pkg_bar, text=("● " if active else "   ") + label,
+                             width=max(6, len(label) + 5),
+                             command=lambda: self.pick_package(value))
+            btn.pack(side="left", padx=1)
+            self.pkg_chips[value] = btn
+
+        chip("全部", "")
+        for p in pkgs:
+            chip(p, p)
 
     def open_search(self):
         kw = self.q.get().strip()
@@ -941,8 +1148,16 @@ class ComponentsTab(ttk.Frame):
         # 首页固定列出 16 个标准大类;库里另有自定义品类或未分类的,补在后面
         meta = call(self.con, server.meta, quiet=True) or {}
         real = [c for c in ((meta.get("filters") or {}).get("categories") or []) if c]
+        # 品类表里用户自己加的顶层品类也要出现在首页 —— 不然他加完「传感器」
+        # 却在首页找不到入口,会以为没加上
+        try:
+            self._load_cat_tree()
+            real = list(real) + [n["name"] for n in self._cat_flat.values()
+                                 if n["parent_id"] is None]
+        except Exception:
+            pass
         names = list(CATEGORY_ORDER)
-        names += sorted(c for c in real if c not in CATEGORY_ORDER)
+        names += sorted({c for c in real if c and c not in CATEGORY_ORDER})
         if any(not c.strip() for c in real):
             names.append(UNCATEGORIZED)
         self._card_names = names
@@ -951,9 +1166,9 @@ class ComponentsTab(ttk.Frame):
         n = len(self._all)
         self.count.set(f"{n} 种在库元件" if n else "还没有元件入库")
 
-        if self.view == "cat":
+        if self.view in ("cat", "pick"):
             if self.current_category in self._card_names:
-                self.open_category(self.current_category)
+                self._reopen_path()
             else:
                 self.go_home()
         elif self.view == "search":
@@ -961,6 +1176,32 @@ class ComponentsTab(ttk.Frame):
                 self.open_search()
             else:
                 self.go_home()
+
+    def _reopen_path(self):
+        """刷新之后把用户留在原来那一层,而不是弹回首页。
+
+        为什么不能直接 open_category(current_category):那只回到大类那一级,
+        用户明明在看「电容 / 无极性陶瓷电容 / 0603」,刷一下(比如刚入完库)
+        就被弹回「电容」,得重新点两次 —— 这是最招人烦的一类小毛病。
+        """
+        path = list(self.crumb)
+        self._load_cat_tree()
+        self.crumb = []
+        for c in path:
+            if c["kind"] == "cat":
+                live = self._cat_flat.get(c.get("id"))
+                if live is None:
+                    break          # 这一级被删了,就停在上一个还在的层级
+                self.crumb.append({"kind": "cat", "id": live["id"],
+                                   "name": live["name"], "path": live["path"]})
+            else:
+                self.crumb.append(dict(c))
+        if not self.crumb:
+            self.go_home()
+            return
+        if not any(c["kind"] == "pkg" for c in self.crumb):
+            self.f_pkg.set(self.ALL)
+        self._descend()
 
     def _render_cards(self):
         specs = []
@@ -1829,6 +2070,137 @@ class BomPaneBase(ttk.Frame):
         return f"勾了 {n} 行,合计 {total} {unit}"
 
 
+class CategoryManagerDialog(tk.Toplevel):
+    """品类管理:加、改名、挪上级、删。
+
+    删的时候**绝不删元件** —— 先把它们挪到上一级,再删节点。用户要的是
+    「整理货架」,不是「连货一起扔」,所以确认框里会写清楚:
+    底下有几个元件、会挪到哪儿去。
+    """
+
+    COLS = [("name", "品类", 170, "w", True),
+            ("own", "直接挂", 62, "e", False),
+            ("total", "含子类", 62, "e", False),
+            ("path", "全路径", 240, "w", True)]
+
+    def __init__(self, parent, app: App):
+        super().__init__(parent)
+        self.app = app
+        self.con = app.con
+        self.title("品类管理")
+        self.transient(parent)
+        self.geometry("660x460")
+        self._flat = {}
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="品类是「按品类找料」和库存菜单的基础。加几级就有几级菜单。",
+                  style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
+        frame, self.tree = make_tree(body, self.COLS, height=12, show="tree headings")
+        self.tree.column("#0", width=180, anchor="w", stretch=True)
+        frame.pack(fill="both", expand=True)
+
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(8, 0))
+        ttk.Button(bar, text="＋ 子品类", command=self.add_child).pack(side="left")
+        ttk.Button(bar, text="＋ 顶级品类", command=self.add_root).pack(side="left", padx=6)
+        ttk.Button(bar, text="改名…", command=self.rename).pack(side="left", padx=6)
+        ttk.Button(bar, text="删除", command=self.remove).pack(side="left", padx=6)
+        ttk.Button(bar, text="关闭", command=self.destroy).pack(side="right")
+
+        self.hint = tk.StringVar()
+        ttk.Label(body, textvariable=self.hint, foreground="#b9770e",
+                  wraplength=600, justify="left").pack(anchor="w", pady=(6, 0))
+        self.reload()
+
+    def _call(self, fn, body=None, match=None):
+        return call(self.con, fn, body=body, match=match, parent=self)
+
+    def reload(self):
+        data = call(self.con, server.list_categories, quiet=True) or {}
+        self._flat = {n["id"]: n for n in (data.get("flat") or [])}
+        clear_tree(self.tree)
+
+        def put(node, parent_iid=""):
+            self.tree.insert(parent_iid, "end", iid=str(node["id"]), text=node["name"],
+                             open=True,
+                             values=(node["name"], node["own"], node["total"], node["path"]))
+            for ch in node.get("children") or []:
+                put(ch, str(node["id"]))
+
+        for n in data.get("items") or []:
+            put(n)
+        loose = int(data.get("loose") or 0)
+        self.hint.set(f"共 {len(self._flat)} 个品类节点。" +
+                      (f"另有 {loose} 个元件还没挂品类,它们不在菜单里 —— "
+                       f"在元件列表里能看到,编辑一下就能挂上。" if loose else ""))
+
+    def selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self._flat.get(int(sel[0]))
+
+    def add_root(self):
+        name = ask_text(self, "加顶级品类", "新品类叫什么?", "")
+        if not name:
+            return
+        if self._call(server.create_category, body={"name": name}) is not None:
+            self.hint.set(f"加好了「{name}」。")
+            self.reload()
+
+    def add_child(self):
+        node = self.selected()
+        if node is None:
+            self.hint.set("先在上面选中一个品类,再给它加子品类。")
+            return
+        name = ask_text(self, "加子品类",
+                        f"挂在「{node['path']}」下面的新子品类叫什么?", "")
+        if not name:
+            return
+        if self._call(server.create_category,
+                      body={"name": name, "parent_id": node["id"]}) is not None:
+            self.hint.set(f"加好了「{node['path']} / {name}」。")
+            self.reload()
+
+    def rename(self):
+        node = self.selected()
+        if node is None:
+            self.hint.set("先选中要改名的品类。")
+            return
+        name = ask_text(self, "改品类名", "新的名字:", node["name"])
+        if not name or name == node["name"]:
+            return
+        res = self._call(server.update_category, match=(node["id"],), body={"name": name})
+        if res is not None:
+            self.hint.set(f"改好了。{res.get('renamed_components') or 0} 个元件的品类跟着更新了。")
+            self.reload()
+
+    def remove(self):
+        node = self.selected()
+        if node is None:
+            self.hint.set("先选中要删的品类。")
+            return
+        n = int(node.get("total") or 0)
+        dest = "上一级品类" if node["parent_id"] else "「未分类」"
+        msg = f"删掉「{node['path']}」?"
+        kids = node.get("children") or []
+        if kids:
+            msg += f"\n\n它下面还有 {len(kids)} 个子品类,会一起删掉。"
+        if n:
+            # 这句必须写出来:用户点「删除」时最怕的就是把料一起删了
+            msg += (f"\n\n挂在它(含子类)下面的 {n} 个元件会挪到{dest},"
+                    f"**不会被删除**。")
+        if not messagebox.askyesno("确认删除", msg, parent=self):
+            return
+        res = self._call(server.delete_category, match=(node["id"],))
+        if res is not None:
+            self.hint.set(
+                f"删掉了。{res.get('moved_components') or 0} 个元件挪到了"
+                f"「{res.get('to')}」,一个都没丢。")
+            self.reload()
+
+
 class BomReceivePane(BomPaneBase):
     """按 BOM 收料:一箱货到了,勾掉收到了的,一次全收进来。
 
@@ -1842,16 +2214,23 @@ class BomReceivePane(BomPaneBase):
     SUBMIT = "✓ 勾选的全部入库"
     ONE = "✓ 只入库选中这一行"
 
+    # 列宽账(排版体检逐个量过):非拉伸列的合计必须小于最小窗口下的可用宽度
+    # (1060 宽时是 629),拉伸的「名称」才有地方可缩。加「参数」这一列之前
+    # 非拉伸合计是 540,得给参数留出 100 —— 办法是从几个本来就被截断的列里
+    # 各让几像素,而不是让新列把这张表撑破(超了就得横向拖才能看全)。
     COLS = [
         ("pick", "选", 34, "center", False),
-        ("name", "名称", 190, "w", True),
-        ("category", "品类", 82, "w", False),
-        ("value", "值", 68, "w", False),
-        ("package", "封装", 88, "w", False),
-        ("designators", "位号", 92, "w", False),
-        ("need", "BOM需求", 62, "e", False),
-        ("on_hand", "现有", 48, "e", False),
-        ("qty", "本次入库", 66, "e", False),
+        ("name", "名称", 170, "w", True),
+        ("category", "品类", 76, "w", False),
+        ("value", "值", 62, "w", False),
+        ("package", "封装", 78, "w", False),
+        # 属性合成一列显示(只放值,如「50V · ±5%」)。不给每个属性各开一列 ——
+        # 属性是用户自己加的,加几个都不该把这张表撑破。
+        ("params", "参数", 104, "w", False),
+        ("designators", "位号", 82, "w", False),
+        ("need", "BOM需求", 58, "e", False),
+        ("on_hand", "现有", 44, "e", False),
+        ("qty", "本次入库", 62, "e", False),
     ]
 
     def extra_tools(self, bar):
@@ -1956,7 +2335,8 @@ class BomReceivePane(BomPaneBase):
         for l in self.lines:
             if kw and kw not in " ".join(
                     str(l.get(k) or "") for k in
-                    ("name", "category", "value", "package", "designators")).lower():
+                    ("name", "category", "value", "package", "designators",
+                     "params")).lower():
                 continue
             shown += 1
             bid = l["bom_id"]
@@ -1965,7 +2345,8 @@ class BomReceivePane(BomPaneBase):
             self.tree.insert("", "end", iid=str(bid), values=(
                 CHECK_ON if on else CHECK_OFF, l.get("name") or "",
                 l.get("category") or "未分类", l.get("value") or "",
-                l.get("package") or "", l.get("designators") or "",
+                l.get("package") or "", attrs.fmt(l.get("params")),
+                l.get("designators") or "",
                 l.get("need") or 0, l.get("on_hand") or 0,
                 self.qty.get(bid, 0)),
                 tags=("done" if l.get("gap") == 0 else "short",))
@@ -2105,21 +2486,28 @@ class BomPickPane(BomPaneBase):
 
     SUBMIT = "✓ 按这个分配出库"
 
+    # 参数列和收料清单同宽同位置:两张表是同一件事的两半,列对不齐最难认。
+    # 非拉伸合计 34+76+68+86+104+50+68+58 = 544,小于最小窗口下的 629,
+    # 「像在哪儿」和树列这两根拉伸列还有余量可让。
     COLS = [
         ("pick", "选", 34, "center", False),
         ("category", "品类", 76, "w", False),
         ("value", "值", 68, "w", False),
         ("package", "封装", 86, "w", False),
+        ("params", "参数", 104, "w", False),
         ("on_hand", "库存", 50, "e", False),
         ("qty", "本次出库", 68, "e", False),
         ("left", "还需要", 58, "e", False),
-        ("match", "像在哪儿", 168, "w", True),
+        ("match", "像在哪儿", 110, "w", True),
     ]
 
     def build_tree(self):
         f, t = make_tree(self, self.COLS, height=13, show="tree headings")
         t.heading("#0", text="BOM 需求 ↓ 能凑它的库存料")
-        t.column("#0", width=196, anchor="w", stretch=True)
+        # 列宽账(和左边项目列表在同一个 Panedwindow 里,请求宽度涨了左边就被挤):
+        # 非拉伸 440 + 参数 104 + 树列 + 「像在哪儿」要 <= 加列之前的 804,
+        # 否则连左边那张只剩 2px 余量的项目表都会一起超。150 + 110 正好补齐。
+        t.column("#0", width=150, anchor="w", stretch=True)
         t.tag_configure("line", background="#eef4fb")
         t.tag_configure("covered", foreground="#1e7a34")
         t.tag_configure("own", foreground="#1e7a34")
@@ -2196,7 +2584,8 @@ class BomPickPane(BomPaneBase):
             bid = l["bom_id"]
             if kw and kw not in " ".join(
                     str(l.get(k) or "") for k in
-                    ("name", "category", "value", "package", "designators")).lower():
+                    ("name", "category", "value", "package", "designators",
+                     "params")).lower():
                 continue
             shown += 1
             rem, used = self.remain(bid), self.used(bid)
@@ -2213,6 +2602,7 @@ class BomPickPane(BomPaneBase):
             self.tree.insert("", "end", iid=str(bid), text=text, open=(bid in self._open),
                              values=("", l.get("category") or "未分类",
                                      l.get("value") or "", l.get("package") or "",
+                                     attrs.fmt(l.get("params")),
                                      l.get("available") or 0, used, rem, ""),
                              tags=tuple(tags))
             cands = l.get("candidates") or []
@@ -2222,7 +2612,7 @@ class BomPickPane(BomPaneBase):
                 # 第一个参数是父行 id:挂在需求下面,不然它会变成一条跟
                 # 需求平级的孤立行,看着像另一条 BOM。
                 self.tree.insert(str(bid), "end", iid=f"{bid}:none", text="",
-                                 values=("", "", "", "", "", "", rem,
+                                 values=("", "", "", "", "", "", "", rem,
                                          "库存里没有能凑它的料,得先入库或设替代料"),
                                  tags=("empty",))
                 continue
@@ -2236,6 +2626,9 @@ class BomPickPane(BomPaneBase):
                                      CHECK_ON if on else CHECK_OFF,
                                      c.get("category") or "未分类",
                                      c.get("value") or "", c.get("package") or "",
+                                     # 出库时最需要区分的正是「值封装一样、耐压不同」的两颗料 ——
+                                     # 候选料是 component_row() 来的,本来就带 params
+                                     attrs.fmt(c.get("params")),
                                      c.get("on_hand") or 0,
                                      self.alloc.get(key, ""), rem,
                                      c.get("match") or ""),
@@ -2765,6 +3158,8 @@ class LineDetail(ttk.Frame):
         self.line = None
         self.comp = None
         self._cats = []
+        self._cat_by_id = {}     # 品类 id -> 下拉里显示的那一行(全路径)
+        self._cat_map = {}       # 下拉里显示的那一行 -> 品类 id
 
         req = ttk.LabelFrame(self, text="这条需求", padding=5)
         req.pack(fill="x")
@@ -2785,7 +3180,11 @@ class LineDetail(ttk.Frame):
         box.pack(fill="x", pady=(8, 0))
         self.v2 = {}
         rows = [("值", "value"), ("封装", "package"), ("立创编号", "lcsc_pn"),
-                ("厂家料号", "mpn"), ("现有库存", "on_hand_total"), ("所在仓位", "locs")]
+                ("厂家料号", "mpn"),
+                # 用户自定义的属性(耐压 / 精度 / 功率 …)。收料清单那一列只放得下
+                # 值,完整的名=值在这里看 —— 属性填了总得有地方看全。
+                ("属性", "params"),
+                ("现有库存", "on_hand_total"), ("所在仓位", "locs")]
         for i, (label, key) in enumerate(rows):
             ttk.Label(box, text=label, style="Dim.TLabel").grid(
                 row=i, column=0, sticky="e", padx=(0, 4), pady=1)
@@ -2817,10 +3216,26 @@ class LineDetail(ttk.Frame):
     # ------------------------------------------------------------ 取值
 
     def category_options(self):
-        """品类候选 = 内置清单 + 库里已经在用的(和导入复核窗口同一份)。"""
-        if not self._cats:
-            meta = call(self.con, server.meta, quiet=True) or {}
-            self._cats = list(meta.get("categories") or [])
+        """品类候选 = 内置清单 + 库里已经在用的 + **树上每个节点的全路径**。
+
+        最后一项是给子类用的:只列顶层名的话,用户自己加过的「无极性陶瓷电容」
+        在这一栏里根本看不见,只能靠记忆打一个一字不差的名字。
+
+        故意不缓存:品类是随时会加的,缓存住的话刚加的子类要重启才出现。
+        这是本地进程内的一次查询(不走网络),值得。
+        """
+        meta = call(self.con, server.meta, quiet=True) or {}
+        opts = list(meta.get("categories") or [])
+        self._cat_by_id = {}
+        for n in meta.get("category_paths") or []:
+            # 顶层显示光名字(和以前一样,免得下拉里一堆「电阻 / ...」),
+            # 子类显示全路径 —— 同名子类挂在不同大类下时,只有路径分得清
+            label = n["path"] if n.get("parent_id") else n["name"]
+            self._cat_by_id[n["id"]] = label
+            if label not in opts:
+                opts.append(label)
+        self._cat_map = {v: k for k, v in self._cat_by_id.items()}
+        self._cats = opts
         return self._cats
 
     def clear(self):
@@ -2856,6 +3271,7 @@ class LineDetail(ttk.Frame):
         self.comp = comp or {}
         for key in ("value", "package", "lcsc_pn", "mpn"):
             self.v2[key].set(str(self.comp.get(key) or "—"))
+        self.v2["params"].set(attrs.fmt_full(self.comp.get("params")) or "—")
         stock = self.comp.get("stock_by_location") or []
         unit = self.comp.get("unit") or "个"
         total = sum(int(s.get("qty") or 0) for s in stock)
@@ -2863,7 +3279,10 @@ class LineDetail(ttk.Frame):
         self.v2["locs"].set("  ".join(f"{s.get('code')}:{s.get('qty')}" for s in stock)
                             or "库里一颗都没有")
         self.cb_cat.configure(values=self.category_options())
-        self.cat.set(str(self.comp.get("category") or ""))
+        # 挂在子类下的元件要显示全路径,不能只显示大类名 ——
+        # 否则这块面板看着像「它就在大类下」,和库存菜单里看到的不是一回事
+        self.cat.set(self._cat_by_id.get(self.comp.get("category_id"))
+                     or str(self.comp.get("category") or ""))
         self.tip.set("品类可以直接改,改完按回车或点「保存品类」。")
 
     # ------------------------------------------------------------ 存
@@ -2878,11 +3297,18 @@ class LineDetail(ttk.Frame):
                 "提示", "品类不能是空的。\n认不出来的话,填一个最接近的也比空着强 —— "
                         "空着以后搜不到它。", parent=self)
             return
-        if want == (self.comp.get("category") or ""):
+        cur_label = (self._cat_by_id.get(self.comp.get("category_id"))
+                     or str(self.comp.get("category") or ""))
+        if want == cur_label:
             self.app.set_status("品类没变,不用保存")
             return
+        body = {"category": want}
+        cat_id = self._cat_map.get(want)
+        if cat_id:
+            # 选的是子类就挂到子类上,不是挂到同名的大类上
+            body["category_id"] = cat_id
         res = call(self.con, server.update_component,
-                   match=(str(self.comp["id"]),), body={"category": want}, parent=self)
+                   match=(str(self.comp["id"]),), body=body, parent=self)
         if res is None:
             return
         old = self.comp.get("category") or "未分类"
@@ -3022,11 +3448,33 @@ class ProjectsTab(ttk.Frame):
             self._on_pick_project()
         else:
             # 一个项目都没有:两个方向的开单区要明确说「先在左边选一个项目」,
-            # 而不是留着上一次的项目 id 继续往旧项目里记账
+            # 而不是留着上一次的项目 id 继续往旧项目里记账。
+            # 只把 _pid 置空是不够的 —— 见 _clear_bom()。
             self._pid = None
+            self._clear_bom()
         # 会走到这里,往往是「刚开完单 / 刚撤销了一笔」—— 开单表上的「现有」
         # 和记录表都得跟着走。不能指望选中事件:选中的项目没变时它不发。
         self._sync_panes(force=True)
+
+    def _clear_bom(self):
+        """把「当前项目」这一摊显示全部清空。
+
+        删掉最后一个项目之后走这里。数据库那一层是干净的:`project_bom` 声明了
+        `ON DELETE CASCADE`,`db.connect()` 里也有 `PRAGMA foreign_keys = ON`,
+        实测删完项目 `project_bom` 一行不剩。残留全在界面上 ——
+
+        `t_bom` 里的行只在 `load_bom()` 里被 `clear_tree` 掉,而 `load_bom()`
+        第一句就是 `if not self._pid: return`:没有项目的时候它压根不会被调用,
+        于是表格、标题、缺料标签、详情面板会一起停在已删项目的内容上。
+        用户看到的就是「项目删了,BOM 明细没删」。
+        """
+        clear_tree(self.t_bom)
+        self._lines = {}
+        self.report = {}
+        self.title.set("（左侧选一个项目）")
+        self.shortage.set("")
+        self.lbl_shortage.configure(foreground="#c0392b")
+        self.detail.clear()
 
     def _has_project(self, iid):
         try:
@@ -3135,10 +3583,15 @@ class ProjectsTab(ttk.Frame):
         """
         for p in (getattr(self, "pane_in", None), getattr(self, "pane_out", None)):
             if p is not None:
+                # 先按「现在到底选着哪个项目」对齐,再决定要不要重刷,顺序不能反。
+                # refresh_panes() 是拿 pane **自己记着的** project_id 去重刷的,
+                # 项目被删掉之后那个 id 已经陈旧 —— 只调它会把一个不存在的项目
+                # 又刷回屏幕上,收料清单和分配树因此一直留着旧内容。
+                # set_project 对同一个项目是幂等的(见 MovePane.set_project),
+                # 项目没变时它直接返回,所以这条路径不会白重建一遍开单表。
+                p.set_project(self._pid)
                 if force:
                     p.refresh_panes()
-                else:
-                    p.set_project(self._pid)
 
     def load_bom(self):
         if not self._pid:
@@ -5248,6 +5701,23 @@ class ComponentDialog(tk.Toplevel):
             existing = call(self.con, server.get_component, match=(cid,), quiet=True) or {}
 
         meta = call(self.con, server.meta, quiet=True) or {}
+        self._meta = meta          # 属性名候选要用(见 attr_options)
+        self.cb_cat = None         # 品类下拉框,拿到引用才能挂刷新
+
+        # 品类下拉的候选:顶层名(含内置建议) + 树上每个节点的全路径。
+        # 只给顶层名的话,用户自己加过的子类在这儿是看不见的 —— 加了个寂寞。
+        self._cat_by_id = {}
+        labels = []
+        for n in meta.get("category_paths") or []:
+            label = n["path"] if n.get("parent_id") else n["name"]
+            self._cat_by_id[n["id"]] = label
+            if label not in labels:
+                labels.append(label)
+        self._cat_values = list(meta.get("categories") or [])
+        for label in labels:
+            if label not in self._cat_values:
+                self._cat_values.append(label)
+        self._cat_map = {v: k for k, v in self._cat_by_id.items()}
         locs = meta.get("locations") or []
         for loc in locs:
             self._loc_map[loc["path"]] = loc["id"]
@@ -5271,9 +5741,15 @@ class ComponentDialog(tk.Toplevel):
                                  values=[self.NO_LOC] + sorted(self._loc_map))
                 w.state(["readonly"])
             elif kind == "category":
-                var = tk.StringVar(value=str(existing.get(key) or ""))
+                # 编辑已有元件:显示它在树上的全路径。只显示大类名的话,
+                # 打开窗口什么都不动直接保存,子类归属就被冲回大类了。
+                cur_cat = str(existing.get(key) or "")
+                cid_cur = existing.get("category_id")
+                if cid_cur and cid_cur in self._cat_by_id:
+                    cur_cat = self._cat_by_id[cid_cur]
+                var = tk.StringVar(value=cur_cat)
                 w = ttk.Combobox(body, textvariable=var, width=32,
-                                 values=list(meta.get("categories") or []))
+                                 values=self._cat_values)
             elif kind == "supplier":
                 var = tk.StringVar(value=str(existing.get(key) or ""))
                 w = ttk.Combobox(body, textvariable=var, width=32, values=sup)
@@ -5283,17 +5759,38 @@ class ComponentDialog(tk.Toplevel):
                 w = ttk.Entry(body, textvariable=var, width=34)
             self.vars[key] = var
             w.grid(row=i, column=1, sticky="w", pady=3)
+            if kind == "category":
+                self.cb_cat = w
+
 
         r = len(self.FIELDS)
 
-        # 品类参数(耐压 / 精度 / 功率 …)。存成 JSON,所以加新参数不用改表结构。
-        ttk.Label(body, text="参数").grid(row=r, column=0, sticky="ne", padx=(0, 8), pady=3)
-        self.params = tk.Text(body, width=34, height=4, font=FONT)
-        self.params.grid(row=r, column=1, sticky="w", pady=3)
-        saved = existing.get("params") or {}
-        if isinstance(saved, dict):
-            self.params.insert("1.0", "\n".join(f"{k}={v}" for k, v in saved.items()))
-        ttk.Label(body, text="一行一个,写成  耐压=50V ,没参数就留空。",
+        # 属性(耐压 / 精度 / 功率 / 额定电流 / 饱和电流 …)。用户自己起名字,
+        # 想加什么加什么。存成 component.params 的 JSON,所以加新属性不用改表结构。
+        #
+        # 这里以前是一个 tk.Text,要用户背「一行一个,写成 耐压=50V」这个语法:
+        # 键名打错一个字不报错,只是静默多出一条属性;想删掉其中一条也只能整块
+        # 重打。现在是一张「名称 / 值」的小表,一行一个属性。
+        ttk.Label(body, text="属性").grid(row=r, column=0, sticky="ne", padx=(0, 8), pady=3)
+        self.attr_box = ttk.Frame(body)
+        self.attr_box.grid(row=r, column=1, sticky="w", pady=3)
+        self.attr_rows = []
+        head = ttk.Frame(self.attr_box)
+        head.pack(fill="x")
+        ttk.Label(head, text="名称", width=12, style="Dim.TLabel").pack(side="left")
+        ttk.Label(head, text="值", width=15, style="Dim.TLabel").pack(side="left", padx=(4, 0))
+        # 「＋ 加一个属性」先摆上,后面每加一行都插到它前面 —— 顺序才稳定
+        self.attr_btn = ttk.Button(self.attr_box, text="＋ 加一个属性", command=self.attr_add)
+        self.attr_btn.pack(anchor="w", pady=(2, 0))
+        saved = existing.get("params")
+        for _k, _v in (saved.items() if isinstance(saved, dict) else []):
+            self.attr_add(_k, _v)
+        if not self.attr_rows:
+            self.attr_add()            # 新元件也先给一行,免得人要找「怎么加」
+        if self.cb_cat is not None:
+            # 品类一改,属性名的候选跟着换(电感的「饱和电流」不该出现在电阻下面)
+            self.cb_cat.bind("<<ComboboxSelected>>", lambda _e: self.attr_refresh(), add="+")
+        ttk.Label(body, text="比如 耐压=50V、精度=±5%。名称能自己填,候选按品类给。",
                   style="Dim.TLabel").grid(row=r + 1, column=1, sticky="w")
 
         ttk.Label(body, text="备注").grid(row=r + 2, column=0, sticky="ne", padx=(0, 8), pady=3)
@@ -5321,16 +5818,64 @@ class ComponentDialog(tk.Toplevel):
         w, h = self.winfo_width(), self.winfo_height()
         self.geometry(f"+{px + (pw - w) // 2}+{py + max(0, (ph - h) // 4)}")
 
+    # ------------------------------------------------------------ 属性小表
+
+    def attr_options(self):
+        """属性名候选:库里这个品类下已经在用的 + 内置建议。
+
+        只是**候选**,不是白名单 —— 下拉框是可编辑的,光耦的「温度范围」、
+        传感器的「量程」这类推不出来的名字必须能自己写。只给固定清单的话,
+        用户只能挑一个最接近的凑合,等于把「它猜错了」换成「我被迫选了个不准确的」。
+        """
+        meta = getattr(self, "_meta", None) or {}
+        cat = (self.vars["category"].get() or "").strip() if "category" in self.vars else ""
+        by_cat = meta.get("attrs_by_category") or {}
+        extra = list(by_cat.get(cat) or [])
+        if not cat:
+            # 品类还没填:把整库用过的属性名都端上来,下拉不该是空的
+            extra = list(meta.get("attrs_all") or [])
+        return attrs.suggest(cat, extra)
+
+    def attr_add(self, name="", value=""):
+        """加一行属性。名称是可编辑下拉。"""
+        row = ttk.Frame(self.attr_box)
+        row.pack(fill="x", pady=1, before=self.attr_btn)
+        var_n = tk.StringVar(value=attrs.display_name(name))
+        var_v = tk.StringVar(value="" if value is None else str(value))
+        cb = ttk.Combobox(row, textvariable=var_n, width=12, values=self.attr_options())
+        cb.pack(side="left")
+        ttk.Entry(row, textvariable=var_v, width=15, font=FONT).pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="✕", width=3,
+                   command=lambda r=row: self.attr_del(r)).pack(side="left", padx=(4, 0))
+        self.attr_rows.append((row, cb, var_n, var_v))
+
+    def attr_del(self, row):
+        """删掉一行。控件和它那两个变量一起丢掉,免得 _parse_params 读到幽灵行。"""
+        self.attr_rows = [t for t in self.attr_rows if t[0] is not row]
+        row.destroy()
+
+    def attr_refresh(self):
+        """品类改了,属性名候选重算一遍。"""
+        opts = self.attr_options()
+        for _row, cb, _vn, _vv in self.attr_rows:
+            cb.configure(values=opts)
+
     def _parse_params(self):
+        """把小表读成 {名称: 值}。
+
+        * 名称空着的那一行直接丢掉 —— 点「＋ 加一个属性」多出来一行又没填,
+          不该存成一条空名字的属性
+        * 名称相同的行,后面的覆盖前面的
+        * **值空着也留着**:「这颗料的耐压还没填」是要记住的状态,
+          和「这颗料没有耐压这个属性」是两件事,后者才是把那一行删掉
+        * 名称按 attrs.norm 归一化后再合并,`耐压 ` 和 `耐压` 算同一个名字
+        """
         out = {}
-        for line in self.params.get("1.0", "end").splitlines():
-            line = line.strip()
-            if not line or "=" not in line:
+        for _row, _cb, var_n, var_v in self.attr_rows:
+            key = attrs.norm(var_n.get())
+            if not key:
                 continue
-            k, v = line.split("=", 1)
-            k, v = k.strip(), v.strip()
-            if k:
-                out[k] = v
+            out[key] = var_v.get().strip()
         return out
 
     def save(self):
@@ -5357,6 +5902,12 @@ class ComponentDialog(tk.Toplevel):
         body["default_loc_id"] = loc_id
         body["params"] = self._parse_params()
         body["note"] = self.note.get("1.0", "end").strip()
+        # 下拉里选的是树上哪个节点就挂到哪个节点。手打的词(_cat_map 里没有)
+        # 仍旧只发名字,由后端按名字找/建顶层节点 —— 这条路必须留着:
+        # 认不出来的品类(光耦、传感器模块)得能直接填。
+        cat_id = self._cat_map.get((body.get("category") or "").strip())
+        if cat_id:
+            body["category_id"] = cat_id
 
         if self.cid:
             res = call(self.con, server.update_component, body=body, match=(self.cid,), parent=self)

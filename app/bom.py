@@ -686,7 +686,7 @@ def build_report(con, project_id: int) -> dict:
         """SELECT b.id AS bom_id, b.component_id, b.required_qty, b.designators,
                   b.placed_qty, b.optional, b.consumable, b.attrition, b.setup_qty, b.note,
                   c.lcsc_pn, c.mpn, c.name, c.category, c.package, c.value, c.unit,
-                  c.unit_price, c.min_stock,
+                  c.unit_price, c.min_stock, c.params,
                   COALESCE((SELECT SUM(qty) FROM stock s
                              WHERE s.component_id = b.component_id), 0) AS on_hand,
                   COALESCE((SELECT SUM(pu.qty) FROM purchase pu
@@ -761,6 +761,9 @@ def build_report(con, project_id: int) -> dict:
             "optional": optional, "consumable": consumable,
             "attrition": attrition, "setup_qty": setup,
             "designators": r["designators"], "note": r["note"],
+            # 用户自定义的属性(耐压 / 精度 / 功率 …)。存的是 JSON,这里解成 dict
+            # 让界面直接用;收料清单要靠它把「这一盘 100nF 是 50V 还是 16V」显示出来。
+            "params": db.parse_params(r["params"]),
             "substitutes": subs,
             "ok": gap == 0,
         })

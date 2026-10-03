@@ -1291,6 +1291,161 @@ check("改完再导一次同一颗料,不会多长一条",
       CON.execute("SELECT COUNT(*) FROM component WHERE value='8.08k'").fetchone()[0], 1)
 
 
+p("\n【32】品类:能加能改能删、能搭层级,而且删品类绝不删元件")
+
+# 全新库起来时,内置品类就该建好了 —— 否则用户得先在一个空列表里
+# 自己敲十几个品类出来,才轮得到「挂元件」这件事
+_s, _t = call(server.list_categories)
+_seeded = [r["name"] for r in _t["flat"] if r["parent_id"] is None]
+check("内置品类在库里就建好了", set(bom.CATEGORIES) <= set(_seeded), True)
+check("树同时给出顶层和扁平两份(items 画菜单、flat 查路径)",
+      (len(_t["items"]) > 0, len(_t["flat"]) >= len(_t["items"])), (True, True))
+
+
+def cat_node(path):
+    """按全路径找节点。路径拼法由后端负责,自检这边只按结果找。"""
+    _s2, t2 = call(server.list_categories)
+    for r in t2["flat"]:
+        if r["path"] == path:
+            return r
+    return None
+
+
+def cat_ev(path):
+    _s2, t2 = call(server.list_categories)
+    for r in t2["flat"]:
+        if r["path"] == path:
+            return r
+    return {}
+
+
+# ---- 加一个二级品类
+cap = cat_node("电容")
+check("「电容」在树上(内置顶层节点)", cap is not None, True)
+_s, sub = call(server.create_category,
+               body={"name": "无极性陶瓷电容", "parent_id": cap["id"]})
+check("能加子品类", cat_node("电容 / 无极性陶瓷电容") is not None, True)
+check("加子品类不动顶层", cat_node("电容")["parent_id"], None)
+
+# ---- 把元件挂到子类上:文本必须还是「电容」
+_s, c1 = call(server.create_component, body={
+    "name": "SELFTEST-CAT-A", "category_id": sub["id"], "value": "1uF", "package": "0603"})
+_s, c2 = call(server.create_component, body={
+    "name": "SELFTEST-CAT-B", "category_id": sub["id"], "value": "2.2uF", "package": "0603"})
+check("挂到子类下,文本仍然是大类(按品类分组的地方一行都不用改)",
+      CON.execute("SELECT category FROM component WHERE id=?", (c1["id"],)).fetchone()[0],
+      "电容")
+check("而 category_id 指的就是那个子类节点",
+      CON.execute("SELECT category_id FROM component WHERE id=?", (c1["id"],)).fetchone()[0],
+      sub["id"])
+check("子类下的元件数会统计上来", cat_ev("电容 / 无极性陶瓷电容")["own"], 2)
+check("父类的 total 含子孙(删之前要靠它告诉用户会牵连多少)",
+      cat_ev("电容")["total"],
+      cat_ev("电容")["own"] + sum(c["total"] for c in cat_ev("电容")["children"]))
+check("但父类的 own 只算直接挂在它下面的",
+      cat_ev("电容")["own"] < cat_ev("电容")["total"], True)
+
+# ---- meta 要把全路径发出来,不然界面上的下拉选不到子类
+_s, mt = call(server.meta)
+check("meta 里带上了品类全路径",
+      any(p["path"] == "电容 / 无极性陶瓷电容" for p in mt.get("category_paths") or []),
+      True)
+check("顶层品类也在 categories 那份清单里(兼容老界面)", "电容" in mt["categories"], True)
+
+# ---- 改名:子类改名不动文本,顶层改名要动
+_s, _r = call(server.update_category, match=(sub["id"],),
+              body={"name": "陶瓷电容(无极性)"})
+check("子类改名后路径跟着变",
+      cat_node("电容 / 陶瓷电容(无极性)") is not None, True)
+check("子类改名不影响元件的文本(大类没变)",
+      CON.execute("SELECT category FROM component WHERE id=?", (c1["id"],)).fetchone()[0],
+      "电容")
+_s, _r = call(server.update_category, match=(cap["id"],),
+              body={"name": "电容(改名测试)"})
+check("顶层改名要报出影响了几个元件", _r["renamed_components"] >= 2, True)
+check("顶层改名:底下元件的文本跟着变(否则分组就和树对不上了)",
+      CON.execute("SELECT category FROM component WHERE id=?", (c1["id"],)).fetchone()[0],
+      "电容(改名测试)")
+check("连挂在子类下的那颗也跟着变(改的是整棵子树)",
+      CON.execute("SELECT category FROM component WHERE id=?", (c2["id"],)).fetchone()[0],
+      "电容(改名测试)")
+# 改回来,别影响后面的断言
+call(server.update_category, match=(cap["id"],), body={"name": "电容"})
+check("改回来之后文本也回到「电容」",
+      CON.execute("SELECT category FROM component WHERE id=?", (c1["id"],)).fetchone()[0],
+      "电容")
+
+# ---- 防呆:同层重名、挪到自己下面
+try:
+    call(server.create_category, body={"name": "电容"})
+    _dup = "没报错"
+except server.ApiError as e:
+    _dup = e.status
+check("同一层里重名会被挡住(否则用户会看到两个一模一样的节点)", _dup, 400)
+try:
+    call(server.create_category, body={"name": "陶瓷电容(无极性)", "parent_id": cap["id"]})
+    _dup2 = "没报错"
+except server.ApiError as e:
+    _dup2 = e.status
+check("同一层里重名(子类)也会被挡住", _dup2, 400)
+try:
+    call(server.update_category, match=(cap["id"],), body={"parent_id": sub["id"]})
+    _cyc = "没报错"
+except server.ApiError as e:
+    _cyc = e.status
+check("不能把品类挪进自己的子孙里(否则这棵树成环,谁也走不到顶)", _cyc, 400)
+
+# ---- 删子品类:元件往上挪,一颗不丢
+_n_before = CON.execute("SELECT COUNT(*) FROM component").fetchone()[0]
+_s, _d = call(server.delete_category, match=(sub["id"],))
+check("删子品类时报告挪走了几个元件", _d["moved_components"], 2)
+check("挪到哪儿也说得明明白白", _d["to"], "电容")
+check("一个元件都没被删 —— 删品类是「整理货架」,不是「扔东西」",
+      CON.execute("SELECT COUNT(*) FROM component").fetchone()[0], _n_before)
+check("它们落到了父类下面",
+      CON.execute("SELECT category_id FROM component WHERE id=?", (c1["id"],)).fetchone()[0],
+      cap["id"])
+check("子类确实没了", cat_node("电容 / 陶瓷电容(无极性)"), None)
+
+# ---- 填一个没见过的品类名:品类表里自动多一行
+_s, c3 = call(server.create_component, body={
+    "name": "SELFTEST-CAT-C", "category": "用户自己敲的品类", "value": "x", "package": "0603"})
+check("敲一个没见过的品类名,树上就多一个顶层节点",
+      cat_node("用户自己敲的品类") is not None, True)
+check("而且元件就挂在这一行上(不是挂了个空)",
+      CON.execute("SELECT category_id FROM component WHERE id=?", (c3["id"],)).fetchone()[0],
+      cat_node("用户自己敲的品类")["id"])
+
+# ---- 删顶层品类:落到「未分类」,元件照样不丢
+_s, _d2 = call(server.delete_category, match=(cat_node("用户自己敲的品类")["id"],))
+check("删顶层品类时,底下的料落到「未分类」", _d2["to"], "未分类")
+check("元件还在", CON.execute(
+    "SELECT COUNT(*) FROM component WHERE id=?", (c3["id"],)).fetchone()[0], 1)
+check("它的文本也跟着变成未分类", CON.execute(
+    "SELECT category FROM component WHERE id=?", (c3["id"],)).fetchone()[0], "未分类")
+check("未分类这一行是兜底,建出来了", cat_node("未分类") is not None, True)
+
+# ---- 野数据(没挂品类的元件)要能被发现,也要能被对账修好
+_loose_id = CON.execute(
+    "INSERT INTO component(name, category, value, package) VALUES(?,?,?,?)",
+    ("野数据", "其他", "0", "0603")).lastrowid
+CON.commit()
+_s, _t4 = call(server.list_categories)
+check("没挂品类的元件会被单独报数 —— 否则用户会在菜单里找不到它却不知道为什么",
+      _t4["loose"] >= 1, True)
+db.reconcile_categories(CON)
+_s, _t5 = call(server.list_categories)
+check("启动对账会把野数据挂回去", _t5["loose"], 0)
+
+# ---- 全库扫描:文本和树上顶层名字必须处处一致
+_mism = 0
+for _r in CON.execute("SELECT id, category, category_id FROM component "
+                      "WHERE category_id IS NOT NULL"):
+    _root = db.category_root(CON, _r["category_id"])
+    if _root is not None and (_root["name"] or "") != (_r["category"] or ""):
+        _mism += 1
+check("全库扫描:没有元件的品类文本和它在树上的顶层名字对不上", _mism, 0)
+
 CON.close()
 p("\n" + "=" * 62)
 p(f"结果:{'全部通过' if not FAILS else '失败 ' + str(len(FAILS)) + ' 项'}")
