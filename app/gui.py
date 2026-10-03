@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import sqlite3
 import sys
 import traceback
@@ -27,6 +28,7 @@ if BASE_DIR not in sys.path:
 
 import db          # noqa: E402
 import server      # noqa: E402  ← 复用全部业务逻辑
+import values      # noqa: E402  ← 值区间筛选要把 1k 这种写法解析成数值
 
 DEFAULT_DB = os.path.join(server.PROJECT_ROOT, "data", "parts.db")
 ICON_PATH = os.path.join(server.PROJECT_ROOT, "app", "static", "app.ico")
@@ -233,6 +235,7 @@ class App(tk.Tk):
 
         m_tool = tk.Menu(menubar, tearoff=0)
         m_tool.add_command(label="⚡ 快速入库…", accelerator="Ctrl+I", command=self.quick_in)
+        m_tool.add_command(label="📋 批量入库…", accelerator="Ctrl+B", command=self.batch_in)
         m_tool.add_separator()
         m_tool.add_command(label="按流水重建库存余额(校验)", command=self.rebuild_stock)
         m_tool.add_command(label="导出元件清单 CSV…", command=self.export_components)
@@ -247,10 +250,17 @@ class App(tk.Tk):
         self.config(menu=menubar)
         # 收货时手上可能还拿着袋子,让快捷键能一键到位
         self.bind_all("<Control-i>", lambda _e: self.quick_in())
+        self.bind_all("<Control-b>", lambda _e: self.batch_in())
         self.bind_all("<F5>", lambda _e: self.refresh_all())
 
     def quick_in(self):
         dlg = QuickInDialog(self, self)
+        self.wait_window(dlg)
+        if dlg.done:
+            self.refresh_all()
+
+    def batch_in(self):
+        dlg = BatchInDialog(self, self)
         self.wait_window(dlg)
         if dlg.done:
             self.refresh_all()
@@ -596,6 +606,7 @@ class ComponentsTab(ttk.Frame):
         # 「快速入库」放在最显眼的位置:收货那一刻就该把东西记下来,
         # 而不是等攒了一堆之后再补录 —— 补录是这类系统最常见的死法
         ttk.Button(head, text="⚡ 快速入库", command=self.quick_in).pack(side="right")
+        ttk.Button(head, text="📋 批量入库", command=self.batch_in).pack(side="right", padx=6)
         ttk.Button(head, text="＋ 新增元件", command=self.add).pack(side="right", padx=6)
         ttk.Button(head, text="刷新", command=self.reload).pack(side="right", padx=6)
 
@@ -631,6 +642,36 @@ class ComponentsTab(ttk.Frame):
         ttk.Button(head, text="＋ 新增元件", command=self.add).pack(side="right")
         ttk.Button(head, text="编辑", command=self.edit).pack(side="right", padx=6)
         ttk.Button(head, text="删除", command=self.delete).pack(side="right")
+
+        # 筛选栏。回答的是「我这个大类里到底有没有某一档的东西」——
+        # 比如「0805 的电阻里有没有 1k~10k 的」。比的是解析出来的数值,不是字符串。
+        bar = ttk.Frame(self.page_cat)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Label(bar, text="值").pack(side="left")
+        self.f_min = tk.StringVar()
+        self.f_max = tk.StringVar()
+        for var, tip in ((self.f_min, "≥"), (self.f_max, "≤")):
+            ttk.Label(bar, text=tip).pack(side="left", padx=(6, 2))
+            e = ttk.Entry(bar, textvariable=var, width=8)
+            e.pack(side="left")
+            e.bind("<Return>", lambda _e: self.load_category())
+        ttk.Label(bar, text="单位").pack(side="left", padx=(10, 4))
+        self.f_unit = tk.StringVar(value=self.ALL)
+        self.cmb_unit = ttk.Combobox(bar, textvariable=self.f_unit, width=6,
+                                     values=[self.ALL], state="readonly")
+        self.cmb_unit.pack(side="left")
+        self.cmb_unit.bind("<<ComboboxSelected>>", lambda _e: self.load_category())
+        ttk.Label(bar, text="封装").pack(side="left", padx=(10, 4))
+        self.f_pkg = tk.StringVar(value=self.ALL)
+        self.cmb_pkg = ttk.Combobox(bar, textvariable=self.f_pkg, width=14,
+                                    values=[self.ALL], state="readonly")
+        self.cmb_pkg.pack(side="left")
+        self.cmb_pkg.bind("<<ComboboxSelected>>", lambda _e: self.load_category())
+        ttk.Button(bar, text="清除筛选", command=self.clear_filters).pack(side="left", padx=10)
+        self.f_hint = tk.StringVar()
+        ttk.Label(bar, textvariable=self.f_hint, foreground="#b9770e").pack(side="left")
+        ttk.Label(bar, text="  (值可以写 1k / 10kΩ / 0.1uF)", style="Dim.TLabel").pack(
+            side="left")
 
         pane = ttk.Panedwindow(self.page_cat, orient="vertical")
         pane.pack(fill="both", expand=True)
@@ -707,11 +748,94 @@ class ComponentsTab(ttk.Frame):
     def open_category(self, name):
         self.view = "cat"
         self.current_category = name
+        self.clear_filters(redraw=False)
+        self.load_category()
+
+    # ------------------------------------------------------ 二级页的筛选
+
+    ALL = "(全部)"
+
+    def _facet_value(self, var):
+        v = var.get().strip()
+        return "" if v in ("", self.ALL) else v
+
+    def _set_facet(self, combo, options, var):
+        """下拉里放「(全部)」+ 当前范围里真有的值,并保留当前选中项。
+
+        选项来自后端按当前范围算出的分面,所以不会摆一堆选了也搜不到的空选项。
+        """
+        cur = var.get()
+        opts = [self.ALL] + list(options)
+        if cur and cur not in opts:
+            opts.append(cur)
+        combo.configure(values=opts)
+
+    def clear_filters(self, redraw=True):
+        self.f_min.set("")
+        self.f_max.set("")
+        self.f_unit.set(self.ALL)
+        self.f_pkg.set(self.ALL)
+        self.f_hint.set("")
+        if redraw and self.view == "cat":
+            self.load_category()
+
+    def _filter_summary(self):
+        bits = []
+        if self.f_min.get().strip():
+            bits.append(f"值 ≥ {self.f_min.get().strip()}")
+        if self.f_max.get().strip():
+            bits.append(f"值 ≤ {self.f_max.get().strip()}")
+        if self._facet_value(self.f_unit):
+            bits.append(f"单位 {self._facet_value(self.f_unit)}")
+        if self._facet_value(self.f_pkg):
+            bits.append(f"封装 {self._facet_value(self.f_pkg)}")
+        return "筛选:" + "  ".join(bits) if bits else ""
+
+    def load_category(self):
+        """按当前筛选重新向后端要这个大类在库的元件。
+
+        为什么不在内存里筛:值区间必须按解析出的数值比(value_num)。
+        在内存里拿字符串比,「100k」会被当成比「10k」小,区间就完全不对了。
+        分面选项(封装/单位)也是后端按当前范围算的,只列真有的。
+        """
+        name = self.current_category
+        if not name:
+            return
+        query = {"category": name, "stocked": "1", "limit": "0", "sort": "value"}
+        pkg, unit = self._facet_value(self.f_pkg), self._facet_value(self.f_unit)
+        if pkg:
+            query["package"] = pkg
+        if unit:
+            query["unit"] = unit
+        for key, var in (("value_min", self.f_min), ("value_max", self.f_max)):
+            text = var.get().strip()
+            if not text:
+                continue
+            num, _u = values.parse_value(text)
+            if num is None:
+                try:
+                    num = float(text)          # 也允许直接写纯数字
+                except ValueError:
+                    self.f_hint.set(f"「{text}」看不懂,值请写 1k / 10kΩ / 0.1uF 这种")
+                    return
+            query[key] = str(num)
+
+        data = call(self.con, server.list_components, query=query, quiet=True) or {}
+        rows = data.get("items") or []
+        facets = data.get("facets") or {}
+        self._set_facet(self.cmb_pkg, facets.get("packages") or [], self.f_pkg)
+        self._set_facet(self.cmb_unit, facets.get("units") or [], self.f_unit)
+
         glyph, color = CATEGORY_STYLE.get(name, DEFAULT_CAT_STYLE)
-        rows = self._cat_data.get(name, [])
         self.cat_badge.configure(text=glyph, bg=color if rows else DIM_BADGE)
         self.cat_title.set(name)
-        self.cat_count.set(f"共 {len(rows)} 种" if rows else "暂无库存元件")
+        summary = self._filter_summary()
+        if rows:
+            self.cat_count.set(f"共 {len(rows)} 种" + (f"   {summary}" if summary else ""))
+            self.f_hint.set("")
+        else:
+            # 空态要分清「这个大类本来就没货」和「是你筛掉了」
+            self.cat_count.set(summary if summary else "暂无库存元件")
         self._swap(self.page_cat)
         self._fill(rows)
 
@@ -722,21 +846,16 @@ class ComponentsTab(ttk.Frame):
             return
         self.view = "search"
         self.current_category = None
-        hits = [it for it in self._all if self._match(it, kw)]
+        # 走后端搜,不是内存里比字符串 —— 丝印、参数 JSON 只有后端才搜得到,
+        # 而拆机料恰恰只能靠丝印找回来
+        data = call(self.con, server.list_components,
+                    query={"q": kw, "limit": "0", "sort": "category"}, quiet=True) or {}
+        hits = data.get("items") or []
         self.cat_badge.configure(text="⌕", bg="#546e7a")
         self.cat_title.set(f"搜索:{kw}")
         self.cat_count.set(f"找到 {len(hits)} 种" if hits else "没找到")
         self._swap(self.page_cat)
         self._fill(hits)
-
-    @staticmethod
-    def _match(it, kw):
-        low = kw.lower()
-        for key in ("name", "lcsc_pn", "mpn", "manufacturer", "value",
-                    "package", "category", "note"):
-            if low in str(it.get(key) or "").lower():
-                return True
-        return False
 
     def _fill(self, rows):
         clear_tree(self.tree)
@@ -865,6 +984,12 @@ class ComponentsTab(ttk.Frame):
 
     def quick_in(self):
         dlg = QuickInDialog(self, self.app)
+        self.app.wait_window(dlg)
+        if dlg.done:
+            self.app.refresh_all()
+
+    def batch_in(self):
+        dlg = BatchInDialog(self, self.app)
         self.app.wait_window(dlg)
         if dlg.done:
             self.app.refresh_all()
@@ -1246,7 +1371,8 @@ class ProjectsTab(ttk.Frame):
 
         bar = ttk.Frame(self)
         bar.pack(fill="x", pady=(0, 6))
-        ttk.Button(bar, text="📥 导入 BOM (Altium .xlsx)", command=self.import_bom).pack(side="left")
+        ttk.Button(bar, text="📥 导入 BOM (.xlsx / .csv)",
+                   command=self.import_bom).pack(side="left")
         ttk.Button(bar, text="计划数量…", command=self.set_qty).pack(side="left", padx=6)
         ttk.Button(bar, text="按 BOM 领料", command=self.pick).pack(side="left")
         ttk.Button(bar, text="缺料转采购", command=self.to_purchase).pack(side="left", padx=6)
@@ -1487,8 +1613,11 @@ class ProjectsTab(ttk.Frame):
 
     def import_bom(self):
         path = filedialog.askopenfilename(
-            parent=self, title="选择 Altium 导出的 BOM",
-            filetypes=[("Excel 工作簿", "*.xlsx *.xlsm"), ("全部文件", "*.*")])
+            parent=self, title="选择 BOM 文件",
+            filetypes=[("BOM 文件", "*.xlsx *.xlsm *.csv *.tsv"),
+                       ("Excel 工作簿", "*.xlsx *.xlsm"),
+                       ("CSV(KiCad / EasyEDA / 立创)", "*.csv *.tsv"),
+                       ("全部文件", "*.*")])
         if not path:
             return
         try:
@@ -1510,8 +1639,11 @@ class ProjectsTab(ttk.Frame):
         if rep is None:
             return
         warn = rep.get("warnings") or []
+        # 报告里的字段名是 bom_lines;这里曾经写成 line_count,导入成功后必然 KeyError。
+        # 用 get 兜一下,免得以后再改字段名又炸一次。
+        lines = rep.get("bom_lines", rep.get("line_count", 0))
         msg = (f"项目:{rep['project_name']}\n"
-               f"BOM {rep['line_count']} 行,新建/复用元件 {rep.get('components_created', 0)} 个\n"
+               f"BOM {lines} 行,新建/复用元件 {rep.get('components_created', 0)} 个\n"
                f"总需求 {rep.get('total_qty', 0)}\n"
                f"警告 {len(warn)} 条")
         if warn:
@@ -1672,6 +1804,10 @@ class LocationsTab(ttk.Frame):
         ttk.Button(bar, text="＋ 加子仓位", command=self.add_child).pack(side="left", padx=6)
         ttk.Button(bar, text="编辑…", command=self.edit).pack(side="left")
         ttk.Button(bar, text="删除", command=self.delete).pack(side="left", padx=6)
+        # 实物清点:拿着一箱料挨个核对。放在这里是因为这事总是「一个抽屉一个抽屉」地做,
+        # 而不是「一个元件一个元件」地做。
+        ttk.Button(bar, text="📋 盘点这个仓位…",
+                   command=self.stocktake).pack(side="left", padx=(0, 6))
         ttk.Button(bar, text="刷新", command=self.reload).pack(side="left")
         ttk.Label(bar, text="入/出库时写一个不存在的仓位编码,会自动建一个顶层仓位。",
                   style="Dim.TLabel").pack(side="left", padx=12)
@@ -1808,6 +1944,15 @@ class LocationsTab(ttk.Frame):
         if dlg.done:
             self.app.refresh_all()
 
+    def stocktake(self):
+        if self._sid is None:
+            messagebox.showinfo("提示", "先在左边选一个要清的仓位。", parent=self)
+            return
+        dlg = StocktakeDialog(self, self.app, self._sid)
+        self.wait_window(dlg)
+        if dlg.done:
+            self.app.refresh_all()
+
     def delete(self):
         if self._sid is None:
             return
@@ -1907,6 +2052,493 @@ class LocationDialog(tk.Toplevel):
             return
         self.done = True
         self.destroy()
+
+
+# --------------------------------------------------------------------- 盘点
+
+
+class StocktakeDialog(tk.Toplevel):
+    """盘点一个仓位 —— 拿着一箱料挨个核对。
+
+    要点是**用键盘走一遍**:输入实数、回车,自动跳到下一个还没数的,
+    全程不用碰鼠标。所以焦点一直留在下面那个输入框,而不是表上。
+
+    对得上的行不写流水(否则流水会被几百条「没变」淹掉,真出事时反而查不出来),
+    只有差异才记账。「账面有但现在根本没数到」也算差异 —— 只要那一行你填了 0。
+    """
+
+    def __init__(self, parent, app, location_id):
+        super().__init__(parent)
+        self.app = app
+        self.con = app.con
+        self.lid = location_id
+        self.done = False
+        self.counts = {}
+        self._by_id = {}
+
+        data = call(self.con, server.location_contents, match=(location_id,),
+                    parent=self) or {}
+        self.loc = data.get("location") or {}
+        self.items = data.get("items") or []
+        self._by_id = {int(i["id"]): i for i in self.items}
+
+        if self.loc.get("structural"):
+            messagebox.showinfo(
+                "提示",
+                f"「{self.loc.get('code')}」是分层仓位,本身不装东西,没有实物可数。\n"
+                f"请盘点它下面的具体仓位。", parent=parent)
+            self.destroy()
+            return
+
+        self.title("盘点仓位")
+        self.transient(parent)
+        self.geometry("860x580")
+        body = ttk.Frame(self, padding=10)
+        body.pack(fill="both", expand=True)
+
+        head = ttk.Frame(body)
+        head.pack(fill="x")
+        ttk.Label(head, text=f"盘点「{data.get('path') or self.loc.get('code') or ''}」",
+                  style="Big.TLabel").pack(side="left")
+        self.summary = tk.StringVar()
+        ttk.Label(head, textvariable=self.summary, style="Dim.TLabel").pack(side="left",
+                                                                           padx=12)
+        ttk.Label(head, text="只把和账面不一样的行写成盘点流水",
+                  style="Dim.TLabel").pack(side="right")
+
+        frame, self.tree = make_tree(body, [
+            ("name", "名称", 205, "w", True),
+            ("lcsc_pn", "立创编号", 92, "center"),
+            ("value", "值", 68, "w"),
+            ("package", "封装", 82, "w"),
+            ("was", "账面", 58, "e"),
+            ("now", "实盘", 58, "e"),
+            ("diff", "差", 58, "e")], height=15)
+        frame.pack(fill="both", expand=True, pady=(8, 6))
+        self.tree.tag_configure("diff", background="#fdecea", foreground="#a93226")
+        self.tree.tag_configure("same", foreground="#7f8c8d")
+        self.tree.bind("<Double-1>", lambda _e: self.ent.focus_set())
+
+        for it in self.items:
+            cid = int(it["id"])
+            self.tree.insert("", "end", iid=str(cid), values=(
+                it.get("name") or "", it.get("lcsc_pn") or "", it.get("value") or "",
+                it.get("package") or "", int(it["qty"]), "", ""))
+        for it in self.items:
+            self._render_row(int(it["id"]))
+
+        foot = ttk.Frame(body)
+        foot.pack(fill="x")
+        ttk.Label(foot, text="现在数", style="Big.TLabel").pack(side="left", padx=(0, 6))
+        self.v_qty = tk.StringVar()
+        self.ent = ttk.Entry(foot, textvariable=self.v_qty, width=9,
+                             font=("Microsoft YaHei UI", 13))
+        self.ent.pack(side="left")
+        self.ent.bind("<Return>", lambda _e: self.apply())
+        self.cur = tk.StringVar()
+        ttk.Label(foot, textvariable=self.cur, foreground="#1a5276").pack(side="left",
+                                                                         padx=12)
+        ttk.Button(foot, text="保存盘点结果", command=self.save).pack(side="right")
+        ttk.Button(foot, text="全部重来", command=self.reset).pack(side="right", padx=6)
+
+        self.hint = tk.StringVar()
+        ttk.Label(body, textvariable=self.hint, foreground="#b9770e").pack(anchor="w",
+                                                                          pady=(6, 0))
+        ttk.Label(body, text="填实数,回车 → 自动跳到下一个;数不到就填 0。"
+                             "没数的行保持原样不动。",
+                  style="Dim.TLabel").pack(anchor="w")
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.selection_set(kids[0])
+        self.ent.focus_set()
+        self._summary()
+        self._show_current()
+
+    # ---------------------------------------------------------- 内部
+
+    def _render_row(self, cid):
+        it = self._by_id[cid]
+        was = int(it["qty"])
+        now = self.counts.get(cid)
+        if now is None:
+            diff, tags = "", ()
+        elif now == was:
+            diff, tags = "一致", ("same",)
+        else:
+            diff, tags = f"{now - was:+d}", ("diff",)
+        self.tree.item(str(cid), values=(
+            it.get("name") or "", it.get("lcsc_pn") or "", it.get("value") or "",
+            it.get("package") or "", was, "" if now is None else now, diff), tags=tags)
+
+    def _summary(self):
+        n, total = len(self.counts), len(self.items)
+        diffs = sum(1 for k, v in self.counts.items() if v != int(self._by_id[k]["qty"]))
+        bits = [f"已数 {n} / {total} 种"]
+        if diffs:
+            bits.append(f"{diffs} 处对不上")
+        if n < total:
+            bits.append(f"还有 {total - n} 种没数")
+        self.summary.set("   ".join(bits))
+
+    def _show_current(self):
+        sel = self.tree.selection()
+        if not sel:
+            self.cur.set("")
+            return
+        it = self._by_id.get(int(sel[0]))
+        if it:
+            self.cur.set(f"← {it['name']}(账面 {int(it['qty'])})")
+
+    def apply(self):
+        sel = self.tree.selection()
+        kids = list(self.tree.get_children())
+        if not sel or not kids:
+            return
+        iid = sel[0]
+        idx = kids.index(iid)
+        raw = self.v_qty.get().strip()
+        if raw != "":
+            try:
+                qty = int(raw)
+            except ValueError:
+                self.hint.set("实盘数要填整数;数不到就填 0。")
+                return
+            if qty < 0:
+                self.hint.set("实盘数不能是负数。")
+                return
+            self.counts[int(iid)] = qty
+            self._render_row(int(iid))
+            self.hint.set("")
+        self.v_qty.set("")
+        # 跳到「下一个还没数的」;后面没有了就绕回前面找
+        order = list(range(idx + 1, len(kids))) + list(range(0, idx))
+        nxt = next((kids[j] for j in order if int(kids[j]) not in self.counts), None)
+        if nxt is None:
+            if len(self.counts) >= len(kids):
+                self.hint.set("这一格全数完了,点「保存盘点结果」。")
+            nxt = iid
+        self.tree.selection_set(nxt)
+        self.tree.see(nxt)
+        self.ent.focus_set()
+        self._summary()
+        self._show_current()
+
+    def reset(self):
+        self.counts.clear()
+        for cid in self._by_id:
+            self._render_row(cid)
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.selection_set(kids[0])
+            self.tree.see(kids[0])
+        self.v_qty.set("")
+        self.hint.set("")
+        self._summary()
+        self._show_current()
+        self.ent.focus_set()
+
+    def save(self):
+        if not self.counts:
+            messagebox.showinfo("提示", "还没数任何一项。", parent=self)
+            return
+        if len(self.counts) < len(self.items) and not messagebox.askyesno(
+                "只数了一部分",
+                f"这一格有 {len(self.items)} 种,你只数了 {len(self.counts)} 种。\n"
+                f"没数到的保持原样不动。\n\n确定就这样保存吗?", parent=self):
+            return
+        items = [{"component_id": cid, "qty": q}
+                 for cid, q in sorted(self.counts.items())]
+        res = call(self.con, server.stocktake_location, body={"items": items},
+                   match=(self.lid,), parent=self)
+        if res is None:
+            return
+        self.done = True
+        self.app.set_status(
+            f"盘点完成:{res['location']} 数了 {res['checked']} 种,"
+            f"{res['changed']} 处差异已记账", 6)
+        msg = f"数了 {res['checked']} 种。\n\n"
+        if res["changed"]:
+            msg += f"有 {res['changed']} 处和账面不一样,已经写成盘点流水:\n\n"
+            msg += "\n".join(f"  {d['name']}:账面 {d['was']} → 实盘 {d['now']}"
+                             for d in res["diffs"][:12])
+            if len(res["diffs"]) > 12:
+                msg += f"\n  … 还有 {len(res['diffs']) - 12} 处"
+        else:
+            msg += "全部和账面一致,没有差异,所以没写流水。"
+        messagebox.showinfo("盘点结果", msg, parent=self)
+        self.destroy()
+
+
+LINE_QTY_RE = re.compile(r"[x×*]\s*(\d+)\s*$", re.IGNORECASE)
+
+
+def parse_batch_line(line):
+    """把人写的一行拆成 (描述, 数量)。
+
+    数量的写法:
+      * 「10k 0603 x50」—— x / × / * 后面跟数字,最明确
+      * 直接从表格里复制粘贴时(有制表符),最后一列是纯数字就当数量
+    故意不把「行尾裸数字」当数量:那样「100nF 0805」会被读成数量 805。
+    拿不准的一律按 1 算,反正预览表里可以改。
+    """
+    text = (line or "").strip()
+    if not text or text.startswith("#"):
+        return None
+    qty = 1
+    if "\t" in text:
+        parts = [p.strip() for p in text.split("\t") if p.strip()]
+        if len(parts) >= 2 and parts[-1].isdigit():
+            qty = int(parts[-1])
+            parts = parts[:-1]
+        text = " ".join(parts)
+    else:
+        m = LINE_QTY_RE.search(text)
+        if m:
+            qty = int(m.group(1))
+            text = text[:m.start()].strip()
+    if not text:
+        return None
+    return text, max(qty, 1)
+
+
+class BatchInDialog(tk.Toplevel):
+    """批量入库 —— 收到一整箱货、或者对着采购单一次性录进来。
+
+    流程是「先解析、再预览、最后才入库」:先把每行对到库里的一条元件上给你看,
+    你确认(或者改数量、改匹配)之后再落库。批量操作最怕的就是「猜错了还悄悄
+    记进去」——几十条料进错地方,事后极难发现,所以宁可多停一步。
+    """
+
+    def __init__(self, parent, app: App):
+        super().__init__(parent)
+        self.app = app
+        self.con = app.con
+        self.done = False
+        self.rows = []
+
+        self.title("批量入库 —— 粘贴一整张单子")
+        self.transient(parent)
+        self.geometry("960x700")
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text="批量入库", style="Big.TLabel").pack(anchor="w")
+        ttk.Label(body, text="一行一个料,数量写成 x50;也可以直接从表格里"
+                             "复制粘贴(最后一列是数字就当数量)。",
+                  style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
+
+        box = ttk.Frame(body)
+        box.pack(fill="x")
+        self.txt = tk.Text(box, height=8, wrap="none",
+                           font=("Consolas", 10))
+        self.txt.pack(side="left", fill="x", expand=True)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="left", fill="y")
+        self.txt.insert("1.0",
+                        "10k 0603 x50\n"
+                        "100nF 0805 x20\n"
+                        "STM32F103C8T6 x2\n")
+
+        ctl = ttk.Frame(body)
+        ctl.pack(fill="x", pady=6)
+        ttk.Button(ctl, text="解析预览", command=self.parse).pack(side="left")
+        ttk.Label(ctl, text="   放进").pack(side="left")
+        meta = call(self.con, server.meta, quiet=True) or {}
+        self._loc_paths = {l["id"]: l["path"] for l in (meta.get("locations") or [])}
+        self.v_loc = tk.StringVar()
+        ttk.Combobox(ctl, textvariable=self.v_loc, width=20,
+                     values=[l["path"] for l in (meta.get("locations") or [])]).pack(
+            side="left", padx=4)
+        ttk.Label(ctl, text="(留空 = 各料自己的默认仓位)", style="Dim.TLabel").pack(
+            side="left")
+        ttk.Button(ctl, text="清空", command=lambda: self.txt.delete("1.0", "end")).pack(
+            side="right")
+
+        f, self.tree = make_tree(body, [
+            ("line", "输入", 185, "w", True),
+            ("match", "匹配到", 215, "w", True),
+            ("on_hand", "现有", 52, "e"),
+            ("qty", "数量", 52, "e"),
+            ("note", "说明", 165, "w", True)], height=12)
+        f.pack(fill="both", expand=True)
+        self.tree.tag_configure("new", foreground="#1e8449")
+        self.tree.tag_configure("bad", background="#fdecea", foreground="#a93226")
+        self.tree.tag_configure("many", background="#fef5e7", foreground="#b9770e")
+        self.tree.bind("<Double-1>", lambda _e: self.pick_match())
+
+        edit = ttk.Frame(body)
+        edit.pack(fill="x", pady=(6, 0))
+        ttk.Label(edit, text="改选中行的数量").pack(side="left")
+        self.v_qty = tk.StringVar()
+        self.ent = ttk.Entry(edit, textvariable=self.v_qty, width=8)
+        self.ent.pack(side="left", padx=4)
+        self.ent.bind("<Return>", lambda _e: self.set_qty())
+        ttk.Button(edit, text="改", command=self.set_qty).pack(side="left")
+        ttk.Button(edit, text="换一个匹配…", command=self.pick_match).pack(side="left",
+                                                                          padx=8)
+        ttk.Button(edit, text="全部入库", command=self.commit).pack(side="right")
+        self.hint = tk.StringVar()
+        ttk.Label(body, textvariable=self.hint, foreground="#b9770e").pack(anchor="w",
+                                                                          pady=(6, 0))
+        ttk.Label(body, text="双击一行可以手动指定它对应哪个元件。"
+                             "「多项匹配」的行不会入库,除非你先指定。",
+                  style="Dim.TLabel").pack(anchor="w")
+
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        self.txt.focus_set()
+
+    # ---------------------------------------------------------- 解析
+
+    def parse(self):
+        lines = self.txt.get("1.0", "end").splitlines()
+        self.rows = []
+        for raw in lines:
+            parsed = parse_batch_line(raw)
+            if not parsed:
+                continue
+            text, qty = parsed
+            res = call(self.con, server.resolve_component, query={"q": text},
+                       quiet=True) or {}
+            self.rows.append({
+                "text": text, "qty": qty,
+                "match": res.get("match"), "how": res.get("how") or "none",
+                "candidates": res.get("candidates") or [],
+            })
+        self.render()
+
+    def render(self):
+        clear_tree(self.tree)
+        for i, r in enumerate(self.rows):
+            m = r["match"]
+            if m:
+                matched = f"{m['name']}"
+                note = "精确命中" if str(r["how"]).startswith("exact") else "唯一命中"
+                tag = ()
+            elif r["how"] == "ambiguous":
+                matched = "?"
+                note = f"{len(r['candidates'])} 项匹配,请手动指定"
+                tag = ("many",)
+            else:
+                matched = f"(新建) {r['text']}"
+                note = "库里没有,入库时按这个名字新建"
+                tag = ("new",)
+            self.tree.insert("", "end", iid=str(i), values=(
+                r["text"], matched, (m or {}).get("on_hand") if m else "",
+                r["qty"], note), tags=tag)
+        todo = sum(1 for r in self.rows if r["match"] or r["how"] == "none")
+        blocked = sum(1 for r in self.rows if r["how"] == "ambiguous")
+        self.hint.set(f"解析出 {len(self.rows)} 行,可入库 {todo} 行"
+                      + (f",{blocked} 行要多项匹配需要你指定" if blocked else "")
+                      if self.rows else "还没有内容,先粘点东西进来再点「解析预览」。")
+
+    # ---------------------------------------------------------- 编辑
+
+    def _sel(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先点一行。", parent=self)
+            return None
+        return self.rows[int(sel[0])]
+
+    def set_qty(self):
+        r = self._sel()
+        if r is None:
+            return
+        try:
+            qty = int(self.v_qty.get() or 0)
+        except ValueError:
+            messagebox.showinfo("提示", "数量要填整数。", parent=self)
+            return
+        if qty <= 0:
+            messagebox.showinfo("提示", "数量要大于 0。", parent=self)
+            return
+        r["qty"] = qty
+        self.v_qty.set("")
+        self.render()
+        self.hint.set(f"「{r['text']}」数量改成 {qty}")
+
+    def pick_match(self):
+        r = self._sel()
+        if r is None:
+            return
+        pk = ComponentPicker(self, self.app, f"给「{r['text']}」指定元件", initial=r["text"])
+        self.wait_window(pk)
+        if not pk.result:
+            return
+        got = call(self.con, server.get_component, match=(str(pk.result),), quiet=True) or {}
+        # get_component 返回的可能是 {component: …} 也可能是元件本身,两种都兜住
+        comp = got.get("component") or got.get("item") or got
+        if not comp or not comp.get("id"):
+            comp = call(self.con, server.resolve_component,
+                        query={"q": str(pk.result)}, quiet=True)
+            comp = (comp or {}).get("match")
+        if comp and comp.get("id"):
+            r["match"] = comp
+            r["how"] = "manual"
+            self.render()
+            self.hint.set(f"「{r['text']}」已指定为「{comp['name']}」")
+
+    # ---------------------------------------------------------- 入库
+
+    def commit(self):
+        if not self.rows:
+            messagebox.showinfo("提示", "先点「解析预览」。", parent=self)
+            return
+        blocked = [r for r in self.rows if not r["match"] and r["how"] == "ambiguous"]
+        ready = [r for r in self.rows if r["match"] or r["how"] == "none"]
+        if blocked and not messagebox.askyesno(
+                "还有没指定的",
+                f"有 {len(blocked)} 行是多匹配,还没指定对应哪个元件,这次会跳过。\n\n"
+                + "\n".join(f"  {r['text']}({len(r['candidates'])} 项匹配)"
+                            for r in blocked[:8])
+                + "\n\n继续入库其余的 " + f"{len(ready)} 行吗?", parent=self):
+            return
+        if not ready:
+            messagebox.showinfo("提示", "没有可入库的行。", parent=self)
+            return
+
+        loc = self.v_loc.get().strip()
+        created = stocked = 0
+        total = 0
+        failed = []
+        for r in ready:
+            cid = (r["match"] or {}).get("id")
+            if not cid:
+                made = call(self.con, server.create_component,
+                            body={"name": r["text"], "category": "未分类"},
+                            parent=self)
+                if not made:
+                    failed.append(r["text"])
+                    continue
+                cid = made["id"]
+                created += 1
+            body = {"kind": "IN", "component_id": cid, "qty": r["qty"]}
+            if loc:
+                body["location"] = loc
+            if call(self.con, server.stock_move, body=body, parent=self) is None:
+                failed.append(r["text"])
+                continue
+            stocked += 1
+            total += r["qty"]
+        self.done = True
+        self.app.set_status(
+            f"批量入库完成:{stocked} 种 / {total} 个(其中新建 {created} 个元件)", 8)
+        msg = (f"入库 {stocked} 种,共 {total} 个。\n"
+               + (f"其中新建了 {created} 个元件(只填了名称,归到「未分类」)。\n"
+                  if created else ""))
+        if blocked:
+            msg += f"\n跳过 {len(blocked)} 行(多匹配未指定)。\n"
+        if failed:
+            msg += "\n失败:" + "、".join(failed[:8])
+        messagebox.showinfo("批量入库", msg, parent=self)
+        self.app.refresh_all()
+        if not failed:
+            self.destroy()
 
 
 # --------------------------------------------------------------------- 总览
@@ -2433,7 +3065,7 @@ class SubstituteDialog(tk.Toplevel):
 class ComponentPicker(tk.Toplevel):
     """从库里挑一个元件。搜索支持名称 / 立创编号 / 厂家料号 / 值 / 封装。"""
 
-    def __init__(self, parent, app: App, title="选一个元件"):
+    def __init__(self, parent, app: App, title="选一个元件", initial=None):
         super().__init__(parent)
         self.app = app
         self.con = app.con
@@ -2441,14 +3073,14 @@ class ComponentPicker(tk.Toplevel):
 
         self.title(title)
         self.transient(parent)
-        self.geometry("760x500")
+        self.geometry("800x520")
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
 
         sbox = ttk.Frame(body)
         sbox.pack(fill="x", pady=(0, 6))
         ttk.Label(sbox, text="搜索").pack(side="left", padx=(0, 4))
-        self.q = tk.StringVar()
+        self.q = tk.StringVar(value=initial or "")
         ent = ttk.Entry(sbox, textvariable=self.q, width=36)
         ent.pack(side="left")
         ent.bind("<Return>", lambda _e: self.reload())
@@ -2519,7 +3151,7 @@ class QuickInDialog(tk.Toplevel):
 
         self.title("快速入库 —— 收货就用它")
         self.transient(parent)
-        self.geometry("760x540")
+        self.geometry("800x560")
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
 

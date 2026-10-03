@@ -684,6 +684,269 @@ def main() -> int:
         check("Ctrl+I 绑上了快速入库", bool(app.bind_all("<Control-i>")), True)
         check("F5 绑上了刷新全部", bool(app.bind_all("<F5>")), True)
 
+        p("\n【17】二级页的值区间 / 封装筛选")
+        app.nb.select(app.tab_comp)
+        app.update()
+        tab.open_category(cat0)
+        app.update()
+        cols = [tab.tree.heading(c)["text"] for c in tab.tree["columns"]]
+        k_val = cols.index("值")
+        # 用一组跨数量级的阻值:按字符串比的话 "100k" < "10k",区间就全错了
+        made = []
+        for v, pkg in (("100", "0603"), ("1k", "0603"), ("10k", "0603"),
+                       ("100k", "0805"), ("1M", "0805")):
+            c = API(server.create_component, body={
+                "name": f"筛选用 {v}Ω", "category": "筛选测试类",
+                "value": f"{v}Ω", "package": pkg})
+            API(server.stock_move, body={"kind": "IN", "component_id": c["id"],
+                                         "qty": 10})
+            made.append(c["id"])
+        app.refresh_all()
+        tab.open_category("筛选测试类")
+        app.update()
+        check("5 个筛选样例都在", len(tab.tree.get_children()), 5)
+
+        tab.f_min.set("500")
+        tab.f_max.set("2000")
+        tab.load_category()
+        app.update()
+        check("值 500~2000 只剩 1k 那一个", len(tab.tree.get_children()), 1)
+        check("剩下的确实是 1kΩ",
+              tab.tree.item(tab.tree.get_children()[0], "values")[k_val], "1kΩ")
+        p("  ↑ 按字符串比的话 100k 会落进这个区间")
+
+        tab.f_min.set("1k")
+        tab.f_max.set("100k")
+        tab.load_category()
+        app.update()
+        check("也认工程记号:1k~100k 命中 3 个",
+              len(tab.tree.get_children()), 3)
+        check("筛选状态写在了计数旁边", "值 ≥ 1k" in tab.cat_count.get(), True)
+
+        tab.clear_filters()
+        app.update()
+        check("清除筛选后恢复 5 个", len(tab.tree.get_children()), 5)
+        check("单位下拉里只有 Ω(范围里真有的)",
+              list(tab.cmb_unit.cget("values")), [tab.ALL, "Ω"])
+        check("封装下拉里是 0603 / 0805",
+              sorted(tab.cmb_pkg.cget("values")[1:]), ["0603", "0805"])
+
+        tab.f_pkg.set("0805")
+        tab.load_category()
+        app.update()
+        check("按封装筛出 2 个 0805", len(tab.tree.get_children()), 2)
+        check("筛选时封装下拉仍然列着 0603(不会被自己筛掉)",
+              "0603" in list(tab.cmb_pkg.cget("values")), True)
+        p("  ↑ 分面按「范围」算而不是按「结果」算,否则选定一个封装后别的就消失了")
+
+        tab.f_min.set("瞎写")
+        tab.load_category()
+        app.update()
+        check("值写错了给提示,而不是把表清空",
+              "看不懂" in tab.f_hint.get(), True)
+        check("值写错时表不动(还是那 2 行)",
+              len(tab.tree.get_children()), 2)
+
+        tab.clear_filters()
+        app.update()
+        tab.go_home()
+        app.update()
+        check("返回首页后筛选被清掉", tab.f_min.get(), "")
+
+        p("\n【18】按仓位盘点(实物清点,键盘走一遍)")
+
+        class FakeBox:
+            """把弹窗换成记账本 —— 顺便保证自检永远不会被一个模态框卡死。"""
+
+            def __init__(self):
+                self.infos, self.warns, self.asks, self.answer = [], [], [], True
+
+            def _fire(self, box, title, msg, **_kw):
+                box.append((title, msg))
+                return True
+
+            def showinfo(self, title, msg, **kw):
+                return self._fire(self.infos, title, msg, **kw)
+
+            def showwarning(self, title, msg, **kw):
+                return self._fire(self.warns, title, msg, **kw)
+
+            def showerror(self, title, msg, **kw):
+                return self._fire(self.warns, title, msg, **kw)
+
+            def askyesno(self, title, msg, **kw):
+                self.asks.append((title, msg))
+                return self.answer
+
+        real_box = gui.messagebox
+        box = FakeBox()
+        gui.messagebox = box
+        try:
+            dloc = API(server.create_location,
+                       body={"code": "盘点抽屉", "name": "盘点抽屉"})
+            API(server.stock_move, body={"kind": "IN", "component_id": made[0],
+                                         "qty": 9, "location": "盘点抽屉"})
+            API(server.stock_move, body={"kind": "IN", "component_id": made[1],
+                                         "qty": 4, "location": "盘点抽屉"})
+            app.refresh_all()
+            app.nb.select(app.tab_loc)
+            app.update()
+            loc_tab = app.tab_loc
+            loc_tab.reload()
+            app.update()
+
+            def find_iid(tree, node=""):
+                for i in tree.get_children(node):
+                    if str(tree.item(i, "text")) == "盘点抽屉":
+                        return i
+                    hit = find_iid(tree, i)
+                    if hit:
+                        return hit
+                return None
+
+            node = find_iid(loc_tab.tree)
+            check("新仓位出现在仓位树上", node is not None, True)
+            loc_tab.tree.selection_set(node)
+            app.update()
+            check("选中仓位后记住了它", loc_tab._sid, dloc["id"])
+            check("右边的内容表列出了这个抽屉里的 2 种",
+                  len(loc_tab.t_contents.get_children()), 2)
+
+            sk = gui.StocktakeDialog(loc_tab, app, dloc["id"])
+            sk.update()
+            check("盘点窗列出了账面有的 2 种", len(sk.tree.get_children()), 2)
+            check("还没数时计数是 0 / 2", "已数 0 / 2 种" in sk.summary.get(), True)
+
+            first, second = sk.tree.get_children()
+            sk.tree.selection_set(first)
+            sk.v_qty.set("7")
+            sk.apply()
+            sk.update()
+            check("填完就记下", sk.counts.get(int(first)), 7)
+            check("差异行打上红标", "diff" in sk.tree.item(first, "tags"), True)
+            check("焦点自动跳到下一个还没数的", sk.tree.selection()[0], second)
+            check("输入框自动清空,接着数下一个", sk.v_qty.get(), "")
+            check("计数变成 1 / 2", "已数 1 / 2 种" in sk.summary.get(), True)
+
+            sk.tree.selection_set(second)
+            sk.v_qty.set("0")
+            sk.apply()
+            sk.update()
+            check("数不到就填 0(账面有、实物没有也是差异)", sk.counts.get(int(second)), 0)
+            check("全数完后给出提示", "全数完" in sk.hint.get(), True)
+            check("计数变成 2 / 2", "已数 2 / 2 种" in sk.summary.get(), True)
+
+            sk.tree.selection_set(second)
+            sk.v_qty.set("x")
+            sk.apply()
+            check("非整数被挡下并提示", "整数" in sk.hint.get(), True)
+            check("挡下时不会写脏数据", sk.counts.get(int(second)), 0)
+
+            sk.save()
+            check("保存后窗口自动关闭", bool(sk.winfo_exists()), False)
+            check("给出了盘点结果", len(box.infos) > 0, True)
+            check("结果里报出了 2 处差异", "2 处" in box.infos[-1][1], True)
+
+            got = {r["component_id"]: r["qty"] for r in app_con.execute(
+                "SELECT component_id, qty FROM stock WHERE location_id=?",
+                (dloc["id"],)).fetchall()}
+            check("第一个被盘成 7", got.get(made[0]), 7)
+            check("第二个被盘成 0(行保留,只是数量归零)", got.get(made[1]), 0)
+            check("正好写了 2 条盘点流水",
+                  app_con.execute("SELECT COUNT(*) FROM movement "
+                                  "WHERE kind='ADJUST' AND location_id=?",
+                                  (dloc["id"],)).fetchone()[0], 2)
+            check("没数到的种类不会被动到(IN 流水还在)",
+                  app_con.execute("SELECT COUNT(*) FROM movement "
+                                  "WHERE kind='IN' AND location_id=?",
+                                  (dloc["id"],)).fetchone()[0], 2)
+
+            # 分层仓位本身没有实物可数
+            scab = API(server.create_location,
+                       body={"code": "盘点柜", "structural": 1})
+            sk2 = gui.StocktakeDialog(loc_tab, app, scab["id"])
+            sk2.update()
+            check("分层仓位直接拒绝,并说清原因", "分层" in box.infos[-1][1], True)
+            sk2.destroy()
+        finally:
+            gui.messagebox = real_box
+
+        p("\n【19】批量入库:一行怎么拆")
+        check("x50 是数量", gui.parse_batch_line("10k 0603 x50"), ("10k 0603", 50))
+        check("×20 / *20 也认", gui.parse_batch_line("100nF ×20"), ("100nF", 20))
+        check("没写数量就是 1", gui.parse_batch_line("STM32F103C8T6"), ("STM32F103C8T6", 1))
+        check("行尾裸数字不当数量 —— 否则「100nF 0805」会被读成 805",
+              gui.parse_batch_line("100nF 0805"), ("100nF 0805", 1))
+        check("表格里复制粘贴(制表符)时最后一列数字当数量",
+              gui.parse_batch_line("10k\t0603\t50"), ("10k 0603", 50))
+        check("# 开头的行当注释忽略", gui.parse_batch_line("# 下面开始"), None)
+        check("空行忽略", gui.parse_batch_line("   "), None)
+
+        p("\n【20】批量入库:先解析预览,确认后才落库")
+        box2 = FakeBox()
+        gui.messagebox = box2
+        try:
+            for v in ("2k2", "2k4"):
+                API(server.create_component, body={
+                    "name": f"批量测试 {v}", "category": "批量测试类",
+                    "value": f"{v}Ω", "package": "0805"})
+            app.refresh_all()
+
+            def on_hand_of(name):
+                row = app_con.execute("SELECT id FROM component WHERE name=?",
+                                      (name,)).fetchone()
+                return app_con.execute(
+                    "SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?",
+                    (row["id"],)).fetchone()[0]
+
+            bd = gui.BatchInDialog(app, app)
+            bd.update()
+            bd.txt.delete("1.0", "end")
+            bd.txt.insert("1.0",
+                          "筛选用 1kΩ x5\n"
+                          "没有的料 ZZZ-404 x2\n"
+                          "0805 x1\n"
+                          "批量测试 2k2 x4\n")
+            bd.parse()
+            bd.update()
+            check("解析出 4 行", len(bd.rows), 4)
+            check("x5 被读成数量 5", bd.rows[0]["qty"], 5)
+            check("整名精确命中已有的元件",
+                  str(bd.rows[0]["how"]).startswith("exact"), True)
+            check("库里没有的那行标成「将新建」", bd.rows[1]["how"], "none")
+            check("一行对上多项时不给答案", bd.rows[2]["how"], "ambiguous")
+            check("多匹配的行在预览里标黄提醒", "many" in bd.tree.item("2", "tags"), True)
+            check("新建的行标绿", "new" in bd.tree.item("1", "tags"), True)
+            check("4 行都列在预览表里", len(bd.tree.get_children()), 4)
+
+            bd.tree.selection_set("2")
+            bd.v_qty.set("9")
+            bd.set_qty()
+            check("能在预览里直接改数量", bd.rows[2]["qty"], 9)
+            check("改完输入框清空", bd.v_qty.get(), "")
+
+            before = on_hand_of("筛选用 1kΩ")
+            box2.answer = True
+            bd.commit()
+            bd.update()
+            check("命中已有元件的入库了 5 个", on_hand_of("筛选用 1kΩ"), before + 5)
+            check("库里没有的当场新建",
+                  app_con.execute("SELECT COUNT(*) FROM component WHERE name=?",
+                                  ("没有的料 ZZZ-404",)).fetchone()[0], 1)
+            check("新建的也入库了 2 个", on_hand_of("没有的料 ZZZ-404"), 2)
+            check("精确命中的第二条也入库了 4 个", on_hand_of("批量测试 2k2"), 4)
+            check("多匹配那行被跳过,没有瞎猜着入库",
+                  app_con.execute("SELECT COUNT(*) FROM component WHERE name='0805'"
+                                  ).fetchone()[0], 0)
+            check("结果里说了跳过了几行", "跳过" in box2.infos[-1][1], True)
+            check("结果里说了新建了几个", "新建" in box2.infos[-1][1], True)
+            check("批量入库标记了 done,主界面会刷新", bd.done, True)
+            check("全部成功时窗口自动关闭", bool(bd.winfo_exists()), False)
+
+            check("Ctrl+B 绑上了批量入库", bool(app.bind_all("<Control-b>")), True)
+        finally:
+            gui.messagebox = real_box
+
         app.refresh_all()
         app.update()
         p("  [OK ] 全量刷新")

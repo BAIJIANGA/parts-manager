@@ -196,6 +196,29 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             p(f"  (出入库项目页跳过:{type(exc).__name__}: {exc})")
 
+    # 弹窗各有自己的几何尺寸,主窗口那轮体检管不着它们。
+    # 新增元件窗口字段最多、盘点窗口列最宽,是两个最容易溢出的。
+    p("\n【弹窗】按各自的默认尺寸")
+    makers = [("快速入库", lambda: gui.QuickInDialog(app, app)),
+              ("批量入库", lambda: gui.BatchInDialog(app, app)),
+              ("新增元件", lambda: gui.ComponentDialog(app, app, None)),
+              ("选一个元件", lambda: gui.ComponentPicker(app, app))]
+    row = app.con.execute(
+        "SELECT id FROM location WHERE structural=0 ORDER BY id LIMIT 1").fetchone()
+    if row:
+        makers.append(("盘点仓位", lambda: gui.StocktakeDialog(app, app, row["id"])))
+    for label, make in makers:
+        try:
+            d = make()
+            d.update()
+            d.update_idletasks()
+            check_trees(d, f"弹窗/{label}")
+            check_squashed(d, f"弹窗/{label}")
+            d.destroy()
+            app.update()
+        except Exception as exc:  # noqa: BLE001
+            p(f"  (弹窗 {label} 跳过:{type(exc).__name__}: {exc})")
+
     app.destroy()
     try:
         app.con.close()

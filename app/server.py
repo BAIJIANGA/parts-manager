@@ -233,34 +233,60 @@ def component_row(row) -> dict:
 
 @route("GET", r"/api/components")
 def list_components(ctx: Ctx, m):
-    where, args = [], []
+    # base = 关键字 / 品类 / 厂家。分面(封装、单位)只按 base 算,不把用户已经选中的
+    # 封装、单位、值区间也叠进去 —— 否则选定一个封装之后别的封装就从下拉里消失,
+    # 想换个封装看看都不行了。
+    base_where, base_args = [], []
     keyword = ctx.q("q")
     if keyword:
         like = f"%{keyword}%"
         # 搜索是主入口,不是分类的补充 —— 所以凡是用户可能记得的碎片都要命中:
         # 名称、立创编号、厂家料号、厂家、值、封装、**丝印**、**参数 JSON**、备注、品类。
         # 丝印那一条是给拆机料用的:SOT-23 上只印着三个字母,查不到就等于没存。
-        where.append(
+        base_where.append(
             "(c.name LIKE ? OR c.lcsc_pn LIKE ? OR c.mpn LIKE ? OR c.manufacturer LIKE ?"
             " OR c.value LIKE ? OR c.package LIKE ? OR c.marking LIKE ? OR c.params LIKE ?"
             " OR c.note LIKE ? OR c.category LIKE ?)"
         )
-        args += [like] * 10
+        base_args += [like] * 10
     if ctx.q("category"):
-        where.append("c.category = ?")
-        args.append(ctx.q("category"))
+        base_where.append("c.category = ?")
+        base_args.append(ctx.q("category"))
+    if ctx.q("manufacturer"):
+        base_where.append("c.manufacturer LIKE ?")
+        base_args.append(f"%{ctx.q('manufacturer')}%")
+
+    def opt_float(name):
+        raw = ctx.q(name)
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    where, args = list(base_where), list(base_args)
     if ctx.q("package"):
         where.append("c.package LIKE ?")
         args.append(f"%{ctx.q('package')}%")
-    if ctx.q("manufacturer"):
-        where.append("c.manufacturer LIKE ?")
-        args.append(f"%{ctx.q('manufacturer')}%")
+    if ctx.q("unit"):
+        where.append("c.value_unit = ?")
+        args.append(ctx.q("unit"))
+    # 值区间 —— 这就是「我 0805 的电阻里到底有没有 1k~10k 的」的答案。
+    # 比的是 value_num 而不是字符串:否则 100k 会排在 10k 前面,区间也就无从谈起。
+    vmin, vmax = opt_float("value_min"), opt_float("value_max")
+    if vmin is not None:
+        where.append("c.value_num >= ?")
+        args.append(vmin)
+    if vmax is not None:
+        where.append("c.value_num <= ?")
+        args.append(vmax)
 
     inner = COMPONENT_SELECT + (" WHERE " + " AND ".join(where) if where else "")
     sql = f"SELECT * FROM ({inner})"
     outer_where, outer_args = [], []
     state = ctx.q("state")
-    if state in ("ok", "low", "out"):
+    if state in ("ok", "low", "out", "short"):
         outer_where.append("stock_state = ?")
         outer_args.append(state)
     # stocked=1:只要真正有库存的。on_hand 是子查询算出来的,所以只能在外层过滤。
@@ -293,7 +319,57 @@ def list_components(ctx: Ctx, m):
         args = args + outer_args
 
     rows = [component_row(r) for r in ctx.con.execute(sql, args)]
-    return 200, {"total": total, "items": rows}
+    return 200, {"total": total, "items": rows,
+                 "facets": _component_facets(ctx.con, base_where, base_args)}
+
+
+def _one_component(ctx: Ctx, where: str, args: list):
+    """按条件取一条元件(带可用量那一套列)。"""
+    row = ctx.con.execute(f"SELECT * FROM ({COMPONENT_SELECT} WHERE {where})", args).fetchone()
+    return component_row(row) if row else None
+
+
+@route("GET", r"/api/components/resolve")
+def resolve_component(ctx: Ctx, m):
+    """把一句「人话」对上库里的一条元件 —— 批量粘贴入库时用。
+
+    规则按可靠程度排:立创编号 / 厂家料号 / 完全同名 的精确命中优先;
+    没有精确命中时,只有模糊搜索**唯一**命中一条才认,否则返回候选让人自己挑。
+
+    宁可让人多看一眼,也不能猜错 —— 批量入库猜错一次就是几十个料进错地方,
+    而且事后极难发现。
+    """
+    text = (ctx.q("q") or "").strip()
+    if not text:
+        raise ApiError(400, "缺少 q")
+    up = text.upper()
+    for col in ("lcsc_pn", "mpn", "name"):
+        hit = _one_component(ctx, f"UPPER(c.{col}) = ?", [up])
+        if hit:
+            return 200, {"match": hit, "how": f"exact:{col}", "candidates": []}
+
+    _s, data = list_components(ctx, m)
+    items = data.get("items") or []
+    if len(items) == 1:
+        return 200, {"match": items[0], "how": "unique", "candidates": items}
+    return 200, {
+        "match": None,
+        "how": "ambiguous" if items else "none",
+        "candidates": items[:8],
+    }
+
+
+def _component_facets(con, base_where, base_args):
+    """当前筛选范围里真实存在的封装和单位 —— 只列出有的,不摆一堆空选项。"""
+    inner = COMPONENT_SELECT + (" WHERE " + " AND ".join(base_where) if base_where else "")
+    out = {}
+    for key, col in (("packages", "package"), ("units", "value_unit")):
+        # WHERE 里用子查询暴露出来的真实列名,不用别名 —— 不依赖 SQLite
+        # 「WHERE 里可以引用结果列别名」这个非标准扩展
+        sql = (f"SELECT DISTINCT {col} AS v FROM ({inner}) "
+               f"WHERE {col} IS NOT NULL AND {col} <> '' ORDER BY {col}")
+        out[key] = [r["v"] for r in con.execute(sql, base_args)]
+    return out
 
 
 @route("GET", r"/api/components/(\d+)")
@@ -521,6 +597,64 @@ def delete_location(ctx: Ctx, m):
     return 200, {"ok": True}
 
 
+@route("POST", r"/api/locations/(\d+)/stocktake")
+def stocktake_location(ctx: Ctx, m):
+    """把一个仓位里的实物数一遍,只把**有差异**的行写成盘点流水。
+
+    这和「一条条改数量」的区别在意图上:实物清点是拿着一箱料挨个核对,
+    对得上的不该留痕(否则流水会被几百条「没变」淹掉,真出事时反而查不出来),
+    对不上的、以及「账面有但现在根本没数到」的,才各记一笔。
+
+    请求体:{"items": [{"component_id": 1, "qty": 33}, …]}
+    qty 是**实盘数**,不是增减量 —— 写增减量的话,清点的人还得自己算差。
+    """
+    lid = int(m.group(1))
+    loc = ctx.con.execute("SELECT * FROM location WHERE id=?", (lid,)).fetchone()
+    if not loc:
+        raise ApiError(404, "仓位不存在")
+    if loc["structural"]:
+        # 分层节点本身没有物理位置,没有东西可数
+        raise ApiError(409, f"「{loc['code']}」是分层仓位,本身不装东西;"
+                            f"请盘点它下面的具体仓位")
+    items = ctx.body.get("items")
+    if not isinstance(items, list):
+        raise ApiError(400, "items 必须是一个列表")
+
+    changed, unchanged = [], 0
+    for it in items:
+        if not isinstance(it, dict):
+            raise ApiError(400, "items 里每一项都要是 {component_id, qty}")
+        try:
+            cid, qty = int(it.get("component_id")), int(it.get("qty"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "每行都要有 component_id 和整数 qty")
+        if qty < 0:
+            raise ApiError(400, "实盘数量不能是负数")
+        comp = ctx.con.execute("SELECT name FROM component WHERE id=?", (cid,)).fetchone()
+        if not comp:
+            raise ApiError(404, f"元件 {cid} 不存在")
+        row = ctx.con.execute("SELECT qty FROM stock WHERE component_id=? AND location_id=?",
+                              (cid, lid)).fetchone()
+        was = int(row["qty"]) if row else 0
+        if was == qty:
+            unchanged += 1
+            continue
+        _bump(ctx.con, cid, lid, qty - was)
+        _log_move(ctx.con, "ADJUST", cid, lid, qty, ref=ctx.b("ref"),
+                  operator=ctx.b("operator"),
+                  note=f"盘点 {loc['code']}:账面 {was} → 实盘 {qty}")
+        changed.append({"component_id": cid, "name": comp["name"], "was": was, "now": qty})
+    ctx.con.commit()
+    return 200, {
+        "ok": True,
+        "location": loc["code"],
+        "checked": len(items),
+        "changed": len(changed),
+        "unchanged": unchanged,
+        "diffs": changed,
+    }
+
+
 @route("GET", r"/api/locations/(\d+)/contents")
 def location_contents(ctx: Ctx, m):
     """某个仓位里装了什么。cascade=1 时连子仓位一起算。"""
@@ -556,6 +690,20 @@ def location_contents(ctx: Ctx, m):
         "total_qty": sum(int(i["qty"]) for i in items),
         "value": round(sum(int(i["qty"]) * float(i["unit_price"] or 0) for i in items), 2),
     }
+
+
+def _log_move(con, kind, component_id, location_id, qty, *, to_location_id=None,
+              project_id=None, ref=None, operator=None, note=None) -> int:
+    """写一条流水。出入库和盘点都走这里,免得两处字段顺序对不上。"""
+    cur = con.execute(
+        """INSERT INTO movement(kind, component_id, location_id, to_location_id, qty,
+                                project_id, ref, operator, note)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (kind, component_id, location_id, to_location_id, qty, project_id,
+         ref, operator or "本地用户", note),
+    )
+    db.touch_component(con, component_id)
+    return int(cur.lastrowid)
 
 
 def _get_location_id(con, code_or_id) -> int:
@@ -665,18 +813,13 @@ def stock_move(ctx: Ctx, m):
         _bump(ctx.con, cid, loc, -qty)
         after = _bump(ctx.con, cid, to_loc, qty)
 
-    cur = ctx.con.execute(
-        """INSERT INTO movement(kind, component_id, location_id, to_location_id, qty,
-                                project_id, ref, operator, note)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
-        (kind, cid, loc, to_loc, qty, ctx.bi("project_id"),
-         ctx.b("ref"), ctx.b("operator") or "本地用户", ctx.b("note")),
-    )
-    db.touch_component(ctx.con, cid)
+    mid = _log_move(ctx.con, kind, cid, loc, qty, to_location_id=to_loc,
+                    project_id=ctx.bi("project_id"), ref=ctx.b("ref"),
+                    operator=ctx.b("operator"), note=ctx.b("note"))
     ctx.con.commit()
 
     on_hand = db.stock_total(ctx.con, cid)
-    return 200, {"ok": True, "movement_id": int(cur.lastrowid), "qty_at_location": after,
+    return 200, {"ok": True, "movement_id": mid, "qty_at_location": after,
                  "on_hand": on_hand}
 
 
@@ -1367,19 +1510,26 @@ def _save_temp_upload(data: bytes, filename: str) -> str:
     return dest
 
 
+def _bom_reject(filename: str):
+    """只认 BOM 类文件。报错时把能接受的后缀说清楚,别让人猜。"""
+    if not filename.lower().endswith((".xlsx", ".xlsm", ".csv", ".tsv", ".txt")):
+        raise ApiError(400, "只支持 .xlsx / .xlsm / .csv(Altium 的 Excel、"
+                            "KiCad / EasyEDA / 立创导出的 CSV 都能直接导)")
+
+
 @route("POST", r"/api/bom/preview")
 def bom_preview(ctx: Ctx, m):
     filename, data = _read_upload(ctx)
-    if not (filename.lower().endswith((".xlsx", ".xlsm"))):
-        raise ApiError(400, "只支持 .xlsx / .xlsm(Altium 的 Excel 导出)")
+    _bom_reject(filename)
     path = _save_temp_upload(data, filename)
     try:
-        items, warnings = bom.parse_workbook(path, sheet_name=ctx.b("sheet"))
+        items, warnings = bom.parse_any(path, sheet_name=ctx.b("sheet"))
     except Exception as exc:
         raise ApiError(400, f"解析失败:{exc}")
+    is_excel = filename.lower().endswith((".xlsx", ".xlsm"))
     return 200, {
         "filename": filename, "saved_to": path,
-        "sheets": xlsx.sheet_names(path),
+        "sheets": xlsx.sheet_names(path) if is_excel else [],
         "line_count": len(items), "total_qty": sum(i["qty"] for i in items),
         "warnings": warnings,
         "lines": [{
@@ -1393,8 +1543,7 @@ def bom_preview(ctx: Ctx, m):
 @route("POST", r"/api/bom/import")
 def bom_import(ctx: Ctx, m):
     filename, data = _read_upload(ctx)
-    if not (filename.lower().endswith((".xlsx", ".xlsm"))):
-        raise ApiError(400, "只支持 .xlsx / .xlsm")
+    _bom_reject(filename)
     path = _save_temp_upload(data, filename)
     project_name = ctx.b("project_name") or os.path.splitext(filename)[0]
     try:

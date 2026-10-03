@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Altium Designer BOM 解析与导入。
+"""BOM 解析与导入(xlsx / csv 都走这里)。
 
-流程:读 xlsx -> 定位表头 -> 按列名映射 -> 归一化每一行 -> upsert 元件 -> 建项目 BOM。
+流程:读文件 -> 定位表头 -> 按列名映射 -> 归一化每一行 -> upsert 元件 -> 建项目 BOM。
 
-列名兼容 Altium 的英文默认导出与常见中文导出,不区分大小写、忽略多余空格。
+xlsx 和 csv 只差「怎么把文件变成二维表格」这一步,后面完全共用一套行解析,
+所以两种格式的识别规则、告警、品类推断不会各走各的。
+
+表头兼容 Altium / KiCad / EasyEDA / 立创 的常见写法,不区分大小写、忽略多余空格。
 没有立创编号时回退用厂家料号(MPN)作为识别键。
 """
 from __future__ import annotations
 
+import csv
+import io
 import math
 import os
 import re
@@ -16,20 +21,30 @@ from typing import Any, Iterable
 import db
 import xlsx
 
-# 规范字段 -> 可接受的表头写法
+# 规范字段 -> 可接受的表头写法。
+# 要同时认下这几家的默认导出,否则用户得先手工改成我们要的列名才导得进来:
+#   Altium   Designator / Comment / Footprint / Quantity / Manufacturer Part
+#   KiCad    Reference / Value / Footprint / Quantity / MPN / Manufacturer / LCSC
+#   EasyEDA  Designator / Comment / Footprint / Quantity / Manufacturer Part
+#   立创 BOM Quantity / Comment / Designator / Footprint / Manufacturer Part / Supplier Part
 HEADER_ALIASES: dict[str, list[str]] = {
-    "no": ["no.", "no", "序号", "#", "item"],
-    "quantity": ["quantity", "qty", "数量", "用量"],
-    "comment": ["comment", "注释", "描述", "description"],
-    "designator": ["designator", "designators", "位号", "元件标号", "元件位号"],
-    "footprint": ["footprint", "封装", "pcb footprint"],
-    "value": ["value", "值", "参数值", "标称值"],
-    "mpn": ["manufacturer part", "manufacturer part number", "mpn",
-            "厂家料号", "制造商料号", "厂商料号"],
-    "manufacturer": ["manufacturer", "厂家", "制造商", "厂商"],
-    "supplier_pn": ["supplier part", "supplier part number", "供应商料号",
-                    "立创编号", "商品编号"],
-    "supplier": ["supplier", "供应商", "供货商"],
+    "no": ["no.", "no", "序号", "#", "item", "index"],
+    "quantity": ["quantity", "qty", "qty.", "数量", "用量", "amount", "pcs", "数量(pcs)"],
+    "comment": ["comment", "注释", "描述", "description", "remark", "备注", "note"],
+    "designator": ["designator", "designators", "位号", "元件标号", "元件位号",
+                   "reference", "references", "refdes", "ref", "refs",
+                   "元件编号", "标号", "reference designator"],
+    "footprint": ["footprint", "封装", "pcb footprint", "package", "case"],
+    "value": ["value", "值", "参数值", "标称值", "val", "nominal"],
+    "mpn": ["manufacturer part", "manufacturer part number", "manufacturer part no",
+            "manufacturer p/n", "mpn", "mpn/part number", "part number", "part no",
+            "partno", "厂家料号", "制造商料号", "厂商料号", "厂家型号", "厂商型号"],
+    "manufacturer": ["manufacturer", "厂家", "制造商", "厂商", "mfr", "brand"],
+    "supplier_pn": ["supplier part", "supplier part number", "supplier part no",
+                    "supplier part #", "供应商料号", "供应商编号", "立创编号",
+                    "立创料号", "商品编号", "lcsc", "lcsc part", "lcsc part number",
+                    "lcsc part no", "lcsc part #", "lcsc part number/商品编号"],
+    "supplier": ["supplier", "供应商", "供货商", "vendor"],
 }
 
 # 位号前缀 -> 品类(按优先顺序匹配,长的必须在前)
@@ -82,10 +97,14 @@ def _norm(s: Any) -> str:
 
 
 def split_designators(raw: Any) -> list[str]:
-    """'C1,C2,C8' -> ['C1','C2','C8'];兼容中文逗号、顿号、分号与空格。"""
+    """'C1,C2,C8' -> ['C1','C2','C8'];兼容中文逗号、顿号、分号与空格。
+
+    空格也是分隔符 —— KiCad 导出的位号就长这样:「R1 R2 R3」。
+    """
     if raw is None:
         return []
     text = str(raw).replace("，", ",").replace("、", ",").replace(";", ",").replace("；", ",")
+    text = re.sub(r"\s+", ",", text)
     return [d.strip() for d in text.split(",") if d.strip()]
 
 
@@ -160,14 +179,73 @@ def build_name(value: str | None, package: str | None, mpn: str | None,
 
 
 def parse_workbook(path: str, sheet_name: str | None = None) -> tuple[list[dict], list[str]]:
-    """解析 BOM 文件,返回 (条目列表, 警告列表)。"""
+    """解析 xlsx/xlsm,返回 (条目列表, 警告列表)。"""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"文件不存在:{path}")
 
     rows = xlsx.read_sheet(path, sheet_name=sheet_name)
     if not rows:
         raise ValueError("工作表是空的")
+    return rows_to_items(rows)
 
+
+# CSV 常见编码。中文 Excel 另存为 CSV 往往是 GBK,而 KiCad / 立创导出的是带 BOM 的
+# UTF-8 —— 两个都得认,不能让用户为了导入先去转一次编码。
+CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5", "latin-1")
+
+
+def read_csv_rows(path: str) -> list[list[str]]:
+    """读 CSV 成二维表。表头定位、列名映射跟 xlsx 完全共用。"""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"文件不存在:{path}")
+    raw = open(path, "rb").read()
+    if not raw.strip():
+        raise ValueError("文件是空的")
+    text = None
+    for enc in CSV_ENCODINGS:
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError("这个 CSV 的编码认不出来")
+
+    # 分隔符按第一行里出现最多的那个猜。欧洲区域设置下 Excel 会用分号,
+    # 有些工具导出的是制表符 —— 全都当 CSV 处理,不让用户去改。
+    first = next((ln for ln in text.splitlines() if ln.strip()), "")
+    delim = ","
+    best = 0
+    for cand in (",", ";", "\t", "|"):
+        n = first.count(cand)
+        if n > best:
+            best, delim = n, cand
+    return [list(r) for r in csv.reader(io.StringIO(text), delimiter=delim)]
+
+
+def parse_csv(path: str) -> tuple[list[dict], list[str]]:
+    rows = [r for r in read_csv_rows(path) if any(str(c).strip() for c in r)]
+    if not rows:
+        raise ValueError("CSV 里没有内容")
+    return rows_to_items(rows)
+
+
+def parse_any(path: str, sheet_name: str | None = None) -> tuple[list[dict], list[str]]:
+    """按扩展名分派。xlsx / xlsm 走 Excel,其余按 CSV 处理。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xlsm"):
+        return parse_workbook(path, sheet_name=sheet_name)
+    if ext in (".csv", ".txt", ".tsv"):
+        return parse_csv(path)
+    # 后缀不认识时两种都试一遍,总比直接拒了强
+    try:
+        return parse_workbook(path, sheet_name=sheet_name)
+    except Exception:
+        return parse_csv(path)
+
+
+def rows_to_items(rows: list[list[Any]]) -> tuple[list[dict], list[str]]:
+    """二维表 -> 条目列表。xlsx 和 csv 共用这一套,规则不会两边跑偏。"""
     hdr_idx, cols = find_header(rows)
     warnings: list[str] = []
     items: list[dict] = []
@@ -188,24 +266,34 @@ def parse_workbook(path: str, sheet_name: str | None = None) -> tuple[list[dict]
         # 整行空白就跳过
         if not any([designators, qty, lcsc, mpn, _cell(row, cols, "value")]):
             continue
-        if not lcsc and not mpn:
-            warnings.append(f"第 {offset} 行:既无立创编号也无厂家料号,已跳过")
-            continue
-
-        key = (lcsc or f"MPN:{mpn}").upper()
-        if key in seen:
-            warnings.append(f"第 {offset} 行:料号 {key} 重复出现,已合并处理")
-        seen.add(key)
-
-        if designators and qty is not None and len(designators) != qty:
-            warnings.append(
-                f"第 {offset} 行:{lcsc or mpn} 位号数({len(designators)})与数量({qty})不一致,按数量为准"
-            )
-            qty = qty if qty is not None else len(designators)
 
         comment = _cell(row, cols, "comment")
         value = _cell(row, cols, "value") or comment
         footprint = _cell(row, cols, "footprint")
+
+        # 识别键:立创编号 > 厂家料号 > 值+封装。
+        # 不能因为「没有料号」就把整行丢掉 —— KiCad 和 EasyEDA 的默认导出
+        # 常常只有 Value + Footprint,这种行照样是能导进来的。
+        if lcsc:
+            key = lcsc.upper()
+        elif mpn:
+            key = f"MPN:{mpn}".upper()
+        elif value or footprint:
+            key = f"VF:{value or ''}|{footprint or ''}".upper()
+        else:
+            warnings.append(f"第 {offset} 行:既没有料号也没有值和封装,没法识别,已跳过")
+            continue
+
+        if key in seen:
+            warnings.append(f"第 {offset} 行:{key} 重复出现,已合并处理")
+        seen.add(key)
+
+        if designators and qty is not None and len(designators) != qty:
+            warnings.append(
+                f"第 {offset} 行:{key} 位号数({len(designators)})与数量({qty})不一致,按数量为准"
+            )
+            qty = qty if qty is not None else len(designators)
+
         category = guess_category(designators, str(footprint or ""), str(value or ""))
 
         items.append({
@@ -228,8 +316,12 @@ def parse_workbook(path: str, sheet_name: str | None = None) -> tuple[list[dict]
     return items, warnings
 
 
-def find_component(con, lcsc_pn: str | None, mpn: str | None):
-    """按立创编号优先、厂家料号其次找已有元件。"""
+def find_component(con, lcsc_pn: str | None, mpn: str | None, name: str | None = None):
+    """按立创编号优先、厂家料号其次找已有元件。
+
+    两者都没有时(纯 Value + Footprint 的 KiCad / EasyEDA BOM)退回按元件名找。
+    名字本来就是由值、封装、料号推出来的,所以同一个元件反复导入不会变成两条。
+    """
     if lcsc_pn:
         row = con.execute("SELECT * FROM component WHERE lcsc_pn=?", (lcsc_pn,)).fetchone()
         if row:
@@ -238,12 +330,18 @@ def find_component(con, lcsc_pn: str | None, mpn: str | None):
         row = con.execute("SELECT * FROM component WHERE mpn=?", (mpn,)).fetchone()
         if row:
             return row
+    if not lcsc_pn and not mpn and name:
+        row = con.execute(
+            "SELECT * FROM component WHERE name=? AND (lcsc_pn IS NULL OR lcsc_pn='')"
+            " AND (mpn IS NULL OR mpn='')", (name,)).fetchone()
+        if row:
+            return row
     return None
 
 
 def upsert_component(con, item: dict) -> tuple[int, bool]:
     """插入或补全元件。返回 (元件 id, 是否新建)。只补空字段,不覆盖已有值。"""
-    existing = find_component(con, item.get("lcsc_pn"), item.get("mpn"))
+    existing = find_component(con, item.get("lcsc_pn"), item.get("mpn"), item.get("name"))
     if existing:
         cid = existing["id"]
         updates, args = [], []
@@ -255,6 +353,9 @@ def upsert_component(con, item: dict) -> tuple[int, bool]:
             updates.append("updated_at=?")
             args.extend([db.now(), cid])
             con.execute(f"UPDATE component SET {', '.join(updates)} WHERE id=?", args)
+        # 导入时就得把数值列算出来。以前靠下次启动的 backfill 补,
+        # 结果「刚导完就按阻值排序 / 筛区间」是不准的。
+        db.set_value_num(con, cid, item.get("value"))
         return cid, False
 
     cur = con.execute(
@@ -263,15 +364,16 @@ def upsert_component(con, item: dict) -> tuple[int, bool]:
         (item.get("lcsc_pn"), item.get("mpn"), item.get("manufacturer"),
          item["name"], item["category"], item.get("value"), item.get("package")),
     )
-    return int(cur.lastrowid), True
+    cid = int(cur.lastrowid)
+    db.set_value_num(con, cid, item.get("value"))
+    return cid, True
 
 
-def import_bom(con, path: str, project_name: str, project_code: str | None = None,
-               repo: str | None = None, sheet_name: str | None = None,
-               replace_existing: bool = True) -> dict:
-    """把一份 BOM 导入成项目。返回导入报告。"""
-    items, warnings = parse_workbook(path, sheet_name=sheet_name)
-
+def import_items(con, items: list[dict], project_name: str, *, project_code: str | None = None,
+                 repo: str | None = None, replace_existing: bool = True,
+                 warnings: list[str] | None = None) -> dict:
+    """把已经解析好的条目导入成一个项目。xlsx 与 csv 共用这一套落库逻辑。"""
+    warnings = list(warnings or [])
     proj = con.execute("SELECT * FROM project WHERE name=?", (project_name,)).fetchone()
     if proj:
         project_id = proj["id"]
@@ -322,6 +424,17 @@ def import_bom(con, path: str, project_name: str, project_code: str | None = Non
         "warnings": warnings,
         "rows": bom_rows,
     }
+
+
+def import_bom(con, path: str, project_name: str, project_code: str | None = None,
+               repo: str | None = None, sheet_name: str | None = None,
+               replace_existing: bool = True) -> dict:
+    """把一份 BOM 文件(xlsx 或 csv)导入成项目。返回导入报告。"""
+    items, warnings = parse_any(path, sheet_name=sheet_name)
+    report = import_items(con, items, project_name, project_code=project_code, repo=repo,
+                          replace_existing=replace_existing, warnings=warnings)
+    report["source"] = os.path.basename(path)
+    return report
 
 
 def build_report(con, project_id: int) -> dict:

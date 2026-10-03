@@ -68,9 +68,9 @@ class Boom(Exception):
     pass
 
 
-def call(fn, query=None, body=None, match=None):
+def call(fn, query=None, body=None, match=None, upload=None):
     """直接调后端 handler,把 ApiError 变成异常方便断言。"""
-    ctx = server.Ctx(None, CON, dict(query or {}), dict(body or {}), None)
+    ctx = server.Ctx(None, CON, dict(query or {}), dict(body or {}), upload)
     status, payload = fn(ctx, _Match(*match) if match else None)
     return status, payload
 
@@ -288,6 +288,195 @@ lines = {ln["component_id"]: ln for ln in rep["lines"]}
 check("B 单块用量降到 1 后能支持 3 块", lines[B]["line_build"], 3)
 check("现在瓶颈是 A 的 10 块?不,A 现有 100÷10 = 10 块", lines[A]["line_build"], 10)
 check("能造几块 = min(10, 3) = 3", rep["can_build"], 3)
+
+p("\n【17】值区间 / 封装 / 单位 分面筛选")
+# 专门造一串跨度大的阻值。关键是要证明区间比的是**数值**不是字符串 ——
+# 按字符串比的话 "100k" < "10k",区间筛选就完全错了。
+for v in ("100", "1k", "10k", "100k", "1M"):
+    mkcomp(f"{v} 电阻", "电阻", f"{v}Ω", package="0603")
+
+_s, r = call(server.list_components, query={"category": "电阻", "value_min": "500",
+                                            "value_max": "2000"})
+check("500~2000 之间只命中 1k(100 和 10k 都排除)",
+      sorted({int(i["value_num"]) for i in r["items"]}), [1000])
+p("  ↑ 若是按字符串比,\"100k\" 会落进这个区间")
+
+_s, r = call(server.list_components, query={"category": "电阻", "value_min": "1000",
+                                            "value_max": "100000"})
+check("1k~100k 的取值集合",
+      sorted({int(i["value_num"]) for i in r["items"]}), [1000, 10000, 100000])
+check("1M 被上界排除",
+      all(int(i["value_num"]) <= 100000 for i in r["items"]), True)
+
+_s, r = call(server.list_components, query={"category": "电阻", "package": "0603"})
+check("封装按「包含」匹配:5 个 0603 + 2 个 R0603 = 7", len(r["items"]), 7)
+p("  ↑ 用 LIKE 而不是等号,所以搜 0603 也能命中 R0603 这种写法")
+check("分面里列出当前范围真有的封装(含 R0603)",
+      sorted(r["facets"]["packages"]), ["0603", "R0603"])
+check("分面里的单位是 Ω", r["facets"]["units"], ["Ω"])
+p("  ↑ 分面只列范围里真有的,不摆一堆选了也搜不到的空选项")
+
+_s, r = call(server.list_components, query={"category": "电容", "unit": "F"})
+check("按单位 F 筛出 1uF", len(r["items"]), 1)
+
+_s, r = call(server.list_components,
+             query={"category": "发光二极管", "value_min": "1"})
+check("值不是数字的元件(丝印式的 GL0805UR01)不会被区间误纳",
+      len(r["items"]), 0)
+
+p("\n【18】按仓位盘点(实物清点)")
+_s, drawer = call(server.create_location, body={"code": "测试抽屉", "name": "测试抽屉"})
+LID = drawer["id"]
+call(server.stock_move, body={"kind": "IN", "component_id": A, "qty": 7,
+                              "location": "测试抽屉"})
+_s, res = call(server.stocktake_location, body={"items": [
+    {"component_id": A, "qty": 5},     # 账面 7,实盘 5 -> 有差异
+    {"component_id": B, "qty": 0},     # 账面没有、实盘也没有 -> 不算差异
+]}, match=(str(LID),))
+check("数了 2 项", res["checked"], 2)
+check("只有 1 处差异", res["changed"], 1)
+check("对得上的不计入差异", res["unchanged"], 1)
+check("差异的账面数如实报出", res["diffs"][0]["was"], 7)
+check("差异的实盘数如实报出", res["diffs"][0]["now"], 5)
+check("库存真的被盘成 5",
+      CON.execute("SELECT qty FROM stock WHERE component_id=? AND location_id=?",
+                  (A, LID)).fetchone()[0], 5)
+mv = CON.execute("SELECT * FROM movement WHERE kind='ADJUST' ORDER BY id DESC "
+                 "LIMIT 1").fetchone()
+check("写了一条盘点流水", mv["kind"], "ADJUST")
+check("流水里写清了「账面 → 实盘」", "账面 7" in mv["note"], True)
+check("流水挂在被盘的那个仓位上", mv["location_id"], LID)
+
+n_mv = CON.execute("SELECT COUNT(*) FROM movement").fetchone()[0]
+_s, res = call(server.stocktake_location,
+               body={"items": [{"component_id": A, "qty": 5}]}, match=(str(LID),))
+check("完全一致时不留痕(否则流水会被几百条「没变」淹掉)",
+      CON.execute("SELECT COUNT(*) FROM movement").fetchone()[0], n_mv)
+check("但也如实报告没有差异", res["changed"], 0)
+
+_s, cab2 = call(server.create_location, body={"code": "测试柜", "structural": 1})
+try:
+    call(server.stocktake_location, body={"items": []}, match=(str(cab2["id"]),))
+    check("分层仓位拒绝盘点(它本身没有实物)", False, True)
+except server.ApiError as exc:
+    check("分层仓位拒绝盘点(它本身没有实物)", "分层" in exc.message, True)
+
+for bad, why in (([{"component_id": A, "qty": -1}], "实盘负数"),
+                 ([{"component_id": A, "qty": "abc"}], "实盘非整数")):
+    try:
+        call(server.stocktake_location, body={"items": bad}, match=(str(LID),))
+        check(f"拒绝{why}", False, True)
+    except server.ApiError:
+        check(f"拒绝{why}", True, True)
+
+p("\n【19】CSV 版 BOM 导入(KiCad / EasyEDA / 立创 / 中文表头)")
+
+
+def write_csv(name, text, encoding="utf-8"):
+    path = os.path.join(CACHE, name)
+    with open(path, "wb") as f:
+        f.write(text.encode(encoding))
+    return path
+
+
+def upload_of(path):
+    with open(path, "rb") as f:
+        return {"filename": os.path.basename(path), "data": f.read()}
+
+
+# KiCad 的默认导出列名
+kicad = write_csv("kicad_bom.csv",
+                  "Reference,Value,Footprint,Quantity,MPN,Manufacturer,LCSC\n"
+                  "R1 R2,10k,R_0603,2,RC0603FR-0710KL,Yageo,C98220\n"
+                  "C1,100nF,C_0402,1,CL05B104KO5NNNC,Samsung,C1525\n"
+                  "U1,STM32F103C8T6,LQFP-48,1,STM32F103C8T6,ST,C8734\n")
+_s, rep = call(server.bom_import, body={"project_name": "KiCad 板"},
+               upload=upload_of(kicad))
+check("KiCad 的 CSV 导入了 3 行", rep["bom_lines"], 3)
+check("位号用空格分隔也认得(R1 R2)", rep["rows"][0]["designators"], "R1,R2")
+check("«LCSC» 这一列当成立创编号", rep["rows"][0]["lcsc_pn"], "C98220")
+check("«MPN» 这一列当成厂家料号", rep["rows"][0]["mpn"], "RC0603FR-0710KL")
+check("从位号 R 推断出品类是电阻", rep["rows"][0]["category"], "电阻")
+check("从位号 U 推断出品类是芯片", rep["rows"][2]["category"], "芯片/IC")
+
+# 立创 / EasyEDA 的列名 + GBK 编码(中文 Excel 另存为 CSV 就是 GBK)
+lcsc = write_csv("lcsc_bom.csv",
+                 "Quantity,Comment,Designator,Footprint,Manufacturer Part,"
+                 "Manufacturer,Supplier Part\n"
+                 "2,0.1uF,C3 C4,0603,CC0603KRX7R9BB104,Yageo,C1590\n",
+                 encoding="gb18030")
+_s, rep = call(server.bom_import, body={"project_name": "立创板"},
+               upload=upload_of(lcsc))
+check("立创列名的 CSV 也能导", rep["bom_lines"], 1)
+check("«Supplier Part» 认成立创编号", rep["rows"][0]["lcsc_pn"], "C1590")
+check("«Comment» 认成值",
+      CON.execute("SELECT value FROM component WHERE lcsc_pn='C1590'").fetchone()[0],
+      "0.1uF")
+
+# 全中文表头 + GBK
+zh = write_csv("zh_bom.csv",
+               "序号,位号,数量,值,封装,厂家料号,备注\n"
+               "1,\"R5,R6\",2,4.7kΩ,0603,RC0603FR-074K7L,手焊\n",
+               encoding="gb18030")
+_s, rep = call(server.bom_import, body={"project_name": "中文表头板"},
+               upload=upload_of(zh))
+check("中文表头认得出(位号/数量/值/封装/厂家料号)", rep["bom_lines"], 1)
+check("GBK 编码没有乱码", rep["rows"][0]["mpn"], "RC0603FR-074K7L")
+check("被引号包住的逗号位号拆得开", rep["rows"][0]["designators"], "R5,R6")
+check("值 4.7kΩ 解析成了数值",
+      CON.execute("SELECT value_num FROM component WHERE mpn=?",
+                  ("RC0603FR-074K7L",)).fetchone()[0], 4700.0)
+
+# 分号分隔(欧洲区域设置的 Excel 会这么存)
+semi = write_csv("semi_bom.csv",
+                 "Designator;Quantity;Comment;Footprint\nD1;1;LED 红;0805\n")
+_s, rep = call(server.bom_import, body={"project_name": "分号板"},
+               upload=upload_of(semi))
+check("分号分隔的 CSV 也认得", rep["bom_lines"], 1)
+check("分号版的值读对了", rep["rows"][0]["name"], "LED 红 0805")
+p("  ↑ 分隔符是按第一行里出现最多的那个猜的,不用手工改")
+
+# 预览接口对 CSV 不该去找 sheet
+_s, prev = call(server.bom_preview, upload=upload_of(kicad))
+check("预览看到的行数和导入一致", prev["line_count"], 3)
+check("CSV 没有工作表概念,sheets 为空", prev["sheets"], [])
+check("预览会把解析告警带出来", isinstance(prev["warnings"], list), True)
+
+try:
+    call(server.bom_preview, upload={"filename": "bom.pdf", "data": b"x"})
+    check("不认识的后缀被拒绝", False, True)
+except server.ApiError as exc:
+    check("不认识的后缀被拒绝,并说清支持哪些", ".csv" in exc.message, True)
+
+bad = write_csv("bad.csv", "hello,world\n1,2\n")
+try:
+    call(server.bom_preview, upload=upload_of(bad))
+    check("没有表头的 CSV 给出可读的报错", False, True)
+except server.ApiError as exc:
+    check("没有表头的 CSV 给出可读的报错", "表头" in exc.message, True)
+
+p("\n【20】批量入库要用:「这句话对应库里的哪条料」")
+_s, r = call(server.resolve_component, query={"q": "C98220"})
+check("按立创编号精确命中", r["how"], "exact:lcsc_pn")
+check("命中的就是那一条", r["match"]["lcsc_pn"], "C98220")
+
+_s, r = call(server.resolve_component, query={"q": "rc0603fr-0710kl"})
+check("按厂家料号精确命中,且大小写不敏感", r["how"], "exact:mpn")
+
+mkcomp("独占匹配测试料 ZQX-777", "其他", "", package="独一无二封装")
+_s, r = call(server.resolve_component, query={"q": "ZQX-777"})
+check("只有一条模糊命中时才认它", r["how"], "unique")
+check("认出来的就是那一条", r["match"]["name"], "独占匹配测试料 ZQX-777")
+
+_s, r = call(server.resolve_component, query={"q": "0805"})
+check("多匹配时不给答案(猜错比没猜到更糟)", r["match"], None)
+check("how 标成 ambiguous", r["how"], "ambiguous")
+check("但把候选带回去让人挑", len(r["candidates"]) > 1, True)
+check("候选最多 8 条,不刷屏", len(r["candidates"]) <= 8, True)
+
+_s, r = call(server.resolve_component, query={"q": "库里绝对没有的料 XYZ-404"})
+check("完全没有就报 none(可以安全地新建)", r["how"], "none")
+check("none 时 match 是 None", r["match"], None)
 
 CON.close()
 p("\n" + "=" * 62)

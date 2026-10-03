@@ -46,13 +46,20 @@ venv\Scripts\python.exe app\server.py     # 网页版(可选,仅对照用)
 
 ### 自检
 
+三套,一共 **363 条断言**,都在 `data\parts.db` 的**副本**上跑,**不会动你的真实数据**:
+
 ```
-python build\test_gui.py
+python build\test_api.py      业务逻辑 135 条(口径、采购、仓位、盘点、CSV 导入、匹配)
+python build\test_gui.py      界面 228 条(7 个页签 + 全部弹窗真的构造并渲染一遍)
+python build\check_layout.py  排版体检:表格列宽是否超出可用宽度、有没有被压扁的容器、
+                              卡片尺寸与重叠
 ```
 
-在 `data\parts.db` 的**副本**上跑:把整个窗口、5 个标签页、3 个弹窗真的构造并渲染一遍,
-再跑一遍代表性的数据操作(增改删、入库/出库/盘点/移库、超额出库、按流水重建校验)。
-结果写到 `build\cache\gui_selftest.txt`。**不会动你的真实数据。**
+结果分别写到 `build\cache\{api_selftest,gui_selftest,layout_check}.txt`,退出码 0 = 全过。
+
+> 第三套是必要的:开发这个程序的模型**读不了截图**,排版问题只能靠算控件尺寸发现。
+> 它已经抓出过 4 处真实溢出(项目页左右两张表都超出了窗口)。
+> 弹窗也纳入体检 —— 它们各有自己的几何尺寸,主窗口那轮管不着。
 
 ### 重新打包
 
@@ -130,11 +137,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
 2. **数据录入是弃用的头号原因。** 社区里最扎人的一句是「你成了它的奴隶」——
    每用一次料都要去改一次数据库,人就不改了,数据一烂整套系统就废了。
    对策:**录入必须发生在刚拆快递、袋子还在手上那十几秒**,而且能省一步就省一步。
-   所以有了 **⚡ 快速入库(Ctrl+I)**:只问「是什么 / 几个 / 放哪」,搜得到回车入库,
-   **搜不到就当场新建一条最小记录**(只填名称、归到「未分类」),绝不拦着你先记下来;
-   入库后窗口不关,可以连着录下一袋。配套地,`stock_move` 不写仓位时自动落到
-   这个元件的 `default_loc_id`(没设就进「未分类」)—— 常用的料设一次「固定的家」,
-   以后就不该再问。
+   所以有了两条录入路径:
+   - **⚡ 快速入库(Ctrl+I)** —— 单个料。只问「是什么 / 几个 / 放哪」,搜得到回车入库,
+     **搜不到就当场新建一条最小记录**(只填名称、归到「未分类」),绝不拦着你先记下来;
+     入库后窗口不关,可以连着录下一袋。
+   - **📋 批量入库(Ctrl+B)** —— 一整箱货 / 对着采购单。粘贴、预览、确认,一次落库。
+     对不上的行会明确标出来而不是猜。
+
+   配套地,`stock_move` 不写仓位时自动落到这个元件的 `default_loc_id`
+   (没设就进「未分类」)—— 常用的料设一次「固定的家」,以后就不该再问。
 3. **搜索比分类学有用。** 「YAGNI:搜索往往比建立、执行和维护一套分类体系更高效」。
    所以分类始终是**可选**的:`component.category` 有默认值,新建时只强制填名称;
    而搜索是主入口,前端有搜索框、`Ctrl+I` 也是先搜。搜索命中
@@ -152,6 +163,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
 - **值同时存两份**:`value` 存人看的文本(`10kΩ`),`value_num` / `value_unit` 存
   解析出的数值和单位。**存数值、显示工程记号** —— 这样 `100kΩ` 才能排在 `10kΩ`
   后面,而不是按字符串排。这是无源件建模里最要紧的一个决定。
+- **光能排序还不够,还得能按区间找。** 无源件的真实问法是「我这个 0805 的抽屉里
+  到底有没有 1k~10k 的」,不是「把电阻按值排个序」。所以二级页有值区间 + 单位 + 封装
+  的筛选栏,比的是 `value_num`。这是唯一一件「调研里点名、而通用库存系统普遍没做好」
+  的事 —— 它们把值当自由文本,于是区间查询无从谈起。
 
 ### 1. 总览
 
@@ -181,6 +196,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
   **名称 / 立创编号 / 厂家料号 / 丝印 / 封装 / 值 / 现有 / 安全 / 需求 / 缺口 /
   在途 / 该买 / 状态 / 备注**。数值为 0 的格子留空,只让非零值显眼。
 - **⚡ 快速入库(Ctrl+I)** 就在这一页右上角,也是收货时最该点的按钮,详见上面「设计取向」
+- **📋 批量入库(Ctrl+B)**:一整箱货 / 对着采购单,一次录进去。
+  一行一个料,数量写成 `x50`;直接从表格复制粘贴也行(有制表符时最后一列数字当数量)。
+  故意**不把行尾裸数字当数量** —— 那样「100nF 0805」会被读成数量 805。
+  点「解析预览」后每行都会对到库里的一条元件上给你看:精确命中(绿)/ 库里没有、
+  会新建(绿)/ **对上了多项,需要你指定**(黄,默认跳过)。确认后才落库。
+  批量操作最怕「猜错了还悄悄记进去」,所以宁可多停一步。
+- **筛选栏**回答的是「我这个大类里到底有没有某一档的东西」:值 ≥ / 值 ≤ / 单位 / 封装。
+  值可以写 `1k`、`10kΩ`、`0.1uF`,也认纯数字。比的是解析出来的数值(`value_num`),
+  不是字符串 —— 按字符串比的话 `100k` 会被当成比 `10k` 小,区间就全错了。
+  封装和单位的下拉是**分面**:只列当前范围里真有的,而且按「范围」算不是按「结果」算,
+  所以选定一个封装之后别的封装不会从下拉里消失。
 - 搜索:首页搜索框回车或点「搜索」,结果也在同样的二级页面里显示。
   搜索命中 名称 / 立创编号 / 厂家料号 / 厂家 / 值 / 封装 / **丝印** / **参数** / 备注 / 品类
 - 库存状态自动标记:**充足 / 偏低(低于安全库存)/ 缺料(低于需求)/ 缺货**,缺料行整行标红
@@ -221,7 +247,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
 
 ### 4. 项目 BOM
 
-- **导入 Altium 导出的 .xlsx** → 自动建元件 + 展开位号 + 生成项目 BOM
+- **导入 BOM:`.xlsx` 和 `.csv` 都行**,`bom.parse_any()` 按扩展名分派,
+  但两种格式**共用同一套行解析**(`rows_to_items`)—— 所以识别规则、告警、品类推断
+  不会各走各的。CSV 侧额外处理了三件真实存在的事:
+  - **编码**:按 `utf-8-sig → utf-8 → gb18030 → gbk → big5` 试。中文 Excel 另存为 CSV
+    往往是 GBK,而 KiCad / 立创导出的是带 BOM 的 UTF-8,两个都得认,不能让用户先去转码
+  - **分隔符**:按第一行里出现最多的那个猜(`,` / `;` / Tab / `|`)。欧洲区域设置的
+    Excel 会用分号,有些工具导出制表符
+  - **表头别名**:同时认 Altium(`Designator`/`Comment`/`Quantity`)、
+    KiCad(`Reference`/`Value`/`Footprint`/`MPN`/`LCSC`)、
+    EasyEDA 与立创(`Comment`/`Manufacturer Part`/`Supplier Part`),以及全中文表头
+    (`位号`/`数量`/`值`/`封装`/`厂家料号`)
+  - **没有料号的行不再丢弃**。识别键按 立创编号 → 厂家料号 → 值+封装 依次回退 ——
+    KiCad / EasyEDA 的默认导出经常只有 Value + Footprint,以前这种行会被整行跳过
 - 左侧项目列表:**计划**(打算做几块)/ **能造**(照现在的库存最多能装出几块)/
   料号数 / 缺料行 / 状态。**能造几块由最缺的那一行决定**,所以只要看哪一行是红的、
   以及「料号/缺料行」这两个数,就知道卡在哪
@@ -270,6 +308,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
 - 删除仓位时:有子仓位、或里面还有库存,都会被拦住
 - 选中上层仓位,右边**级联**列出它下面所有仓位里的料(`WITH RECURSIVE`),
   并给出 `含子仓位:N 种 / M 个   估值 X 元`
+- **📋 盘点这个仓位…**(实物清点)。实物清点总是「一个抽屉一个抽屉」地做,
+  而不是「一个元件一个元件」地做,所以入口在这里而不是在元件页。
+  要点是**用键盘走一遍**:输入实数、回车,自动跳到下一个还没数的,全程不用碰鼠标。
+  只把**有差异**的行写成 `ADJUST` 流水 —— 对得上的不留痕,否则流水会被几百条
+  「没变」淹掉,真出事时反而查不出来。「账面有、实物没数到」也是差异(填 0 即可)。
+  只数了一部分也能保存,没数到的保持原样不动(会先问一句)。
+  分层仓位本身没有实物可数,会被直接拒绝。
 
 ### 7. 流水
 
@@ -286,7 +331,7 @@ parts-manager/
 │   ├── gui.py             ★ 桌面版界面(原生 tkinter),程序入口
 │   ├── server.py          业务逻辑 + JSON API(网页版用;桌面版直接复用它的处理函数)
 │   ├── db.py              SQLite 建表、连接、工具
-│   ├── bom.py             Altium BOM 解析与导入、缺料计算
+│   ├── bom.py             BOM 解析与导入(xlsx / csv 共用一套行解析)、缺料计算
 │   ├── xlsx.py            纯标准库 .xlsx 读取器(zipfile + xml)
 │   └── static/
 │       ├── index.html
@@ -338,34 +383,41 @@ project_bom   项目 BOM = 项目 × 元件 × 需求数量 + 位号
 
 ## 导入 BOM 的要求
 
-支持 Altium Designer 直接导出的 `.xlsx`,列名**不区分大小写、自动识别中英文**。
+支持 Altium / KiCad / EasyEDA / 立创 导出的 **`.xlsx` 和 `.csv`**(也能读 `.tsv` / `.txt`),
+列名**不区分大小写、自动识别中英文**,编码和分隔符自动识别。
 
 必需两列(缺了会明确报错):
 
 | 规范字段 | 可接受的表头写法 |
 |---|---|
-| 位号 | `Designator` / `Designators` / `位号` / `元件标号` |
-| 数量 | `Quantity` / `Qty` / `数量` / `用量` |
+| 位号 | `Designator` / `Reference` / `RefDes` / `位号` / `元件标号` / `元件编号` |
+| 数量 | `Quantity` / `Qty` / `数量` / `用量` / `Amount` / `PCS` |
 
 可选列:
 
 | 规范字段 | 可接受的表头写法 |
 |---|---|
-| 厂家料号 | `Manufacturer Part` / `MPN` / `厂家料号` |
-| 厂家 | `Manufacturer` / `厂家` / `制造商` |
-| 立创编号 | `Supplier Part` / `供应商料号` / `立创编号` |
-| 供应商 | `Supplier` / `供应商` |
-| 注释 / 值 / 封装 | `Comment` / `Value` / `Footprint` / `注释` / `值` / `封装` |
+| 厂家料号 | `Manufacturer Part` / `MPN` / `Part Number` / `厂家料号` / `厂商型号` |
+| 厂家 | `Manufacturer` / `Mfr` / `Brand` / `厂家` / `制造商` |
+| 立创编号 | `Supplier Part` / `LCSC` / `LCSC Part #` / `供应商料号` / `立创编号` / `商品编号` |
+| 供应商 | `Supplier` / `Vendor` / `供应商` |
+| 注释 / 值 / 封装 | `Comment` / `Value` / `Footprint` / `Package` / `注释` / `值` / `封装` |
 
 导入时的行为:
 
-- 立创编号优先做识别键;**没有立创编号就回退用厂家料号**
+- 识别键按 **立创编号 → 厂家料号 → 值+封装** 依次回退。
+  第三档是必须的:KiCad / EasyEDA 的默认导出经常只有 Value + Footprint,
+  只认前两档的话这种 BOM 一行都导不进来
 - 已有元件只**补空字段**,不覆盖你手工改过的值
 - 位号数与数量不一致会给出警告,以数量为准
+- 位号支持 `C1,C2,C8` / `C1 C2 C8`(KiCad 用空格)/ 中文逗号 / 顿号 / 分号
 - 品类按 **封装特征 → 位号前缀** 自动推断(如 `USB1` / `CONN-*` → 连接器,`RES-ADJ` → 电位器)
+- 导入时就把 `value_num` / `value_unit` 算出来 —— 否则「刚导完就按阻值排序 / 筛区间」
+  会不准(以前要等下次启动的 backfill 才补上)
 
 > 已用你桌面上 `BOM_Board1_PCB1_2026-10-01.xlsx` 实测:20 行读取完整、
 > 19 个元件、位号 1~19 齐全、总用量 39、**0 条警告**。
+> CSV 侧覆盖了 KiCad 列名、立创列名、全中文表头 + GBK 编码、分号分隔四种情况。
 
 ---
 
@@ -432,23 +484,43 @@ BOM 这种规整表格只需要读共享字符串表和单元格值,约 150 行�
 
 ```
 GET    /api/summary    ← 桌面版就是 server.summary(ctx, None)
-GET    /api/components?q=&category=&state=&sort=&limit=&offset=
+GET    /api/components?q=&category=&package=&unit=&value_min=&value_max=
+                      &state=&stocked=&sort=&limit=&offset=
+                       返回 items + total + facets(当前范围里真有的封装/单位)
 POST   /api/components                    新建元件
 GET    /api/components/{id}               元件详情(含仓位分布与流水)
 PUT    /api/components/{id}               更新元件
 DELETE /api/components/{id}?force=1       删除元件
+GET    /api/components/resolve?q=         一句话对应库里哪条料(批量入库用)
 GET    /api/meta                          品类/封装/厂家/仓位选项
+GET    /api/locations                     仓位列表(含路径、子仓位、数量)
 POST   /api/locations                     新建仓位
+PUT    /api/locations/{id}                改仓位
 DELETE /api/locations/{id}                删除仓位
+GET    /api/locations/{id}/contents?cascade=1   这个仓位里有什么
+POST   /api/locations/{id}/stocktake      实物清点,只记有差异的行
 POST   /api/stock/move                    入库/出库/盘点/移库
 GET    /api/movements?component_id=&project_id=&kind=&limit=
 GET    /api/lowstock                      低库存与缺货
+GET    /api/shopping                      该买什么(每行带原因)
+GET    /api/purchase                      采购单
+POST   /api/purchase                      加入采购单
+PUT    /api/purchase/{id}                 改状态/数量
+POST   /api/purchase/{id}/receive         到货入库(支持分批)
+DELETE /api/purchase/{id}                 删采购单
 POST   /api/rebuild                       按流水重建余额并比对
-GET    /api/projects                      项目列表
+GET    /api/dashboard                     总览页数据
+GET    /api/projects                      项目列表(带能造几块、缺料)
 POST   /api/projects                      新建空项目
 DELETE /api/projects/{id}                 删除项目
 GET    /api/projects/{id}/bom             项目 BOM + 缺料清单
+POST   /api/projects/{id}/bom             加一行
+PUT    /api/bom/{id}                      改一行(用量/损耗/可选/免点/位号/备注)
+DELETE /api/bom/{id}                      删一行
+GET    /api/bom/{id}/substitutes          替代料
+POST   /api/bom/{id}/substitutes          加替代料
+DELETE /api/substitutes/{id}              删替代料
 POST   /api/projects/{id}/pick            按 BOM 批量领料
-POST   /api/bom/preview                   上传 BOM 预览(不落库)
+POST   /api/bom/preview                   上传 BOM 预览(不落库;xlsx 与 csv 都行)
 POST   /api/bom/import                    上传 BOM 导入
 ```
