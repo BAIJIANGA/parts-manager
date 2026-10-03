@@ -822,17 +822,17 @@ def location_contents(ctx: Ctx, m):
 
 
 def _log_move(con, kind, component_id, location_id, qty, *, to_location_id=None,
-              project_id=None, purchase_id=None, ref=None, operator=None, note=None,
-              qty_before=None, void_of=None) -> int:
+              project_id=None, bom_id=None, purchase_id=None, ref=None, operator=None,
+              note=None, qty_before=None, void_of=None) -> int:
     """写一条流水。出入库、盘点、领料、到货和撤销都走这里,
     免得几处 INSERT 的字段顺序各写各的、漏字段。"""
     cur = con.execute(
         """INSERT INTO movement(kind, component_id, location_id, to_location_id, qty,
-                                project_id, purchase_id, ref, operator, note,
+                                project_id, bom_id, purchase_id, ref, operator, note,
                                 qty_before, void_of)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (kind, component_id, location_id, to_location_id, qty, project_id,
-         purchase_id, ref, operator or "本地用户", note, qty_before, void_of),
+         bom_id, purchase_id, ref, operator or "本地用户", note, qty_before, void_of),
     )
     db.touch_component(con, component_id)
     return int(cur.lastrowid)
@@ -898,6 +898,155 @@ def _bump(con, component_id: int, location_id: int, delta: int) -> int:
     return new
 
 
+def _apply_move(con, kind: str, cid: int, qty: int, loc: int, *, to_loc=None,
+                project_id=None, bom_id=None, ref=None, operator=None, note=None,
+                spill: bool = False) -> list[int]:
+    """实际改动余额并写流水。返回写下的流水号。
+
+    `spill=True` 时出库允许从**其他仓位凑**:东西常常散在几个盒子里,
+    而用户心里想的是「这个项目要领 8 个」,不是「先从哪个盒子拿」。
+    拆出来的每一笔都单独记一条流水 —— 仓位是真的动了,账就得如实反映。
+
+    单笔开单、按 BOM 领料、一键批量都走这里。三个入口各写一遍的话,
+    「盘点要把原数量记进备注」这类规则迟早只改到其中一处。
+    """
+    if kind in ("IN", "OUT") and qty <= 0:
+        raise ApiError(400, "数量必须大于 0")
+    if kind == "TRANSFER" and qty <= 0:
+        raise ApiError(400, "移库数量必须大于 0")
+
+    if kind == "IN":
+        was = _qty_at(con, cid, loc)
+        _bump(con, cid, loc, qty)
+        return [_log_move(con, "IN", cid, loc, qty, project_id=project_id,
+                          bom_id=bom_id, ref=ref, operator=operator, note=note,
+                          qty_before=was)]
+
+    if kind == "ADJUST":
+        was = _qty_at(con, cid, loc)
+        _bump(con, cid, loc, qty - was)
+        # 盘点记录里的 qty 是「新数量」,所以必须把「原来多少」也存下来,
+        # 否则以后没法撤销它
+        return [_log_move(con, "ADJUST", cid, loc, qty, project_id=project_id,
+                          bom_id=bom_id, ref=ref, operator=operator,
+                          note=(note or "") + f"（盘点:原 {was} → 新 {qty}）",
+                          qty_before=was)]
+
+    if kind == "TRANSFER":
+        was = _qty_at(con, cid, loc)
+        _bump(con, cid, loc, -qty)
+        _bump(con, cid, to_loc, qty)
+        return [_log_move(con, "TRANSFER", cid, loc, qty, to_location_id=to_loc,
+                          project_id=project_id, bom_id=bom_id, ref=ref,
+                          operator=operator, note=note, qty_before=was)]
+
+    # ---- OUT
+    if not spill:
+        # 不够就交给 _bump 抛「库存不足:仓位 X 现有 N,需要 M」,
+        # 那句话比这里另写一句更具体(它知道是哪个仓位)
+        was = _qty_at(con, cid, loc)
+        _bump(con, cid, loc, -qty)
+        return [_log_move(con, "OUT", cid, loc, qty, project_id=project_id,
+                          bom_id=bom_id, ref=ref, operator=operator, note=note,
+                          qty_before=was)]
+
+    plan = [(loc, min(qty, _qty_at(con, cid, loc)))]
+    rest = qty - plan[0][1]
+    if rest > 0:
+        total = db.stock_total(con, cid)
+        if total < qty:
+            raise ApiError(409, f"库存不足:需要 {qty},仅有 {total}")
+        for s in con.execute(
+                "SELECT location_id, qty FROM stock WHERE component_id=? AND qty>0"
+                " AND location_id<>? ORDER BY qty DESC", (cid, loc)):
+            if rest <= 0:
+                break
+            take = min(rest, int(s["qty"]))
+            plan.append((s["location_id"], take))
+            rest -= take
+    ids = []
+    for src, take in plan:
+        if take <= 0:
+            continue
+        was = _qty_at(con, cid, src)
+        _bump(con, cid, src, -take)
+        ids.append(_log_move(con, "OUT", cid, src, take, project_id=project_id,
+                             bom_id=bom_id, ref=ref, operator=operator,
+                             note=note, qty_before=was))
+    if not ids:
+        raise ApiError(409, "没有可出库的数量")
+    return ids
+
+
+def _credit_placed(con, bom_id, qty: int) -> None:
+    """出库成功后,把对应 BOM 行的「已发料」加上去。
+
+    界面上的「BOM 还需要数」就是这个数算出来的,所以它必须跟着动 ——
+    否则用户出了 8 个,界面还说「还差 10 个」。
+    """
+    if bom_id and qty:
+        con.execute("UPDATE project_bom SET placed_qty = placed_qty + ? WHERE id=?",
+                    (qty, bom_id))
+
+
+@route("POST", r"/api/stock/batch")
+def stock_batch(ctx: Ctx, m):
+    """一键批量开单:入库或出库一次报多行,逐行给结果。
+
+    入库侧主要是「按 BOM 收料」那个勾选清单:一箱货到了,勾掉收到的,
+    一次全部入库。出库侧走的是 /api/projects/{id}/pick(要按 BOM 行分配),
+    这里只做直接的元件级开单。
+
+    整批一个事务提交:某一行失败不影响其余已经成功的行(逐行 try),
+    但不会出现「提交了一半」的状态。
+    """
+    kind = str(ctx.require("kind")).upper()
+    if kind not in ("IN", "OUT"):
+        raise ApiError(400, "批量开单只支持 IN / OUT")
+    raw = ctx.b("items") or []
+    if not isinstance(raw, list) or not raw:
+        raise ApiError(400, "items 不能为空")
+
+    default_loc = ctx.b("location") or ctx.b("location_id")
+    operator = ctx.b("operator")
+    ref = ctx.b("ref")
+    done, failed = [], []
+    for i, it in enumerate(raw):
+        cid = int(it.get("component_id") or 0)
+        qty = int(it.get("qty") or 0)
+        try:
+            if not cid:
+                raise ApiError(400, "缺 component_id")
+            comp = ctx.con.execute("SELECT * FROM component WHERE id=?",
+                                   (cid,)).fetchone()
+            if not comp:
+                raise ApiError(404, "元件不存在")
+            raw_loc = it.get("location") or it.get("location_id") or default_loc
+            loc = _fallback_location(ctx.con, comp) if raw_loc in (None, "") \
+                else _get_location_id(ctx.con, raw_loc)
+            ids = _apply_move(
+                ctx.con, kind, cid, qty, loc,
+                project_id=ctx.bi("project_id") or it.get("project_id"),
+                bom_id=it.get("bom_id"),
+                ref=it.get("ref") or ref, operator=it.get("operator") or operator,
+                note=it.get("note") or ctx.b("note"),
+                spill=(kind == "OUT"))
+            # 只有出库才算「这条 BOM 需求被发料了」。入库记 bom_id 是为了留下
+            # 来路(这批货是为哪个项目买的),但**绝不能**去加已发料 ——
+            # 加了的话,货一进库界面就会说「齐了」,反而发不出去了。
+            if kind == "OUT":
+                _credit_placed(ctx.con, it.get("bom_id"), qty)
+            done.append({"component_id": cid, "name": comp["name"], "qty": qty,
+                         "movement_ids": ids})
+        except ApiError as exc:
+            failed.append({"index": i, "component_id": cid, "qty": qty,
+                           "reason": exc.message})
+    ctx.con.commit()
+    return 200, {"ok": not failed, "kind": kind,
+                 "done": done, "failed": failed,
+                 "total_qty": sum(d["qty"] for d in done)}
+
+
 @route("POST", r"/api/stock/move")
 def stock_move(ctx: Ctx, m):
     """入库/出库/盘点/移库。全部在一个事务里完成。"""
@@ -926,36 +1075,22 @@ def stock_move(ctx: Ctx, m):
         to_loc = _get_location_id(ctx.con, ctx.b("to_location") or ctx.b("to_location_id"))
         if to_loc == loc:
             raise ApiError(400, "移库的来源与目标仓位相同")
-        if qty <= 0:
-            raise ApiError(400, "移库数量必须大于 0")
-    if kind in ("IN", "OUT") and qty <= 0:
-        raise ApiError(400, "数量必须大于 0")
 
-    if kind == "IN":
-        before = _qty_at(ctx.con, cid, loc)
-        after = _bump(ctx.con, cid, loc, qty)
-    elif kind == "OUT":
-        before = _qty_at(ctx.con, cid, loc)
-        after = _bump(ctx.con, cid, loc, -qty)
-    elif kind == "ADJUST":
-        before = _qty_at(ctx.con, cid, loc)
-        after = _bump(ctx.con, cid, loc, qty - before)
-        # 盘点记录里的 qty 是「新数量」,所以必须把「原来多少」也存下来,
-        # 否则以后没法撤销它
-        ctx.body["note"] = (ctx.b("note") or "") + f"（盘点:原 {before} → 新 {qty}）"
-    else:  # TRANSFER
-        before = _qty_at(ctx.con, cid, loc)
-        _bump(ctx.con, cid, loc, -qty)
-        after = _bump(ctx.con, cid, to_loc, qty)
-
-    mid = _log_move(ctx.con, kind, cid, loc, qty, to_location_id=to_loc,
-                    project_id=ctx.bi("project_id"), ref=ctx.b("ref"),
-                    operator=ctx.b("operator"), note=ctx.b("note"),
-                    qty_before=before)
+    ids = _apply_move(ctx.con, kind, cid, qty, loc, to_loc=to_loc,
+                      project_id=ctx.bi("project_id"), bom_id=ctx.bi("bom_id"),
+                      ref=ctx.b("ref"), operator=ctx.b("operator"),
+                      note=ctx.b("note"))
+    mid = ids[-1]
+    _credit_placed(ctx.con, ctx.bi("bom_id"), qty if kind == "OUT" else 0)
     ctx.con.commit()
 
     on_hand = db.stock_total(ctx.con, cid)
-    return 200, {"ok": True, "movement_id": mid, "qty_at_location": after,
+    # 移库问「现在落在哪儿」,答案当然在目标仓位;其余动作都在本仓位。
+    # 这里曾经返回源仓位,于是「移库 2 个」看上去像只移过去 1 个 ——
+    # 自检里那条断言就是这么抓住它的。
+    at = to_loc if kind == "TRANSFER" else loc
+    return 200, {"ok": True, "movement_id": mid,
+                 "qty_at_location": _qty_at(ctx.con, cid, at),
                  "on_hand": on_hand}
 
 
@@ -1020,10 +1155,18 @@ def void_movement(ctx: Ctx, m):
     new_id = _log_move(
         ctx.con, back["kind"], cid, back["location_id"], back["qty"],
         to_location_id=back.get("to_location_id"),
-        project_id=mv["project_id"], ref=mv["ref"], operator=ctx.b("operator"),
+        project_id=mv["project_id"], bom_id=mv["bom_id"],
+        ref=mv["ref"], operator=ctx.b("operator"),
         note=f"撤销 #{mid}({who} {KIND_LABEL.get(kind, kind)} {qty})",
         qty_before=back.get("qty_before"), void_of=mid)
     ctx.con.execute("UPDATE movement SET voided=1 WHERE id=?", (mid,))
+
+    # 撤销一笔「按 BOM 领料」时,那条 BOM 需求的已发料也要退回去。
+    # 不退的话界面会说「还差 0 个」,而东西其实已经还回架上了 —— 账就成了假的。
+    if kind == "OUT" and mv["bom_id"]:
+        ctx.con.execute(
+            "UPDATE project_bom SET placed_qty = MAX(0, placed_qty - ?) WHERE id=?",
+            (qty, mv["bom_id"]))
 
     # 撤销「采购到货」时,采购单的已收数量也得退回去 —— 否则那张单永远收不完,
     # 而且「在途」会一直少算这一笔
@@ -1502,6 +1645,78 @@ def project_bom(ctx: Ctx, m):
     return 200, rep
 
 
+@route("GET", r"/api/projects/(\d+)/pick_plan")
+def project_pick_plan(ctx: Ctx, m):
+    """出库分配方案:每条 BOM 需求 + 库存里能拿来凑它的元件。
+
+    为什么要有这个接口:导出的 BOM 要的是「100nF 10 个」,而库里可能
+    0603 有 8 个、0805 有 2 个 —— 一条需求常常要由几颗不同的库存料凑齐。
+    界面得知道「这一行还差多少」和「哪些料能凑」,而且勾选、改数量时要能
+    在本地反复试算,不能每动一下就往返查一次库。
+
+    remaining 是「还需要发多少」(需求 − 已发料),就是界面上的「BOM 还需要数」。
+    """
+    pid = int(m.group(1))
+    proj = ctx.con.execute("SELECT * FROM project WHERE id=?", (pid,)).fetchone()
+    if not proj:
+        raise ApiError(404, "项目不存在")
+    rep = bom.build_report(ctx.con, pid)
+
+    try:
+        limit = int(ctx.q("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 30))
+
+    lines = []
+    for line in rep["lines"]:
+        cands = similar_components(
+            ctx.con, value=line["value"], package=line["package"],
+            category=line["category"], limit=limit, in_stock_only=True)
+        for c in cands:
+            c["own"] = False
+            c["substitute"] = False
+
+        # 这一行自己指定的那颗料,只要还有库存就必须排在最前面 ——
+        # 它才是 BOM 本来要的东西,相似度再高也只是「像」。
+        # 相似匹配找不到它(值不认、封装也不同)时也得补上,否则用户
+        # 在树上根本选不到自己 BOM 里写的那颗料。
+        row = ctx.con.execute(COMPONENT_SELECT + " WHERE c.id=? AND c.merged_into IS NULL",
+                              (line["component_id"],)).fetchone()
+        if row and (row["on_hand"] or 0) > 0:
+            entry = component_row(row)
+            entry.update({"score": None, "match": "BOM 本行指定的料",
+                          "verdict": "BOM 里就是它", "own": True, "substitute": False})
+            cands = [c for c in cands if c["id"] != entry["id"]]
+            cands.insert(0, entry)
+
+        # 替代料也放进来:用户设替代料就是为了「这颗不够时用那颗顶」,
+        # 而它的值可能和本行完全不同(相似匹配找不到),只按相似度会漏掉
+        known = {c["id"] for c in cands}
+        for s in line["substitutes"]:
+            if s["component_id"] in known or not s["on_hand"]:
+                continue
+            srow = ctx.con.execute(
+                COMPONENT_SELECT + " WHERE c.id=? AND c.merged_into IS NULL",
+                (s["component_id"],)).fetchone()
+            if not srow:
+                continue
+            entry = component_row(srow)
+            entry.update({"score": None, "match": "BOM 里登记的替代料",
+                          "verdict": "替代料", "own": False, "substitute": True})
+            cands.append(entry)
+            known.add(entry["id"])
+
+        lines.append(dict(line, remaining=max(0, line["need"] - line["placed_qty"]),
+                          candidates=cands))
+
+    return 200, {
+        "project_id": pid, "project_name": proj["name"], "boards": rep["boards"],
+        "line_count": len(lines), "lines": lines,
+        "hint": "一条 BOM 需求可以由几颗不同的库存料凑齐;勾选后确认出库。",
+    }
+
+
 @route("POST", r"/api/projects/(\d+)/pick")
 def pick_for_project(ctx: Ctx, m):
     """按 BOM 领料:对指定项目批量出库。items 传 [{component_id, qty, location_id?}] 或留空=整单。"""
@@ -1512,7 +1727,10 @@ def pick_for_project(ctx: Ctx, m):
 
     requested = ctx.b("items")
     if requested:
-        plan = [(int(i["component_id"]), int(i["qty"]), i.get("location_id") or i.get("location"))
+        # bom_id:这条出库是为哪一条 BOM 需求发的。一条需求可能由几颗不同的
+        # 库存料凑齐(0603 出 8 个 + 0805 出 2 个),不指明就对不上账。
+        plan = [(int(i["component_id"]), int(i["qty"]),
+                 i.get("location_id") or i.get("location"), i.get("bom_id"))
                 for i in requested]
     else:
         rep = bom.build_report(ctx.con, pid)
@@ -1520,51 +1738,32 @@ def pick_for_project(ctx: Ctx, m):
         for line in rep["lines"]:
             need = line["need"] - line["placed_qty"]
             if need > 0:
-                plan.append((line["component_id"], need, None))
+                plan.append((line["component_id"], need, None, line["bom_id"]))
 
     default_loc = ctx.b("location") or ctx.b("location_id") or "未分类"
     done, failed = [], []
-    for cid, qty, loc in plan:
+    for cid, qty, loc, bom_id in plan:
         try:
             if qty <= 0:
                 continue
             loc_id = _get_location_id(ctx.con, loc or default_loc)
-            # 库存不足时:只要总量够,从其他仓位凑
-            row = ctx.con.execute("SELECT qty FROM stock WHERE component_id=? AND location_id=?",
-                                  (cid, loc_id)).fetchone()
-            avail = int(row["qty"]) if row else 0
-            if avail < qty:
-                total = db.stock_total(ctx.con, cid)
-                if total < qty:
-                    raise ApiError(409, f"库存不足:需要 {qty},仅有 {total}")
-                # 先从其他仓位扣,再扣目标仓位
-                need = qty
-                for s in ctx.con.execute(
-                        "SELECT location_id, qty FROM stock WHERE component_id=? AND qty>0 "
-                        "AND location_id<>? ORDER BY qty DESC", (cid, loc_id)):
-                    if need <= 0:
-                        break
-                    take = min(need, int(s["qty"]))
-                    was = _qty_at(ctx.con, cid, s["location_id"])
-                    _bump(ctx.con, cid, s["location_id"], -take)
-                    _log_move(ctx.con, "OUT", cid, s["location_id"], take,
-                              project_id=pid, ref=ctx.b("ref"),
-                              operator=ctx.b("operator"), qty_before=was,
-                              note=f"项目领料({proj['name']})")
-                    need -= take
-                avail = need
-            was = _qty_at(ctx.con, cid, loc_id)
-            _bump(ctx.con, cid, loc_id, -avail)
-            _log_move(ctx.con, "OUT", cid, loc_id, avail, project_id=pid,
-                      ref=ctx.b("ref"), operator=ctx.b("operator"), qty_before=was,
-                      note=f"项目领料({proj['name']})")
-            ctx.con.execute(
-                """UPDATE project_bom SET placed_qty = placed_qty + ?
-                   WHERE project_id=? AND component_id=?""", (qty, pid, cid))
+            # spill=True:目标仓位不够时,只要总量够就从其他仓位凑
+            ids = _apply_move(ctx.con, "OUT", cid, qty, loc_id, project_id=pid,
+                              bom_id=bom_id, ref=ctx.b("ref"),
+                              operator=ctx.b("operator"), note=f"项目领料({proj['name']})",
+                              spill=True)
+            if bom_id:
+                _credit_placed(ctx.con, bom_id, qty)
+            else:
+                ctx.con.execute(
+                    """UPDATE project_bom SET placed_qty = placed_qty + ?
+                       WHERE project_id=? AND component_id=?""", (qty, pid, cid))
             db.touch_component(ctx.con, cid)
-            done.append({"component_id": cid, "qty": qty})
+            done.append({"component_id": cid, "qty": qty, "bom_id": bom_id,
+                         "movement_ids": ids})
         except ApiError as exc:
-            failed.append({"component_id": cid, "qty": qty, "reason": exc.message})
+            failed.append({"component_id": cid, "qty": qty, "bom_id": bom_id,
+                           "reason": exc.message})
     ctx.con.commit()
     return 200, {"ok": not failed, "picked": done, "failed": failed}
 

@@ -204,6 +204,11 @@ ADDED_COLUMNS = {
     },
     "movement": {
         "purchase_id": "INTEGER REFERENCES purchase(id) ON DELETE SET NULL",
+        # 这条流水是为**哪一条 BOM 需求**发的。一条 BOM 需求可能由几颗不同的
+        # 库存料凑齐(0603 出 8 个 + 0805 出 2 个),光看 component_id 分不清
+        # 它们是在顶同一条需求。项目 BOM 被重新导入时,旧行的 id 会消失,
+        # 这一列就置空 —— 与其记一个指向别处的号,不如老实说「那条已经不在了」。
+        "bom_id": "INTEGER REFERENCES project_bom(id) ON DELETE SET NULL",
         # 撤销用的三列。做法是**写一条反向流水**并把原记录标记为已撤销,
         # 而不是把原记录删掉 —— 账本必须能重建,删了就查不出「那天到底是谁
         # 把它改成这样的」。qty_before 只在撤销盘点(ADJUST)时才用得上:

@@ -26,6 +26,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(BASE)
 sys.path.insert(0, os.path.join(ROOT, "app"))
 
+import db      # noqa: E402
 import gui     # noqa: E402
 import server  # noqa: E402
 
@@ -147,6 +148,23 @@ def main() -> int:
         os.remove(DB)
     shutil.copy2(os.path.join(ROOT, "data", "parts.db"), DB)
 
+    # 给每条 BOM 需求的那颗料补一点库存,让「按 BOM 出库」那张树有真实的
+    # 候选行。空表量不出列宽有没有溢出,而它是全套里唯一带 #0 树列的表。
+    _c = db.connect(DB)
+    db.init_db(_c)
+    _loc = _c.execute("SELECT id FROM location ORDER BY id LIMIT 1").fetchone()[0]
+    for (_cid,) in _c.execute(
+            "SELECT DISTINCT component_id FROM project_bom").fetchall():
+        if _c.execute("SELECT 1 FROM stock WHERE component_id=? AND location_id=?",
+                      (_cid, _loc)).fetchone():
+            _c.execute("UPDATE stock SET qty=5 WHERE component_id=? AND location_id=?",
+                       (_cid, _loc))
+        else:
+            _c.execute("INSERT INTO stock(component_id, location_id, qty)"
+                       " VALUES(?,?,5)", (_cid, _loc))
+    _c.commit()
+    _c.close()
+
     app = gui.App(DB)
     for geom in ("1360x830", "1060x640"):
         app.geometry(geom)
@@ -202,13 +220,22 @@ def main() -> int:
 
         # 开单搬到了项目 BOM 页,而且右半边变成了三个子页签 ——
         # 每一个的可用宽度都比以前窄一点,必须逐个量。
+        # 两个方向各有两种开单方式(按 BOM / 自由),四张表都要量:
+        # 「按 BOM 出库」那张是树,多一个 #0 树列,列宽账跟平表不一样。
         app.nb.select(app.tab_proj)
+        app.update()
         for k in ("pane_in", "pane_out"):
-            app.tab_proj.sub.select(app.tab_proj.__dict__[k])
-            app.update()
-            app.update_idletasks()
-            check_trees(app.tab_proj.__dict__[k], f"proj/{k}", strict)
-            check_squashed(app.tab_proj.__dict__[k], f"proj/{k}")
+            pane = app.tab_proj.__dict__[k]
+            for mode, tag in (("bom", "按BOM"), ("free", "自由")):
+                pane.mode.set(mode)
+                pane._sync_mode()
+                app.tab_proj.sub.select(pane)
+                app.update()
+                app.update_idletasks()
+                check_trees(pane, f"proj/{k}-{tag}", strict)
+                check_squashed(pane, f"proj/{k}-{tag}")
+            pane.mode.set("bom")
+            pane._sync_mode()
         app.tab_proj.sub.select(0)
         app.update()
         app.update_idletasks()

@@ -1048,6 +1048,125 @@ check("两个条件都空时什么都不给(没有比对的依据)",
 check("limit 参数管用",
       len(call(server.components_similar, query={"package": "0603", "limit": "1"})[1]["items"]), 1)
 
+p("\n【29】出库分配方案:一条 BOM 需求,由几颗库存料来凑")
+P29 = call(server.create_project, body={"name": "SELFTEST-分配方案"})[1]["id"]
+C_BOM = mk_raw("分配-BOM\u6307\u5b9a\u768468nF", "68nF", "0603", "\u7535\u5bb9")
+C_A = mk_raw("分配-68nF-0603", "68nF", "0603", "\u7535\u5bb9", 8)
+C_C = mk_raw("分配-68nF-0805", "68nF", "0805", "\u7535\u5bb9", 2)
+B29 = call(server.add_bom_line, match=(P29,),
+           body={"component_id": C_BOM, "required_qty": 10})[1]["id"]
+
+_s, plan = call(server.project_pick_plan, match=(P29,))
+check("接口认得这个项目", plan["project_id"], P29)
+line = next(l for l in plan["lines"] if l["bom_id"] == B29)
+check("这一行要 10 个", line["need"], 10)
+check("还需要 10 个(还没发过料)", line["remaining"], 10)
+check("候选正好是那两颗有库存的",
+      sorted(c["id"] for c in line["candidates"]), sorted([C_A, C_C]))
+check("值+封装都对上的排最前面", line["candidates"][0]["id"], C_A)
+check("封装不同的排后面,但也在(它就是用来凑剩下的那 2 个)",
+      line["candidates"][1]["id"], C_C)
+check("第一颗的把握是「很可能是同一颗」",
+      line["candidates"][0]["verdict"], "\u5f88\u53ef\u80fd\u662f\u540c\u4e00\u9897")
+check("第二颗会提醒你封装要自己看",
+      line["candidates"][1]["verdict"], "\u503c\u5bf9\u4e0a\u4e86,\u5c01\u88c5\u8981\u81ea\u5df1\u770b")
+check("BOM 自己那颗没库存,所以不进候选",
+      C_BOM in [c["id"] for c in line["candidates"]], False)
+check("说了这一屏该怎么用", "凑齐" in plan["hint"], True)
+
+# BOM 自己指定的那颗只要还有库存,必须排最前面 —— 相似度再高也只是「像」
+call(server.stock_move, body={"kind": "IN", "component_id": C_BOM, "qty": 5})
+_s, plan2 = call(server.project_pick_plan, match=(P29,))
+line2 = next(l for l in plan2["lines"] if l["bom_id"] == B29)
+check("BOM 自己那颗有库存时排最前面", line2["candidates"][0]["id"], C_BOM)
+check("而且标出它就是 BOM 本行指定的料", line2["candidates"][0]["own"], True)
+
+# 替代料:用户设它就是为了「这颗不够时拿那颗顶」,值可能完全不同,
+# 只按相似度会漏掉,所以必须单独放进来
+C_SUB = mk_raw("分配-\u66ff\u4ee3\u6599", "82nF", "1206", "\u7535\u5bb9", 3)
+call(server.add_substitute, match=(B29,), body={"component_id": C_SUB})
+_s, plan3 = call(server.project_pick_plan, match=(P29,))
+line3 = next(l for l in plan3["lines"] if l["bom_id"] == B29)
+check("登记过的替代料也进候选(哪怕值和封装都不一样)",
+      C_SUB in [c["id"] for c in line3["candidates"]], True)
+check("标明它是替代料,不是靠相似度猜来的",
+      next(c["substitute"] for c in line3["candidates"] if c["id"] == C_SUB), True)
+
+# 库里一颗都没有的需求:方案里照样要出现,只是候选是空的 ——
+# 从方案里悄悄抹掉的话,用户会以为「这条需求不存在」
+C_NONE = mk_raw("分配-\u5e93\u91cc\u6ca1\u6709\u7684", "XF-9999", "NOPE999",
+                "SELFTEST-\u65e0\u5e93\u5b58\u7c7b")
+B_none = call(server.add_bom_line, match=(P29,),
+              body={"component_id": C_NONE, "required_qty": 3})[1]["id"]
+_s, plan4 = call(server.project_pick_plan, match=(P29,))
+line4 = next(l for l in plan4["lines"] if l["bom_id"] == B_none)
+check("库里一颗都凑不出的需求,候选是空的", line4["candidates"], [])
+check("但它照样出现在方案里(不能因为没库存就不列)",
+      line4["remaining"], 3)
+
+p("\n【30】批量开单:逐行给结果,一行坏不拖累别的行")
+C31 = mk_raw("批量-\u5165\u5e93\u6599", "1k\u03a9", "0801", "\u7535\u9631")
+C32 = mk_raw("批量-\u51fa\u5e93\u6599", "2k\u03a9", "0802", "\u7535\u9631", 5)
+_s, r = call(server.stock_batch, body={"kind": "IN", "items": [
+    {"component_id": C31, "qty": 3},
+    {"component_id": 999999, "qty": 1},
+    {"component_id": C32, "qty": 2},
+]})
+check("批量入库成功两行", len(r["done"]), 2)
+check("失败一行", len(r["failed"]), 1)
+check("失败那行说清楚了为什么", "不存在" in r["failed"][0]["reason"], True)
+check("成功的那些照样落库",
+      CON.execute("SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?",
+                  (C31,)).fetchone()[0], 3)
+check("总数量只算成功的那几行", r["total_qty"], 5)
+check("有一行没成,ok 就得是 False(界面要如实说)", r["ok"], False)
+
+# 出库:目标仓位不够时从别的仓位凑,而且要把「已发料」记到对应的 BOM 需求上
+C33 = mk_raw("批量-\u5206\u6563\u5728\u4e24\u5730", "3k\u03a9", "0803", "\u7535\u9631")
+call(server.stock_move, body={"kind": "IN", "component_id": C33, "qty": 1,
+                              "location": "\u672a\u5206\u7c7b"})
+call(server.stock_move, body={"kind": "IN", "component_id": C33, "qty": 4,
+                              "location": "SELFTEST-L2"})
+P30 = call(server.create_project, body={"name": "SELFTEST-批量出库"})[1]["id"]
+B30 = call(server.add_bom_line, match=(P30,),
+           body={"component_id": C33, "required_qty": 4})[1]["id"]
+_s, outs = call(server.pick_for_project, match=(P30,), body={"items": [
+    {"bom_id": B30, "component_id": C33, "qty": 4, "location": "\u672a\u5206\u7c7b"}]})
+check("按 BOM 出库整体成功", outs["ok"], True)
+check("目标仓位只有 1 个,剩下的自动从别的仓位凑",
+      CON.execute("SELECT COALESCE(SUM(qty),0) FROM stock WHERE component_id=?",
+                  (C33,)).fetchone()[0], 1)
+check("凑的过程拆成了两条流水(仓位是真的动了)",
+      len(outs["picked"][0]["movement_ids"]), 2)
+check("已发料记到那条 BOM 需求上,不是记到元件上",
+      CON.execute("SELECT placed_qty FROM project_bom WHERE id=?",
+                  (B30,)).fetchone()[0], 4)
+# 注意区别:「缺口 gap」说的是**库里还差多少**(发料不会让库存回来),
+# 「还需要 remaining」才是**还要发多少**。发完这 4 个,后者归零、前者照旧。
+_s, rep30 = call(server.project_bom, match=(P30,))
+l30 = next(l for l in rep30["lines"] if l["bom_id"] == B30)
+check("发完之后「还需要」归零", l30["remaining"], 0)
+check("但库里的缺口照旧在(发给板子不等于补回库存):需求 4 减掉还剩的 1 个", l30["gap"], 3)
+
+# 入库也带 bom_id:留下的只是「这批货是为哪条需求买的」,不能算成已发料
+_s, inb = call(server.stock_batch, body={"kind": "IN", "items": [
+    {"component_id": C33, "qty": 4, "bom_id": B30}]})
+check("批量入库也留下了来路(为哪条需求买的)",
+      CON.execute("SELECT COUNT(*) FROM movement WHERE bom_id=? AND kind='IN'",
+                  (B30,)).fetchone()[0], 1)
+check("但入库**不算**已发料 —— 货进来不等于发给板子了",
+      CON.execute("SELECT placed_qty FROM project_bom WHERE id=?",
+                  (B30,)).fetchone()[0], 4)
+
+M30 = outs["picked"][0]["movement_ids"][0]
+call(server.void_movement, match=(M30,), body={"operator": "SELFTEST"})
+check("撤销一笔出库,已发料跟着退回去",
+      CON.execute("SELECT placed_qty FROM project_bom WHERE id=?",
+                  (B30,)).fetchone()[0], 3)
+check("撤销补的反向流水也记着那条需求",
+      CON.execute("SELECT COUNT(*) FROM movement WHERE bom_id=?", (B30,)
+                  ).fetchone()[0] >= 4, True)
+
 CON.close()
 p("\n" + "=" * 62)
 p(f"结果:{'全部通过' if not FAILS else '失败 ' + str(len(FAILS)) + ' 项'}")

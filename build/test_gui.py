@@ -418,6 +418,18 @@ def main() -> int:
               pr.pane_in.form.only_stocked.get(), False)
         check("出库方向默认只列有库存的",
               pr.pane_out.form.only_stocked.get(), True)
+        # 两个方向现在各有两种开单方式,默认是「按 BOM」。下面这一段测的是
+        # 「自由」那条路(不在 BOM 上的东西),所以先切过去;按 BOM 那两块
+        # 单独在【27】【28】里测
+        check("两个方向默认都按 BOM 开单",
+              (pr.pane_in.mode.get(), pr.pane_out.mode.get()), ("bom", "bom"))
+        check("入库区默认那块是按 BOM 收料清单",
+              isinstance(pr.pane_in.bom_form, gui.BomReceivePane), True)
+        check("出库区默认那块是按 BOM 分配树",
+              isinstance(pr.pane_out.bom_form, gui.BomPickPane), True)
+        pr.pane_in.show_free()
+        pr.pane_out.show_free()
+        app.update()
         p(f"  [OK ] 项目页 {len(pr.t_proj.get_children())} 个项目,"
           f"BOM {len(pr.t_bom.get_children())} 行,缺料标签「{pr.shortage.get()}」")
 
@@ -482,6 +494,10 @@ def main() -> int:
               any("撤销" in str(gui.call(app.con, server.list_movements,
                                         query={"kind": "OUT"})["items"][k]["note"])
                   for k in range(3)), True)
+
+        pr.pane_in.show_bom()
+        pr.pane_out.show_bom()
+        app.update()
 
         app.nb.select(app.tab_move)
         app.update()
@@ -1177,9 +1193,12 @@ def main() -> int:
             check("「不指定项目」也永远在",
                   st.NONE_PROJ in st.cb_proj.cget("values"), True)
 
-            # 在「项目 BOM」页里真的收一次货
+            # 在「项目 BOM」页里真的收一次货。这一页默认是「按 BOM 收料」清单,
+            # 按 BOM 那两块在【27】【28】里单独测,这里测的是「自由入库」那条路
             pr = app.tab_proj
             pr.t_proj.selection_set(str(pid))
+            app.update()
+            pr.pane_in.show_free()
             app.update()
             check("选中项目后开单区左边有元件可选(不能是空列表)",
                   len(pr.pane_in.form.tree.get_children()) > 0, True)
@@ -1432,7 +1451,10 @@ def main() -> int:
                 check("出库方向默认只看有库存的", seen.get("in_stock_only"), True)
                 check("接了回调,挑中之后能接着开单", bool(seen.get("on_pick")), True)
 
-            # 开单区那个按钮:入库方向刻意**不**勾只看有库存的
+            # 开单区那个按钮:入库方向刻意**不**勾只看有库存的。
+            # 「找相似…」在「自由入库」那块上,所以先切过去
+            pr.pane_in.show_free()
+            app.update()
             f_in = pr.pane_in.form
             if f_in._items:
                 # 挑一颗有值的料,不然这条断言等于没测到「预填」
@@ -1453,12 +1475,18 @@ def main() -> int:
         finally:
             gui.SimilarDialog = real_sim
 
-        # 挑中之后切到出库子页签并选中它
+        # 挑中之后切到出库子页签。库里这颗料要是那条 BOM 需求的候选,就挂在
+        # 分配树上勾好;不是候选(比如根本没库存)就退回「自由出库」选中它 ——
+        # 这两条路都不能「点了没反应」
+        pr.pane_out.show_free()
+        app.update()
         out_form = pr.pane_out.form
         out_ids = list(out_form._items)
         if out_ids:
             cid = out_ids[0]
-            pr._pick_similar_from_line(cid)
+            _bom0 = pr.t_bom.get_children()
+            bid_for = int(_bom0[0]) if _bom0 else 1
+            pr._pick_similar_from_line(bid_for, cid)
             app.update()
             check("挑中之后自动切到「元件出库」子页签",
                   pr.sub.index(pr.sub.select()), 2)
@@ -1485,6 +1513,294 @@ def main() -> int:
             out_form.q.set("")
             out_form.reload()
             app.update()
+
+
+        # ==================================================== 按 BOM 收料清单
+        p("\n【27】按 BOM 收料:品类看得见、能勾选、一键入库")
+        pid27 = API(server.create_project, body={"name": "SELFTEST-收料", "qty": 1})["id"]
+        c27a = API(server.create_component, body={
+            "name": "SELFTEST-收料电容", "category": "电容",
+            "value": "1uF", "package": "0603"})["id"]
+        c27b = API(server.create_component, body={
+            "name": "SELFTEST-收料电阻", "category": "电阻",
+            "value": "10k\u03a9", "package": "0603"})["id"]
+        b27a = API(server.add_bom_line, match=(pid27,),
+                   body={"component_id": c27a, "required_qty": 7})["id"]
+        b27b = API(server.add_bom_line, match=(pid27,),
+                   body={"component_id": c27b, "required_qty": 4})["id"]
+
+        app.refresh_all()
+        app.update()
+        pr.t_proj.selection_set(str(pid27))
+        app.nb.select(app.tab_proj)
+        pr.sub.select(pr.pane_in)
+        pr.pane_in.show_bom()
+        app.update()
+        rp = pr.pane_in.bom_form
+        rp.set_project(pid27)
+        app.update()
+
+        check("收料清单按 BOM 展开", len(rp.lines), 2)
+        cols = [rp.tree.heading(k, "text") for k in rp.tree["columns"]]
+        check("表里有「品类」这一列(收料时最容易搞错的就是这个)",
+              "品类" in cols, True)
+        check("勾选框那一列排在最前面", cols[0], "选")
+        rows = {int(i): rp.tree.item(i, "values") for i in rp.tree.get_children()}
+        check("每行都写着品类", sorted(r[2] for r in rows.values()), ["\u7535\u5bb9", "\u7535\u963b"])
+        check("数量默认取 BOM 需求,不用自己填",
+              sorted(int(r[8]) for r in rows.values()), [4, 7])
+        check("默认一个都没勾(勾了才是收到了)", len(rp.picked), 0)
+        check("每条最前面都是空框", sorted(set(r[0] for r in rows.values())),
+              [gui.CHECK_OFF])
+
+        # 走真实的点击路径,而不是直接调 toggle —— 「点不上」正是要防的毛病
+        rp.tree.see(str(b27a))
+        rp.tree.update_idletasks()
+        bbox = rp.tree.bbox(str(b27a), "#1")
+        check("那个勾选框真的画在屏幕上了", bool(bbox), True)
+        if bbox:
+            class _Ev:
+                pass
+            ev = _Ev()
+            ev.x, ev.y = bbox[0] + bbox[2] // 2, bbox[1] + bbox[3] // 2
+            rp.on_click(ev)
+            app.update()
+        check("点「选」那一格就勾上了", b27a in rp.picked, True)
+        check("勾上之后格子里是打钩", rp.tree.item(str(b27a), "values")[0],
+              gui.CHECK_ON)
+        rp.on_click(ev)
+        app.update()
+        check("再点一下取消勾选", b27a in rp.picked, False)
+        rp.on_click(ev)
+        app.update()
+        check("再点回来又勾上了", b27a in rp.picked, True)
+
+        # 双击改数量
+        _ask27 = gui.ask_text
+        gui.ask_text = lambda *a, **k: "5"
+        try:
+            rp.edit_qty(str(b27b))
+            app.update()
+        finally:
+            gui.ask_text = _ask27
+        check("双击能改这一行的数量", int(rp.tree.item(str(b27b), "values")[8]), 5)
+        check("改了数量就顺手勾上(不然改了也不算)", b27b in rp.picked, True)
+
+        _ask27b = gui.ask_text
+        gui.ask_text = lambda *a, **k: "三"
+        try:
+            rp.edit_qty(str(b27b))
+            app.update()
+        finally:
+            gui.ask_text = _ask27b
+        check("填了不是数字的东西,数量不变",
+              int(rp.tree.item(str(b27b), "values")[8]), 5)
+
+        rp.check_all(True)
+        app.update()
+        check("「全选」把两行都勾上", sorted(rp.picked), sorted([b27a, b27b]))
+        check("摘要里写着勾了几行、共几个", "2 \u884c" in rp.hint.get(), True)
+
+        _mb27 = gui.messagebox
+        box27 = FakeBox()
+        gui.messagebox = box27
+        try:
+            rp.submit()
+            app.update()
+        finally:
+            gui.messagebox = _mb27
+        check("提交前先把要收的东西念了一遍", bool(box27.asks), True)
+        for _cid27, _want27 in ((c27a, 7), (c27b, 5)):
+            check(f"一键入库把 {_want27} 个收进来了",
+                  app_con.execute("SELECT COALESCE(SUM(qty),0) FROM stock "
+                                  "WHERE component_id=?", (_cid27,)).fetchone()[0], _want27)
+        check("两笔都记在这个项目名下",
+              app_con.execute("SELECT COUNT(*) FROM movement WHERE project_id=? "
+                              "AND kind='IN' AND voided=0", (pid27,)).fetchone()[0], 2)
+        check("流水还记得它是为哪条 BOM 需求收的",
+              app_con.execute("SELECT COUNT(*) FROM movement WHERE bom_id=?",
+                              (b27a,)).fetchone()[0], 1)
+        check("收完把勾清空,免得再点一次又收一遍", len(rp.picked), 0)
+        check("入库**不该**动「已发料」(货进来不等于发给板子了)",
+              app_con.execute("SELECT COALESCE(SUM(placed_qty),0) FROM project_bom "
+                              "WHERE project_id=?", (pid27,)).fetchone()[0], 0)
+
+        # 收完货切到「元件出库」:刚收进来的那颗料必须已经出现在候选里。
+        # 两张表看的是同一份库存,切过去还显示旧数字的话,用户会以为
+        # 「我明明收了,怎么找不到」
+        pr.sub.select(pr.pane_out)
+        app.update()
+        po27 = pr.pane_out.bom_form
+        _ln27 = next(l for l in po27.lines if l["bom_id"] == b27a)
+        check("切到出库页,刚收进来的那颗料就在候选里",
+              c27a in [c["id"] for c in _ln27["candidates"]], True)
+        check("而且候选上写的库存就是刚收的 7 个",
+              next(c["on_hand"] for c in _ln27["candidates"]
+                   if c["id"] == c27a), 7)
+        pr.sub.select(0)
+        app.update()
+
+        # ==================================================== 按 BOM 出库分配树
+        p("\n【28】按 BOM 出库:一条需求由几颗库存料凑齐")
+        pid28 = API(server.create_project, body={"name": "SELFTEST-分配", "qty": 1})["id"]
+        c28bom = API(server.create_component, body={
+            "name": "SELFTEST-BOM\u6307\u5b9a\u7684\u7535\u5bb9", "category": "\u7535\u5bb9",
+            "value": "68nF", "package": "0603"})["id"]
+        b28 = API(server.add_bom_line, match=(pid28,),
+                  body={"component_id": c28bom, "required_qty": 10})["id"]
+        c28a = API(server.create_component, body={
+            "name": "SELFTEST-68nF-0603-\u5e93\u5b58", "category": "\u7535\u5bb9",
+            "value": "68nF", "package": "0603"})["id"]
+        c28c = API(server.create_component, body={
+            "name": "SELFTEST-68nF-0805-\u5e93\u5b58", "category": "\u7535\u5bb9",
+            "value": "68nF", "package": "0805"})["id"]
+        # 品类也用一个库里没有的:不然「品类相同」那一分会让别的料混进候选,
+        # 而这条要测的恰恰是「一颗都凑不出来」
+        c28none = API(server.create_component, body={
+            "name": "SELFTEST-\u5e93\u91cc\u6ca1\u6709\u7684\u6599",
+            "category": "SELFTEST-\u65e0\u5e93\u5b58\u7c7b", "value": "XF-9999",
+            "package": "NOPE999"})["id"]
+        b28none = API(server.add_bom_line, match=(pid28,),
+                      body={"component_id": c28none, "required_qty": 3})["id"]
+        # 库里:0603 有 8 个、0805 有 2 个 —— 正是「一条需求两颗料凑」的场景
+        API(server.stock_move, body={"kind": "IN", "component_id": c28a, "qty": 8,
+                                     "location": "\u672a\u5206\u7c7b"})
+        API(server.stock_move, body={"kind": "IN", "component_id": c28c, "qty": 2,
+                                     "location": "\u672a\u5206\u7c7b"})
+
+        app.refresh_all()
+        app.update()
+        pr.t_proj.selection_set(str(pid28))
+        app.update()
+        pp = pr.pane_out.bom_form
+        pr.pane_out.show_bom()
+        pp.set_project(pid28)
+        app.update()
+
+        plan = API(server.project_pick_plan, match=(pid28,))
+        line28 = next(l for l in plan["lines"] if l["bom_id"] == b28)
+        check("分配方案里这条需求要 10 个", line28["need"], 10)
+        check("还需要 10 个", line28["remaining"], 10)
+        check("能凑它的库存料有两颗",
+              sorted(c["id"] for c in line28["candidates"]), sorted([c28a, c28c]))
+        check("值+封装都对上的那颗排在最前面",
+              line28["candidates"][0]["id"], c28a)
+        check("封装不同的那颗也列出来了(它正是用来凑剩下的)",
+              line28["candidates"][1]["id"], c28c)
+
+        parent = str(b28)
+        check("这条需求成了树上的一行(父行)", pp.tree.exists(parent), True)
+        check("展开箭头下面挂着两颗库存料",
+              sorted(pp.tree.get_children(parent)),
+              sorted([pp.child_iid(b28, c28a), pp.child_iid(b28, c28c)]))
+        check("父行上写着还差多少", "\u8fd8\u5dee 10" in pp.tree.item(parent, "text"), True)
+        check("父行也带品类", pp.tree.item(parent, "values")[1], "\u7535\u5bb9")
+        check("子行默认没勾",
+              pp.tree.item(pp.child_iid(b28, c28a), "values")[0], gui.CHECK_OFF)
+
+        # ------- 用户要的就是这一件事:0603 出 8 个之后,0805 那边自动变成还差 2
+        pp.toggle(pp.child_iid(b28, c28a))
+        app.update()
+        check("勾上 0603 那颗,默认把它 8 个库存全出", pp.alloc[(b28, c28a)], 8)
+        check("父行的「还需要」立刻从 10 变成 2",
+              int(pp.tree.item(parent, "values")[6]), 2)
+        check("0805 那行的「还需要」也变成 2",
+              int(pp.tree.item(pp.child_iid(b28, c28c), "values")[6]), 2)
+        pp.toggle(pp.child_iid(b28, c28c))
+        app.update()
+        check("再勾 0805,默认正好补上剩下的 2 个", pp.alloc[(b28, c28c)], 2)
+        check("父行的「还需要」归零", int(pp.tree.item(parent, "values")[6]), 0)
+        check("父行上说「齐了」", "\u9f50\u4e86" in pp.tree.item(parent, "text"), True)
+
+        _mb28 = gui.messagebox
+        box28 = FakeBox()
+        gui.messagebox = box28
+        try:
+            pp.submit()
+            app.update()
+        finally:
+            gui.messagebox = _mb28
+        check("出库前把要发的东西念了一遍", bool(box28.asks), True)
+        for _cid28 in (c28a, c28c):
+            check("那一颗的库存被扣光了",
+                  app_con.execute("SELECT COALESCE(SUM(qty),0) FROM stock "
+                                  "WHERE component_id=?", (_cid28,)).fetchone()[0], 0)
+        check("两笔流水都记在这个项目名下",
+              app_con.execute("SELECT COUNT(*) FROM movement WHERE project_id=? "
+                              "AND kind='OUT' AND voided=0", (pid28,)).fetchone()[0], 2)
+        check("两笔流水都记住了自己是顶哪条 BOM 需求",
+              app_con.execute("SELECT COUNT(*) FROM movement WHERE bom_id=?",
+                              (b28,)).fetchone()[0], 2)
+        check("这条 BOM 需求的「已发料」记成了 10",
+              app_con.execute("SELECT placed_qty FROM project_bom WHERE id=?",
+                              (b28,)).fetchone()[0], 10)
+        check("出完勾选清空", len(pp.alloc), 0)
+
+        # 撤销一笔出库,已发料要退回去 —— 不退的话界面会说「还差 0 个」,
+        # 而东西其实已经还回架上了
+        mid28 = app_con.execute(
+            "SELECT id FROM movement WHERE bom_id=? AND kind='OUT' AND voided=0"
+            " ORDER BY id DESC LIMIT 1", (b28,)).fetchone()[0]
+        API(server.void_movement, match=(mid28,), body={"operator": "SELFTEST"})
+        check("撤销一笔出库后,已发料退回到 8",
+              app_con.execute("SELECT placed_qty FROM project_bom WHERE id=?",
+                              (b28,)).fetchone()[0], 8)
+        check("撤销补的反向流水也记着那条 BOM 需求",
+              app_con.execute("SELECT COUNT(*) FROM movement WHERE bom_id=?",
+                              (b28,)).fetchone()[0], 3)
+
+        # 库里一颗都没有的那条:展开不能是空的,空白会让人以为界面坏了
+        pp.set_project(pid28)
+        app.update()
+        check("库里一颗都没有的那条,展开写着「没有能凑它的料」",
+              pp.tree.exists(f"{b28none}:none"), True)
+        check("那种行勾不上", pp.is_checkable(f"{b28none}:none"), False)
+        check("不是这条需求的候选时勾不上,让调用方去解释",
+              pp.check_for(b28none, c28a), False)
+
+        # 自动配齐:按相似度先配一遍,但绝不自动提交
+        API(server.stock_move, body={"kind": "IN", "component_id": c28a, "qty": 20,
+                                     "location": "\u672a\u5206\u7c7b"})
+        pp.set_project(pid28)
+        app.update()
+        n_out = app_con.execute("SELECT COUNT(*) FROM movement WHERE project_id=? "
+                                "AND kind='OUT'", (pid28,)).fetchone()[0]
+        want_fill = next(l["remaining"] for l in pp.lines if l["bom_id"] == b28)
+        pp.auto_fill()
+        app.update()
+        check("自动配齐把缺口填满,填的正好是还差的那个数",
+              pp.alloc.get((b28, c28a)), want_fill)
+        check("填完之后这条需求就不缺了", pp.remain(b28), 0)
+        check("它只是填勾选,不会自己提交",
+              app_con.execute("SELECT COUNT(*) FROM movement WHERE project_id=? "
+                              "AND kind='OUT'", (pid28,)).fetchone()[0], n_out)
+
+        # BOM 自己指定的那颗料只要还有库存,就必须排在最前面 ——
+        # 它才是 BOM 本来要的东西,相似度再高也只是「像」
+        API(server.stock_move, body={"kind": "IN", "component_id": c28bom, "qty": 5,
+                                     "location": "\u672a\u5206\u7c7b"})
+        pp.set_project(pid28)
+        app.update()
+        line28b = next(l for l in pp.lines if l["bom_id"] == b28)
+        check("BOM 自己那颗料有库存时排在最前面",
+              line28b["candidates"][0]["id"], c28bom)
+        check("它被标成「BOM 本行指定的料」", line28b["candidates"][0]["own"], True)
+
+        # 从 BOM 明细的「找相似库存…」挑一颗:要自动切到出库页,并挂到这条
+        # 需求的分配树上勾好 —— 而不是丢回一个平表让人自己再找一遍
+        pr.t_bom.selection_set(str(b28))
+        app.update()
+        pp.alloc = {}
+        pr._pick_similar_from_line(b28, c28bom)
+        app.update()
+        check("从 BOM 明细挑中的料会自动切到「元件出库」子页签",
+              pr.sub.index(pr.sub.select()), 2)
+        check("并且按相似度挂在这条需求的分配树上勾好了",
+              (b28, c28bom) in pp.alloc, True)
+
+        pr.pane_in.show_bom()
+        pr.pane_out.show_bom()
+        app.update()
 
         app.refresh_all()
         app.update()
