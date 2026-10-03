@@ -745,6 +745,35 @@ _s, dup2 = call(server.component_duplicates)
 g2 = [g for g in dup2["groups"] if g["reason"] == "mpn" and g["key"] == "DUP-MPN-001"]
 check("查重结果里那一组消失了", len(g2), 0)
 
+# ---------------------------------------------------------------- 【25】
+# 出入库页靠 list_projects 的 moves 决定给不给项目摆卡片。导入 BOM 会建项目,
+# 但那一刻一件货都没动过 —— 摆出来等于把 BOM 当成一条出入库记录,是误导。
+p("\n【25】只有真的发生过出入库的项目才算「有过出入库」")
+_s, proj3 = call(server.create_project, body={"name": "没动过的项目"})
+P3 = proj3["id"]
+_s, c3 = call(server.create_component, body={"name": "统计流水测试料", "category": "其他"})
+C3 = c3["id"]
+_s, lp = call(server.list_projects)
+row3 = [i for i in lp["items"] if i["id"] == P3][0]
+check("刚建好、一次库都没动过的项目 moves = 0", row3["moves"], 0)
+check("last_move_at 也是空的", row3["last_move_at"], None)
+
+_s, mv3 = call(server.stock_move,
+               body={"kind": "IN", "component_id": C3, "qty": 4, "project_id": P3})
+_s, lp = call(server.list_projects)
+row3 = [i for i in lp["items"] if i["id"] == P3][0]
+check("真的入过一次库之后 moves = 1", row3["moves"], 1)
+check("last_move_at 记下了时间", bool(row3["last_move_at"]), True)
+
+_s, _ = call(server.void_movement, match=(str(mv3["movement_id"]),))
+_s, lp = call(server.list_projects)
+row3 = [i for i in lp["items"] if i["id"] == P3][0]
+# 收进来又撤了 = 没动过。撤销补的那笔反向流水本身也不算,
+# 否则「撤销一次」会把项目永远钉在「有过出入库」上
+check("撤销掉唯一那笔之后 moves 回到 0", row3["moves"], 0)
+check("反向流水不算一次出入库", CON.execute(
+    "SELECT COUNT(*) FROM movement WHERE project_id=?", (P3,)).fetchone()[0], 2)
+
 CON.close()
 p("\n" + "=" * 62)
 p(f"结果:{'全部通过' if not FAILS else '失败 ' + str(len(FAILS)) + ' 项'}")

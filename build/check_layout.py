@@ -194,6 +194,16 @@ def main() -> int:
         app.tab_stock.go_home()
         app.update()
         check_cards(app.tab_stock, "出入库项目卡片")
+        # 默认只显示真的有过出入库记录的项目,所以「项目卡片」这个状态在开发库上
+        # 可能一张都走不到。把开关打开,让那些卡片也过一次尺寸体检。
+        app.tab_stock.show_empty.set(True)
+        app.tab_stock._render_cards()
+        app.update()
+        app.update_idletasks()
+        check_cards(app.tab_stock, "出入库项目卡片(含还没出入过库的)")
+        app.tab_stock.show_empty.set(False)
+        app.tab_stock._render_cards()
+        app.update()
         try:
             keys = list(app.tab_stock.board.cards)
             if keys:

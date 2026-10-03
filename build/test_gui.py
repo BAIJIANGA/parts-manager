@@ -331,10 +331,28 @@ def main() -> int:
         check("进来是项目卡片首页", st.view, "home")
         check("入库 / 出库两个按钮都在", sorted(st.btn), ["IN", "OUT"])
         check("项目卡片里有「不指定项目」那一格", "0" in st.cards, True)
-        check("项目卡片数 = 项目数 + 1(不指定项目)",
+        live = [p for p in st._projects if p.get("moves")]
+        idle = [p for p in st._projects if not p.get("moves")]
+        check("默认只给真的有出入库记录的项目摆卡片",
+              len(st.cards), len(live) + 1)
+        check("导入过 BOM 但一次都没出入过库的项目默认不显示",
+              all(str(p["id"]) not in st.cards for p in idle), True)
+        if idle:
+            check("藏起来的项目数写在提示行里,不是悄悄消失",
+                  str(len(idle)) in st.home_hint.get(), True)
+        check("每张卡片都写着「点开开单」或出入库次数",
+              all(any("点开开单" in t or "出入库记录" in t or "还没出入过库" in t
+                      for t in card_labels(c)) for c in st.cards.values()), True)
+        # 卡片同时是「给这个项目开第一单」的唯一入口,藏死就成死路 —— 得能找回来
+        st.show_empty.set(True)
+        st._render_cards()
+        app.update()
+        check("勾上「显示还没出入过库的项目」后它们全都出来",
               len(st.cards), len(st._projects) + 1)
-        check("每张项目卡片都写着「点开开单 / 看记录」",
-              all("点开开单" in "".join(card_labels(c)) for c in st.cards.values()), True)
+        st.show_empty.set(False)
+        st._render_cards()
+        app.update()
+        check("取消勾选又收回去", len(st.cards), len(live) + 1)
         p(f"  项目卡片 {sorted(st.cards)}")
 
         st.open_project("0")
@@ -1080,6 +1098,50 @@ def main() -> int:
             check("「已合并的元件…」能查回并到哪儿去了",
                   "界面查重甲" in box4.infos[-1][1], True)
             dd.destroy()
+        finally:
+            gui.messagebox = real_box
+
+        p("\n【23】出入库首页只列真的有过出入库的项目")
+        box5 = FakeBox()
+        gui.messagebox = box5
+        try:
+            pid = API(server.create_project, body={"name": "界面收发货项目", "qty": 1})["id"]
+            cid = API(server.create_component, body={
+                "name": "界面收发货料", "category": "其他",
+                "value": "2k2Ω", "package": "0603"})["id"]
+            app.refresh_all()
+            app.nb.select(app.tab_stock)
+            st = app.tab_stock
+            st.go_home()
+            st.reload()
+            app.update()
+
+            check("刚建好、一次库都没动过的项目不摆卡片",
+                  str(pid) in st.cards, False)
+            check("但提示行说明了它被藏起来了",
+                  "先不显示" in st.home_hint.get(), True)
+
+            # 真的入一次库(挂在这个项目名下)
+            API(server.stock_move, body={"kind": "IN", "component_id": cid,
+                                         "qty": 3, "project_id": pid})
+            app.refresh_all()
+            st.reload()
+            app.update()
+            check("真的入过库之后,项目卡片出现了", str(pid) in st.cards, True)
+            check("卡片上写着有几次出入库记录",
+                  any("1 次出入库记录" in t for t in card_labels(st.cards[str(pid)])), True)
+
+            # 撤销掉这一次 —— 收进来又撤了,等于没动过,卡片应该收回
+            mid = API(server.list_movements,
+                      query={"project_id": str(pid)})["items"][0]["id"]
+            API(server.void_movement, match=(str(mid),))
+            app.refresh_all()
+            st.reload()
+            app.update()
+            check("撤销掉唯一那次出入库后,卡片又收回去了",
+                  str(pid) in st.cards, False)
+            check("项目本身还在,只是没记录所以不摆卡片",
+                  any(p["id"] == pid for p in st._projects), True)
         finally:
             gui.messagebox = real_box
 

@@ -1287,6 +1287,16 @@ def list_projects(ctx: Ctx, m):
         d["shortage_qty"] = rep["shortage_qty"]
         d["shortage_value"] = rep["shortage_value"]
         d["ready"] = rep["ready"]
+        # 这个项目**真的**发生过几次出入库。导入 BOM 本身不产生流水,所以刚导完
+        # 是 0 —— 出入库页就靠这个数决定要不要给项目摆一张卡片。
+        # 已撤销的(voided)和撤销动作本身(void_of)都不算:收进来又撤了,
+        # 等于没动过,卡片就该收回。
+        d["moves"] = int(ctx.con.execute(
+            "SELECT COUNT(*) AS n FROM movement "
+            "WHERE project_id=? AND voided=0 AND void_of IS NULL", (r["id"],)).fetchone()["n"])
+        d["last_move_at"] = ctx.con.execute(
+            "SELECT MAX(created_at) AS t FROM movement "
+            "WHERE project_id=? AND voided=0 AND void_of IS NULL", (r["id"],)).fetchone()["t"]
         items.append(d)
     return 200, {"items": items}
 

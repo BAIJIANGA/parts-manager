@@ -1151,6 +1151,19 @@ class StockTab(ttk.Frame):
     # ------------------------------------------------------ 页面:项目卡片
 
     def _build_home(self):
+        # 只有**真的发生过出入库**的项目才摆卡片。导入 BOM 会建项目,但那一刻
+        # 一件货都还没动过 —— 把它当成一条出入库记录摆出来是误导。
+        # 不过卡片同时是「给这个项目开第一单」的唯一入口,直接藏死就成了死路,
+        # 所以留一个默认关闭的开关兜底。
+        bar = ttk.Frame(self.page_home)
+        bar.pack(fill="x", pady=(0, 6))
+        self.show_empty = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="显示还没出入过库的项目",
+                        variable=self.show_empty,
+                        command=self._render_cards).pack(side="left")
+        self.home_hint = tk.StringVar()
+        ttk.Label(bar, textvariable=self.home_hint,
+                  style="Dim.TLabel").pack(side="left", padx=10)
         self.board = CardBoard(self.page_home, self.open_project)
         self.board.pack(fill="both", expand=True)
 
@@ -1178,15 +1191,32 @@ class StockTab(ttk.Frame):
         page.pack(fill="both", expand=True)
 
     def _render_cards(self):
+        # 「不指定项目」那一格永远在(日常补货要用),所以卡片区不会是空的 ——
+        # 「项目都被藏起来了」这件事只能靠上面那行提示说明,不能指望空状态。
+        live = [p for p in self._projects if p.get("moves")]
+        idle = [p for p in self._projects if not p.get("moves")]
+        show_idle = bool(self.show_empty.get())
         specs = []
-        for i, p in enumerate(self._projects):
+        for i, p in enumerate(live + (idle if show_idle else [])):
             name = p.get("name") or f"项目 {p['id']}"
+            n = p.get("moves") or 0
             specs.append((str(p["id"]), name, (name.strip()[:1] or "P").upper(),
                           PROJECT_COLORS[i % len(PROJECT_COLORS)],
-                          "点开开单 / 看记录", False))
+                          f"{n} 次出入库记录" if n else "还没出入过库", False))
         specs.append(("0", self.NO_PROJECT, "—", "#8d99a6",
                       "点开开单 / 看记录", False))
-        self.board.render(specs, empty_text="还没有项目。先到「项目 BOM」页导入一个。")
+        self.board.render(specs, empty_text="没有可显示的内容。")
+        if not self._projects:
+            self.home_hint.set("还没有项目。先到「项目 BOM」页导入一个。")
+        elif idle and not show_idle:
+            self.home_hint.set(
+                f"另有 {len(idle)} 个导入过 BOM、但一条出入库记录都还没有的项目,"
+                f"先不显示。要给它们开第一单,勾上左边这个框。")
+        elif idle:
+            self.home_hint.set(f"其中 {len(idle)} 个还没真出入过库,"
+                               f"卡片上写着「还没出入过库」。")
+        else:
+            self.home_hint.set("")
 
     # ------------------------------------------------------ 页面:某个项目
 
@@ -1305,7 +1335,8 @@ class StockTab(ttk.Frame):
             # 否则提交成功了但下面那半张表还是旧的
             self._load_records()
         else:
-            self.head.set(f"{self._act_label()}:先选一个项目,进去开单并看记录")
+            self.head.set(f"{self._act_label()}:先选一个项目,进去开单并看记录"
+                          f"(只列真的有过出入库的项目)")
 
     def _load_components(self):
         keep = self._current_id()      # 刷之前选中的是谁,刷完要还选回去
