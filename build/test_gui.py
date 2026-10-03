@@ -1121,17 +1121,45 @@ def main() -> int:
             check("但提示行说明了它被藏起来了",
                   "先不显示" in st.home_hint.get(), True)
 
+            # ---- 左边那排「找元件」列表:导入 BOM 建出来、一次没动过的料不该出现。
+            # 它们库存全是 0、全被标成红色「缺货」,在出入库页面上纯属噪音。
+            st.open_project(str(pid))
+            app.update()
+            check("二级页已打开", st.view, "proj")
+            check("默认勾着「只列有过出入库的」", st.only_moved.get(), True)
+            check("刚建出来、一次都没动过的元件不在列表里", cid in st._items, False)
+            # 列表里还有别的动过的料(前面几节造的),所以「空」这个状态
+            # 得靠一个搜不到的词去够到
+            st.q.set("不存在的料zzz")
+            st._load_components()
+            app.update()
+            check("搜不到时指出是筛选挡住的,并给出取消勾选这条路",
+                  "取消勾选" in st.list_hint.get(), True)
+            check("而且明确说是「有过出入库的里面没匹配」,不让人以为搜索坏了",
+                  "没有匹配" in st.list_hint.get(), True)
+            st.q.set("")
+            st._load_components()
+            app.update()
+            st.only_moved.set(False)
+            st._load_components()
+            app.update()
+            check("取消勾选后就能看到它(否则新料永远收不进来)", cid in st._items, True)
+
             # 真的入一次库(挂在这个项目名下)
             API(server.stock_move, body={"kind": "IN", "component_id": cid,
                                          "qty": 3, "project_id": pid})
             app.refresh_all()
+            st.only_moved.set(True)
             st.reload()
             app.update()
+            check("真的出入过库之后,它进列表了", cid in st._items, True)
+            check("列表上方写着这是筛选后的结果",
+                  "只列有过出入库的元件" in st.list_hint.get(), True)
             check("真的入过库之后,项目卡片出现了", str(pid) in st.cards, True)
             check("卡片上写着有几次出入库记录",
                   any("1 次出入库记录" in t for t in card_labels(st.cards[str(pid)])), True)
 
-            # 撤销掉这一次 —— 收进来又撤了,等于没动过,卡片应该收回
+            # 撤销掉这一次 —— 收进来又撤了,等于没动过,卡片和列表都该收回
             mid = API(server.list_movements,
                       query={"project_id": str(pid)})["items"][0]["id"]
             API(server.void_movement, match=(str(mid),))
@@ -1140,6 +1168,8 @@ def main() -> int:
             app.update()
             check("撤销掉唯一那次出入库后,卡片又收回去了",
                   str(pid) in st.cards, False)
+            check("撤销后它也退出出入库列表了(等于没动过)",
+                  cid in st._items, False)
             check("项目本身还在,只是没记录所以不摆卡片",
                   any(p["id"] == pid for p in st._projects), True)
         finally:

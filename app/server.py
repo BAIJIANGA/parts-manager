@@ -265,6 +265,19 @@ def list_components(ctx: Ctx, m):
     if ctx.q("manufacturer"):
         base_where.append("c.manufacturer LIKE ?")
         base_args.append(f"%{ctx.q('manufacturer')}%")
+    # moved=1:只要真的发生过出入库的元件。
+    # 导入 BOM 会凭空建出一堆库存为 0 的元件,它们在任何「出入库」的意义上都还不存在
+    # —— 出入库页默认就靠这个把它们挡在外面,只留下真正动过的那些。
+    # 已撤销的(voided)和撤销动作本身(void_of)都不算:收进来又撤了等于没动过。
+    if ctx.q("moved") in ("1", "true", "yes"):
+        base_where.append(
+            "EXISTS (SELECT 1 FROM movement m WHERE m.component_id = c.id"
+            " AND m.voided = 0 AND m.void_of IS NULL)")
+    # 反过来:只看还没动过的,用来查「我导进来但一直没买的东西」
+    if ctx.q("moved") == "0":
+        base_where.append(
+            "NOT EXISTS (SELECT 1 FROM movement m WHERE m.component_id = c.id"
+            " AND m.voided = 0 AND m.void_of IS NULL)")
 
     def opt_float(name):
         raw = ctx.q(name)
@@ -977,7 +990,14 @@ def list_movements(ctx: Ctx, m):
 
 @route("GET", r"/api/lowstock")
 def lowstock(ctx: Ctx, m):
-    sql = f"SELECT * FROM ({COMPONENT_SELECT}) WHERE stock_state IN ('low','out') ORDER BY on_hand, name"
+    inner = COMPONENT_SELECT
+    if ctx.q("moved") in ("1", "true", "yes"):
+        # EXISTS 必须写在 COMPONENT_SELECT 里面 —— 那里 c 才在作用域内。
+        # 套在外层的话 on_hand / stock_state 这些算出来的别名看得到,c 看不到。
+        inner += (" WHERE EXISTS (SELECT 1 FROM movement m WHERE m.component_id = c.id"
+                  " AND m.voided = 0 AND m.void_of IS NULL)")
+    sql = (f"SELECT * FROM ({inner}) WHERE stock_state IN ('low','out')"
+           " ORDER BY on_hand, name")
     return 200, {"items": [component_row(r) for r in ctx.con.execute(sql)]}
 
 

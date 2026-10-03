@@ -1247,6 +1247,16 @@ class StockTab(ttk.Frame):
         ent.pack(side="left")
         ent.bind("<KeyRelease>", lambda _e: self._load_components())
         ttk.Button(sbar, text="只看缺货", command=self.only_low).pack(side="left", padx=6)
+        # 导入 BOM 会凭空建出一堆库存为 0 的元件,在这个页面上全是标红的「缺货」。
+        # 它们在任何「出入库」的意义上都还不存在,所以默认挡在外面 ——
+        # 这一页只该出现真正动过的料。要收一批新货时把这个框取消掉。
+        self.only_moved = tk.BooleanVar(value=True)
+        ttk.Checkbutton(sbar, text="只列有过出入库的", variable=self.only_moved,
+                        command=self._load_components).pack(side="left")
+
+        self.list_hint = tk.StringVar()
+        ttk.Label(left, textvariable=self.list_hint, style="Dim.TLabel",
+                  wraplength=560, justify="left").pack(anchor="w", pady=(0, 4))
 
         f, self.tree = make_tree(left, [
             ("name", "名称", 190, "w", True),
@@ -1343,8 +1353,11 @@ class StockTab(ttk.Frame):
         query = {"limit": 500}
         if self.q.get().strip():
             query["q"] = self.q.get().strip()
+        only_moved = bool(self.only_moved.get())
+        if only_moved:
+            query["moved"] = "1"
         if getattr(self, "_only_low", False):
-            data = call(self.con, server.lowstock, quiet=True)
+            data = call(self.con, server.lowstock, query=query, quiet=True)
         else:
             data = call(self.con, server.list_components, query=query, quiet=True)
         if data is None:
@@ -1357,6 +1370,27 @@ class StockTab(ttk.Frame):
                 it.get("on_hand") or 0, STATE_LABEL.get(it.get("stock_state"), "")),
                 tags=(it.get("stock_state") or "",))
             self._items[it["id"]] = it
+        n = len(self._items)
+        if n:
+            self.list_hint.set(
+                f"只列有过出入库的元件:{n} 个。" if only_moved
+                else f"库里全部元件:{n} 个(含刚导入 BOM、还没动过的)。")
+        elif only_moved:
+            # 空列表必须解释清楚,否则看起来像坏了。而且要说清是「筛掉了」还是
+            # 「没搜到」—— 明明搜了东西却回一句「取消勾选就能看到全部」,
+            # 用户会以为搜索坏了。
+            kw = self.q.get().strip()
+            if kw:
+                self.list_hint.set(
+                    f"有过出入库的元件里没有匹配「{kw}」的。要连刚导入 BOM、"
+                    f"还没动过的也一起找,取消勾选上面的「只列有过出入库的」。")
+            else:
+                self.list_hint.set(
+                    "这里还没有任何有过出入库的元件。导入 BOM 建出来的新料不算 —— "
+                    "它们库存还是 0,一次都没动过。要收一批新货,把上面"
+                    "「只列有过出入库的」取消勾选,就能看到全部元件。")
+        else:
+            self.list_hint.set("没有匹配的元件。")
         # 开完单 app.refresh_all() 会走到这里。不把选中还回去的话,左侧会变成
         # 没选中任何元件的状态,下一次开单得重新点一遍 —— 连续入库很难用。
         if keep and keep in self._items:      # _items 的键是 int,别拿 str 去比

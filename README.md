@@ -46,12 +46,12 @@ venv\Scripts\python.exe app\server.py     # 网页版(可选,仅对照用)
 
 ### 自检
 
-三套,一共 **478 条断言**,都在 `data\parts.db` 的**副本**上跑,**不会动你的真实数据**:
+三套,一共 **497 条断言**,都在 `data\parts.db` 的**副本**上跑,**不会动你的真实数据**:
 
 ```
-python build\test_api.py      业务逻辑 213 条(口径、采购、仓位、盘点、CSV 导入、
-                              匹配、撤销、查重与合并、项目出入库统计)
-python build\test_gui.py      界面 265 条(7 个页签 + 全部弹窗真的构造并渲染一遍)
+python build\test_api.py      业务逻辑 223 条(口径、采购、仓位、盘点、CSV 导入、
+                              匹配、撤销、查重与合并、项目出入库统计、进出流水筛选)
+python build\test_gui.py      界面 274 条(7 个页签 + 全部弹窗真的构造并渲染一遍)
 python build\check_layout.py  排版体检:表格列宽是否超出可用宽度、有没有被压扁的容器、
                               卡片尺寸与重叠、首页搜索框有没有被按钮挤扁
 ```
@@ -256,6 +256,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
     不能让项目悄无声息地消失,那种「我明明导入过」的困惑比多一张卡片糟糕得多。
 - 开单在二级页里,不用先想好项目再翻回来找元件;提交后记录表**立刻**多一条,而且
   **左侧选中的元件不会掉** —— 可以连着开好几单
+- **左侧「找元件」列表默认只列真的有过出入库的元件**(勾选框「只列有过出入库的」)。
+  导入 BOM 会凭空建出几十个库存为 0 的元件,它们在一个还没开始的出入库流程里
+  全是标红的「缺货」噪音 —— 这一页只该出现真正动过的料。
+  - 判据和项目卡片同一个:`voided=0 AND void_of IS NULL` 的流水条数 > 0。
+    已撤销的不算,所以撤销掉唯一一次入库之后,那个元件也会退出列表。
+  - 按**元件**算,不按项目算:这颗料只要在哪儿真的动过一次,它就是一颗「真的在用」
+    的料,在任何项目的出入库页都该找得到。
+  - **要收一批新货时把勾去掉** —— 否则导入 BOM 的料永远进不了库。
+    列表上方一直写着当前是「只列有过出入库的: N 个」还是「库里全部元件: N 个」,
+    搜不到东西时也会说清是筛选挡住的、还是真的没有,免得看成搜索坏了。
 - 盘点 / 移库不在两个页签里(它们不是「进 / 出」这种方向性动作),用页签右边那个
   **「盘点 / 移库…」**按钮开,或者在「库存」页右键一个元件也行
 
@@ -534,7 +544,8 @@ BOM 这种规整表格只需要读共享字符串表和单元格值,约 150 行�
 
 ```
 GET    /api/summary    ← 桌面版就是 server.summary(ctx, None)
-GET    /api/components?q=&category=&package=&unit=&value_min=&value_max=
+GET    /api/components?q=&category=&package=&unit=&value_min=&value_max=&moved=
+                                          moved=1 只要真的有过出入库的;moved=0 只要没动过的
                       &state=&stocked=&sort=&limit=&offset=
                        返回 items + total + facets(当前范围里真有的封装/单位)
 POST   /api/components                    新建元件
@@ -556,7 +567,7 @@ POST   /api/stock/move                    入库/出库/盘点/移库
 GET    /api/movements?component_id=&project_id=&kind=&limit=
 GET    /api/movements/last                最近一笔还能撤销的(给 Ctrl+Z 用)
 POST   /api/movements/{id}/void           撤销一笔:补反向流水 + 标记原记录
-GET    /api/lowstock                      低库存与缺货
+GET    /api/lowstock                      低库存与缺货(也认 moved=1)
 GET    /api/shopping                      该买什么(每行带原因)
 GET    /api/purchase                      采购单
 POST   /api/purchase                      加入采购单

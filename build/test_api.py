@@ -774,6 +774,50 @@ check("撤销掉唯一那笔之后 moves 回到 0", row3["moves"], 0)
 check("反向流水不算一次出入库", CON.execute(
     "SELECT COUNT(*) FROM movement WHERE project_id=?", (P3,)).fetchone()[0], 2)
 
+# ---------------------------------------------------------------- 【26】
+# 出入库页的「找元件」列表靠这个筛选保持干净:导入 BOM 会凭空建出一堆库存为 0
+# 的元件,它们在一个还没开始的出入库流程里全是噪音。
+p("\n【26】moved 筛选:只要真的有过出入库的元件")
+
+
+def live_moves(cid):
+    return CON.execute("SELECT COUNT(*) FROM movement WHERE component_id=? "
+                       "AND voided=0 AND void_of IS NULL", (cid,)).fetchone()[0]
+
+
+_s, lc1 = call(server.list_components, query={"moved": "1", "limit": 999})
+ids1 = {i["id"] for i in lc1["items"]}
+_s, lc0 = call(server.list_components, query={"moved": "0", "limit": 999})
+ids0 = {i["id"] for i in lc0["items"]}
+_s, lca = call(server.list_components, query={"limit": 999})
+
+check("刚建、一次都没动过的元件不在 moved=1 里", C3 in ids1, False)
+check("它出现在 moved=0 里", C3 in ids0, True)
+check("moved=1 返回的每一个都真的有流水",
+      all(live_moves(i) > 0 for i in ids1), True)
+check("moved=0 返回的每一个都真的没有流水",
+      all(live_moves(i) == 0 for i in ids0), True)
+check("moved=1 和 moved=0 不重不漏,合起来正好是全部元件",
+      len(ids1) + len(ids0), len(lca["items"]))
+check("两个集合没有交集", bool(ids1 & ids0), False)
+
+_s, c4 = call(server.create_component, body={"name": "moved 筛选测试料", "category": "其他"})
+C4 = c4["id"]
+_s, lc1b = call(server.list_components, query={"moved": "1", "limit": 999})
+check("新料建出来时也不在 moved=1 里", C4 in {i["id"] for i in lc1b["items"]}, False)
+_s, _mv4 = call(server.stock_move, body={"kind": "IN", "component_id": C4, "qty": 2})
+_s, lc1c = call(server.list_components, query={"moved": "1", "limit": 999})
+check("入过一次库之后就进 moved=1 了", C4 in {i["id"] for i in lc1c["items"]}, True)
+_s, _ = call(server.void_movement, match=(str(_mv4["movement_id"]),))
+_s, lc1d = call(server.list_components, query={"moved": "1", "limit": 999})
+check("撤销之后又退出 moved=1(等于没动过)",
+      C4 in {i["id"] for i in lc1d["items"]}, False)
+
+# lowstock(「只看缺货」那条路)也要认这个参数,否则一勾缺货筛选就破功
+_s, ls1 = call(server.lowstock, query={"moved": "1"})
+check("lowstock 也认 moved=1:返回的每一个都真的有流水",
+      all(live_moves(i["id"]) > 0 for i in ls1["items"]), True)
+
 CON.close()
 p("\n" + "=" * 62)
 p(f"结果:{'全部通过' if not FAILS else '失败 ' + str(len(FAILS)) + ' 项'}")
