@@ -323,115 +323,149 @@ def main() -> int:
         app.update()
 
         # ---------------------------------------------------------- 出入库
-        p("\n【5】出入库:拆成入库 / 出库两个页签,先选项目再进二级页")
+        p("\n【5】出入库:只查账,拆成入库流水 / 出库流水")
         app.nb.select(app.tab_stock)
         app.update()
         st = app.tab_stock
-        check("默认停在入库", st.action, "IN")
-        check("进来是项目卡片首页", st.view, "home")
-        check("入库 / 出库两个按钮都在", sorted(st.btn), ["IN", "OUT"])
-        check("项目卡片里有「不指定项目」那一格", "0" in st.cards, True)
-        live = [p for p in st._projects if p.get("moves")]
-        idle = [p for p in st._projects if not p.get("moves")]
-        check("默认只给真的有出入库记录的项目摆卡片",
-              len(st.cards), len(live) + 1)
-        check("导入过 BOM 但一次都没出入过库的项目默认不显示",
-              all(str(p["id"]) not in st.cards for p in idle), True)
-        if idle:
-            check("藏起来的项目数写在提示行里,不是悄悄消失",
-                  str(len(idle)) in st.home_hint.get(), True)
-        check("每张卡片都写着「点开开单」或出入库次数",
-              all(any("点开开单" in t or "出入库记录" in t or "还没出入过库" in t
-                      for t in card_labels(c)) for c in st.cards.values()), True)
-        # 卡片同时是「给这个项目开第一单」的唯一入口,藏死就成死路 —— 得能找回来
-        st.show_empty.set(True)
-        st._render_cards()
-        app.update()
-        check("勾上「显示还没出入过库的项目」后它们全都出来",
-              len(st.cards), len(st._projects) + 1)
-        st.show_empty.set(False)
-        st._render_cards()
-        app.update()
-        check("取消勾选又收回去", len(st.cards), len(live) + 1)
-        p(f"  项目卡片 {sorted(st.cards)}")
-
-        st.open_project("0")
-        app.update()
-        check("选了项目后进二级页", st.view, "proj")
-        check("二级页已显示", bool(st.page_proj.winfo_ismapped()), True)
-        check("项目首页已收起", bool(st.page_home.winfo_ismapped()), False)
-        check("标题写出了动作和项目", st.proj_title.get(), "入库 · 不指定项目")
-        # 【4】里那几次入库没挂项目,所以本来就该出现在「不指定项目」下
-        base = len(gui.call(app.con, server.list_movements,
-                            query={"project": "none", "kind": "IN"}, quiet=True)["items"])
-        check("「不指定项目」只收没挂项目的流水",
-              all(m["project_id"] is None for m in gui.call(
-                  app.con, server.list_movements,
-                  query={"project": "none", "kind": "IN"}, quiet=True)["items"]), True)
-        check("二级页显示的就是这个项目 + 这个动作的全部记录",
-              len(st.t_rec.get_children()), base)
+        check("默认停在入库流水", st.action, "IN")
+        check("入库流水 / 出库流水两个按钮都在", sorted(st.btn), ["IN", "OUT"])
+        # 职责重排:这一页现在只是账本,开单和元件列表都搬去「项目 BOM」页了
+        check("这一页已经没有开单区(操作搬去项目 BOM 页了)",
+              hasattr(st, "submit"), False)
+        check("这一页也没有元件列表(所以不会再被导入 BOM 的料塞满)",
+              hasattr(st, "tree") and "headings" in str(st.tree.cget("show")), True)
         check("记录表是平表,没有展开三角",
-              "headings" in str(st.t_rec.cget("show"))
-              and "tree" not in str(st.t_rec.cget("show")), True)
+              "tree" not in str(st.tree.cget("show")), True)
+        # 盘点/移库既不是入库也不是出库,只该出现在「流水」页
+        kinds_shown = {str(st.tree.item(i, "values")[1]).replace("(已撤销)", "")
+                       .replace("·撤销", "") for i in st.tree.get_children()}
+        check("这里不会出现盘点 / 移库",
+              kinds_shown <= {"入库", "出库", ""}, True)
 
-        it = chosen[0][1]
-        st.tree.selection_set(str(it["id"]))
-        app.update()
-        st.qty.set("5")
-        st.loc.set("未分类")
-        st.note.set("自检第一条")
-        st.submit()
-        app.update()
-        recs = st.t_rec.get_children()
-        check("开单后记录表立刻多一条(刷新要跟上,不能是旧的)", len(recs), base + 1)
-        v = st.t_rec.item(recs[0], "values")
-        check("最新一条就是刚入的元件", v[1], it["name"])
-        check("记录里数量对", int(v[3]), 5)
+        base_in = len(gui.call(app.con, server.list_movements,
+                               query={"kind": "IN", "limit": "5000"}, quiet=True)["items"])
+        check("入库流水显示的就是全部入库流水",
+              len(st.tree.get_children()), base_in)
+        check("摘要写出了条数和合计", "入库流水" in st.summary.get(), True)
+        check("摘要里说明了这一页只查账", "只查账" in st.summary.get(), True)
+        check("摘要给出了真正的操作在哪做",
+              "项目 BOM" in st.summary.get(), True)
 
-        st.qty.set("3")
-        st.note.set("自检第二条")
-        st.submit()
+        # ---- 项目筛选
+        check("项目筛选有「全部项目」和「不指定项目」",
+              st.ALL in st.cb_proj.cget("values")
+              and st.NONE_PROJ in st.cb_proj.cget("values"), True)
+        st.proj.set(st.NONE_PROJ)
+        st.reload()
         app.update()
-        recs = st.t_rec.get_children()
-        check("再开一单,记录再多一条", len(recs), base + 2)
-        check("记录按时间倒序(新的在最上面)",
-              st.t_rec.item(recs[0], "values")[6], "自检第二条")
-        check("倒序:第二新的在它下面",
-              st.t_rec.item(recs[1], "values")[6], "自检第一条")
+        none_in = len(gui.call(app.con, server.list_movements,
+                               query={"kind": "IN", "project": "none",
+                                      "limit": "5000"}, quiet=True)["items"])
+        check("选「不指定项目」只剩没挂项目的流水",
+              len(st.tree.get_children()), none_in)
+        # 【4】里那几次入库没挂项目,所以本来就该出现在「不指定项目」下
+        check("「不指定项目」里确实有前面那几笔", none_in > 0, True)
+        st.proj.set(st.ALL)
+        st.reload()
+        app.update()
+        check("切回「全部项目」又都回来了",
+              len(st.tree.get_children()), base_in)
 
-        # ---- 出库是独立的一套,不会和入库混在一起
+        # ---- 出库流水是独立的一套
         st.set_action("OUT")
         app.update()
-        check("切到出库后先回项目卡片首页", st.view, "home")
         check("出库页签记住自己是出库", st.action, "OUT")
-        st.open_project("0")
-        app.update()
-        check("出库的标题跟着动作变", st.proj_title.get(), "出库 · 不指定项目")
         base_out = len(gui.call(app.con, server.list_movements,
-                                query={"project": "none", "kind": "OUT"},
+                                query={"kind": "OUT", "limit": "5000"},
                                 quiet=True)["items"])
-        check("入库那几单不会出现在出库记录里",
-              len(st.t_rec.get_children()), base_out)
-        st.tree.selection_set(str(it["id"]))
-        st.qty.set("2")
-        st.note.set("自检出库")
-        st.submit()
-        app.update()
-        check("开一单出库,出库记录里多一条",
-              len(st.t_rec.get_children()), base_out + 1)
+        check("出库流水显示的是全部出库流水",
+              len(st.tree.get_children()), base_out)
+        check("入库那几单不会出现在出库流水里", base_out < base_in, True)
         st.set_action("IN")
-        st.open_project("0")
         app.update()
-        check("切回入库,出库那一单不会混进来",
-              len(st.t_rec.get_children()), base + 2)
-        st.go_home()
-        app.update()
-        check("返回项目卡片首页正常", st.view, "home")
+        p(f"  入库流水 {base_in} 条 / 出库流水 {base_out} 条")
 
+        # ---- 真正的入库/出库操作现在在「项目 BOM」页里
+        p("\n【5.1】入库 / 出库的操作搬到了项目 BOM 页")
         app.nb.select(app.tab_proj)
         app.update()
-        p(f"  [OK ] 项目页 {len(app.tab_proj.t_proj.get_children())} 个项目,"
-          f"BOM {len(app.tab_proj.t_bom.get_children())} 行,缺料标签「{app.tab_proj.shortage.get()}」")
+        pr = app.tab_proj
+        check("项目页右半边分成了三个子页签", pr.sub.index("end"), 3)
+        tabs = [pr.sub.tab(i, "text").strip() for i in range(pr.sub.index("end"))]
+        check("三个子页签是 BOM 明细 / 元件入库 / 元件出库",
+              tabs, ["BOM 明细", "元件入库", "元件出库"])
+        check("元件入库的开单区是入库方向", pr.pane_in.action, "IN")
+        check("元件出库的开单区是出库方向", pr.pane_out.action, "OUT")
+        # 入库必须看得见全部,否则刚导入 BOM 的新料永远收不进来(它库存就是 0);
+        # 出库反过来,没有的东西发不出去,列出来纯属干扰
+        check("入库方向默认列出全部元件",
+              pr.pane_in.form.only_stocked.get(), False)
+        check("出库方向默认只列有库存的",
+              pr.pane_out.form.only_stocked.get(), True)
+        p(f"  [OK ] 项目页 {len(pr.t_proj.get_children())} 个项目,"
+          f"BOM {len(pr.t_bom.get_children())} 行,缺料标签「{pr.shortage.get()}」")
+
+        pid0 = int(pr.t_proj.get_children()[0])
+        pr.t_proj.selection_set(str(pid0))
+        app.update()
+        check("选中项目后入库区记下了这个项目", pr.pane_in.project_id, pid0)
+        check("选中项目后出库区也记下了", pr.pane_out.project_id, pid0)
+
+        it = chosen[0][1]
+        f_in = pr.pane_in.form
+        f_in.tree.selection_set(str(it["id"]))
+        app.update()
+        f_in.qty.set("6")
+        f_in.note.set("项目里开的入库单")
+        n_rec = len(pr.pane_in.t_rec.get_children())
+        f_in.submit()
+        app.update()
+        got = gui.call(app.con, server.list_movements,
+                       query={"project_id": str(pid0), "kind": "IN"})["items"]
+        check("在项目里开的入库单会落在这个项目名下",
+              got[0]["note"], "项目里开的入库单")
+        check("记录表立刻多一条", len(pr.pane_in.t_rec.get_children()), n_rec + 1)
+        check("这边开的单也进了出入库页的入库流水",
+              any(gui.call(app.con, server.list_movements, query={"kind": "IN"})
+                  ["items"][k]["note"] == "项目里开的入库单" for k in range(3)), True)
+
+        # 没选项目时不许开单 —— 记在谁名下都不清楚
+        f_in.set_project(None)
+        f_in.qty.set("1")
+        _mb, _infos = gui.messagebox, []
+        class _Box:
+            answer = True
+            def showinfo(self, *a, **k):
+                _infos.append(a)
+            def showwarning(self, *a, **k):
+                _infos.append(a)
+            def askyesno(self, *a, **k):
+                return True
+        box5a = _Box()
+        gui.messagebox = box5a
+        try:
+            f_in.submit()
+            check("没选项目时开单会被挡住并说明原因",
+                  bool(_infos) and "项目" in str(_infos[0][1]), True)
+        finally:
+            gui.messagebox = _mb
+        f_in.set_project(pid0)
+
+        # 撤销也要能在项目页里做
+        mid = pr.pane_in.t_rec.get_children()[0]
+        gui.messagebox = box5a
+        try:
+            pr.pane_in.t_rec.selection_set(mid)
+            pr.pane_in.undo()
+            app.update()
+            check("在项目页撤销后那一条标成了已撤销",
+                  "voided" in str(pr.pane_in.t_rec.item(mid, "tags")), True)
+        finally:
+            gui.messagebox = _mb
+        check("撤销补的反向流水出现在出入库页的出库流水里",
+              any("撤销" in str(gui.call(app.con, server.list_movements,
+                                        query={"kind": "OUT"})["items"][k]["note"])
+                  for k in range(3)), True)
 
         app.nb.select(app.tab_move)
         app.update()
@@ -1101,7 +1135,7 @@ def main() -> int:
         finally:
             gui.messagebox = real_box
 
-        p("\n【23】出入库首页只列真的有过出入库的项目")
+        p("\n【23】出入库页的项目下拉只列真的有记录的项目")
         box5 = FakeBox()
         gui.messagebox = box5
         try:
@@ -1112,66 +1146,62 @@ def main() -> int:
             app.refresh_all()
             app.nb.select(app.tab_stock)
             st = app.tab_stock
-            st.go_home()
+            st.set_action("IN")
+            app.update()
+
+            nm = "界面收发货项目"
+            # 导入 BOM 会建出一堆一次库都没出入过的项目。全列进下拉的话,
+            # 每挑一个都是一张空表 —— 那才是这一页真正的噪音来源。
+            check("刚建好、一次库都没动过的项目不进下拉",
+                  nm in st.cb_proj.cget("values"), False)
+            check("摘要里说明了有几个被藏起来",
+                  "没列进下拉" in st.summary.get(), True)
+            check("「全部项目」永远在(否则看不到全部流水)",
+                  st.ALL in st.cb_proj.cget("values"), True)
+            check("「不指定项目」也永远在",
+                  st.NONE_PROJ in st.cb_proj.cget("values"), True)
+
+            # 在「项目 BOM」页里真的收一次货
+            pr = app.tab_proj
+            pr.t_proj.selection_set(str(pid))
+            app.update()
+            check("选中项目后开单区左边有元件可选(不能是空列表)",
+                  len(pr.pane_in.form.tree.get_children()) > 0, True)
+            pr.pane_in.form.tree.selection_set(str(cid))
+            app.update()
+            pr.pane_in.form.qty.set("3")
+            pr.pane_in.form.submit()
+            app.update()
+
             st.reload()
             app.update()
-
-            check("刚建好、一次库都没动过的项目不摆卡片",
-                  str(pid) in st.cards, False)
-            check("但提示行说明了它被藏起来了",
-                  "先不显示" in st.home_hint.get(), True)
-
-            # ---- 左边那排「找元件」列表:导入 BOM 建出来、一次没动过的料不该出现。
-            # 它们库存全是 0、全被标成红色「缺货」,在出入库页面上纯属噪音。
-            st.open_project(str(pid))
-            app.update()
-            check("二级页已打开", st.view, "proj")
-            check("默认勾着「只列有过出入库的」", st.only_moved.get(), True)
-            check("刚建出来、一次都没动过的元件不在列表里", cid in st._items, False)
-            # 列表里还有别的动过的料(前面几节造的),所以「空」这个状态
-            # 得靠一个搜不到的词去够到
-            st.q.set("不存在的料zzz")
-            st._load_components()
-            app.update()
-            check("搜不到时指出是筛选挡住的,并给出取消勾选这条路",
-                  "取消勾选" in st.list_hint.get(), True)
-            check("而且明确说是「有过出入库的里面没匹配」,不让人以为搜索坏了",
-                  "没有匹配" in st.list_hint.get(), True)
-            st.q.set("")
-            st._load_components()
-            app.update()
-            st.only_moved.set(False)
-            st._load_components()
-            app.update()
-            check("取消勾选后就能看到它(否则新料永远收不进来)", cid in st._items, True)
-
-            # 真的入一次库(挂在这个项目名下)
-            API(server.stock_move, body={"kind": "IN", "component_id": cid,
-                                         "qty": 3, "project_id": pid})
-            app.refresh_all()
-            st.only_moved.set(True)
+            check("真的入过库之后,项目就进下拉了",
+                  nm in st.cb_proj.cget("values"), True)
+            st.proj.set(nm)
             st.reload()
             app.update()
-            check("真的出入过库之后,它进列表了", cid in st._items, True)
-            check("列表上方写着这是筛选后的结果",
-                  "只列有过出入库的元件" in st.list_hint.get(), True)
-            check("真的入过库之后,项目卡片出现了", str(pid) in st.cards, True)
-            check("卡片上写着有几次出入库记录",
-                  any("1 次出入库记录" in t for t in card_labels(st.cards[str(pid)])), True)
+            check("选中它看得到这个项目的入库流水,不是空表",
+                  len(st.tree.get_children()), 1)
 
-            # 撤销掉这一次 —— 收进来又撤了,等于没动过,卡片和列表都该收回
+            st.set_action("OUT")
+            app.update()
+            check("出库流水里,还没出过库的项目依然不列",
+                  nm in st.cb_proj.cget("values"), False)
+
+            # 撤销掉唯一那笔 —— 等于没动过,又该从下拉里退出
             mid = API(server.list_movements,
-                      query={"project_id": str(pid)})["items"][0]["id"]
+                      query={"project_id": str(pid), "kind": "IN"})["items"][0]["id"]
             API(server.void_movement, match=(str(mid),))
-            app.refresh_all()
-            st.reload()
+            st.set_action("IN")
             app.update()
-            check("撤销掉唯一那次出入库后,卡片又收回去了",
-                  str(pid) in st.cards, False)
-            check("撤销后它也退出出入库列表了(等于没动过)",
-                  cid in st._items, False)
-            check("项目本身还在,只是没记录所以不摆卡片",
+            check("撤销掉唯一那笔之后,项目又退出入库下拉",
+                  nm in st.cb_proj.cget("values"), False)
+            # 下拉藏起来不等于删除 —— 项目还在「项目 BOM」页的列表里,
+            # 所以第一单永远开得出来,不会变成死路
+            check("项目本身还在「项目 BOM」页的列表里(藏起来不是删掉)",
                   any(p["id"] == pid for p in st._projects), True)
+            check("在项目 BOM 页里仍然选得到它",
+                  str(pid) in pr.t_proj.get_children(), True)
         finally:
             gui.messagebox = real_box
 

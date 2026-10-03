@@ -190,30 +190,29 @@ def main() -> int:
             check_trees(app.tab_comp, "comp/二级页", strict)
             check_squashed(app.tab_comp, "comp/二级页")
 
+        # 出入库页现在是一张只读流水表(入库 / 出库两张),没有卡片也没有二级页了
         app.nb.select(app.tab_stock)
-        app.tab_stock.go_home()
         app.update()
-        check_cards(app.tab_stock, "出入库项目卡片")
-        # 默认只显示真的有过出入库记录的项目,所以「项目卡片」这个状态在开发库上
-        # 可能一张都走不到。把开关打开,让那些卡片也过一次尺寸体检。
-        app.tab_stock.show_empty.set(True)
-        app.tab_stock._render_cards()
+        for act, name in (("IN", "stock/入库流水"), ("OUT", "stock/出库流水")):
+            app.tab_stock.set_action(act)
+            app.update()
+            app.update_idletasks()
+            check_trees(app.tab_stock, name, strict)
+            check_squashed(app.tab_stock, name)
+
+        # 开单搬到了项目 BOM 页,而且右半边变成了三个子页签 ——
+        # 每一个的可用宽度都比以前窄一点,必须逐个量。
+        app.nb.select(app.tab_proj)
+        for k in ("pane_in", "pane_out"):
+            app.tab_proj.sub.select(app.tab_proj.__dict__[k])
+            app.update()
+            app.update_idletasks()
+            check_trees(app.tab_proj.__dict__[k], f"proj/{k}", strict)
+            check_squashed(app.tab_proj.__dict__[k], f"proj/{k}")
+        app.tab_proj.sub.select(0)
         app.update()
         app.update_idletasks()
-        check_cards(app.tab_stock, "出入库项目卡片(含还没出入过库的)")
-        app.tab_stock.show_empty.set(False)
-        app.tab_stock._render_cards()
-        app.update()
-        try:
-            keys = list(app.tab_stock.board.cards)
-            if keys:
-                app.tab_stock.open_project(keys[0])
-                app.update()
-                app.update_idletasks()
-                check_trees(app.tab_stock, "stock/项目页", strict)
-                check_squashed(app.tab_stock, "stock/项目页")
-        except Exception as exc:  # noqa: BLE001
-            p(f"  (出入库项目页跳过:{type(exc).__name__}: {exc})")
+        check_squashed(app.tab_proj, "proj/BOM 明细")
 
     # 弹窗各有自己的几何尺寸,主窗口那轮体检管不着它们。
     # 新增元件窗口字段最多、盘点窗口列最宽,是两个最容易溢出的。

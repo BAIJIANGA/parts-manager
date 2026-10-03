@@ -996,7 +996,12 @@ def lowstock(ctx: Ctx, m):
         # 套在外层的话 on_hand / stock_state 这些算出来的别名看得到,c 看不到。
         inner += (" WHERE EXISTS (SELECT 1 FROM movement m WHERE m.component_id = c.id"
                   " AND m.voided = 0 AND m.void_of IS NULL)")
-    sql = (f"SELECT * FROM ({inner}) WHERE stock_state IN ('low','out')"
+    extra = ""
+    # stocked=1 只要真正有库存的。on_hand 是 COMPONENT_SELECT 里算出来的别名,
+    # 所以只能在外层过滤 —— 好在派生表外面看得到它,这样写是合法的。
+    if ctx.q("stocked") in ("1", "true", "yes"):
+        extra = " AND on_hand > 0"
+    sql = (f"SELECT * FROM ({inner}) WHERE stock_state IN ('low','out'){extra}"
            " ORDER BY on_hand, name")
     return 200, {"items": [component_row(r) for r in ctx.con.execute(sql)]}
 
@@ -1307,16 +1312,20 @@ def list_projects(ctx: Ctx, m):
         d["shortage_qty"] = rep["shortage_qty"]
         d["shortage_value"] = rep["shortage_value"]
         d["ready"] = rep["ready"]
-        # 这个项目**真的**发生过几次出入库。导入 BOM 本身不产生流水,所以刚导完
-        # 是 0 —— 出入库页就靠这个数决定要不要给项目摆一张卡片。
-        # 已撤销的(voided)和撤销动作本身(void_of)都不算:收进来又撤了,
-        # 等于没动过,卡片就该收回。
-        d["moves"] = int(ctx.con.execute(
-            "SELECT COUNT(*) AS n FROM movement "
-            "WHERE project_id=? AND voided=0 AND void_of IS NULL", (r["id"],)).fetchone()["n"])
-        d["last_move_at"] = ctx.con.execute(
-            "SELECT MAX(created_at) AS t FROM movement "
-            "WHERE project_id=? AND voided=0 AND void_of IS NULL", (r["id"],)).fetchone()["t"]
+        # 这个项目**真的**发生过几次出入库,按方向分开。导入 BOM 本身不产生流水,
+        # 所以刚导完是 0 —— 出入库页的项目下拉靠它只列出「选了不会看到空表」的项目。
+        # 已撤销的(voided)和撤销动作本身(void_of)都不算:收进来又撤了等于没动过。
+        cnt = ctx.con.execute(
+            "SELECT COUNT(*) AS n,"
+            " COALESCE(SUM(CASE WHEN kind='IN' THEN 1 ELSE 0 END),0) AS ins,"
+            " COALESCE(SUM(CASE WHEN kind='OUT' THEN 1 ELSE 0 END),0) AS outs,"
+            " MAX(created_at) AS t FROM movement"
+            " WHERE project_id=? AND voided=0 AND void_of IS NULL",
+            (r["id"],)).fetchone()
+        d["moves"] = int(cnt["n"] or 0)
+        d["moves_in"] = int(cnt["ins"] or 0)
+        d["moves_out"] = int(cnt["outs"] or 0)
+        d["last_move_at"] = cnt["t"]
         items.append(d)
     return 200, {"items": items}
 

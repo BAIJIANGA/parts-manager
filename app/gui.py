@@ -1084,279 +1084,116 @@ class ComponentsTab(ttk.Frame):
 
 # --------------------------------------------------------------------- 出入库
 
-class StockTab(ttk.Frame):
-    """出入库 —— 拆成「入库」和「出库」两个页签。
+class MoveForm(ttk.Frame):
+    """一个方向的开单区:左边找元件,右边填单。
 
-    这两件事方向相反、看的东西也不一样,挤在一个单选框里容易点错。每一页都是:
-
-        先选项目(卡片)  →  进这个项目的二级页,在里面开单,并看这个项目
-                            在这个动作下的全部记录(按时间倒序)
-
-    项目是这批料的去向,所以按项目分开看最自然;「不指定项目」那一格用来记
-    不带项目的日常补货。盘点 / 移库不在这两个页签里,用下面那个按钮开,
-    它们本来也不是「进 / 出」这种方向性的动作。
+    这块原本长在「出入库」页上。搬到项目里,是因为入库/出库从来不是孤立的动作 ——
+    它总是「给某个项目收料 / 发料」,而做这个决定要看的正是这张 BOM 还缺什么。
+    出入库页因此只剩查账的职责。
     """
 
-    ACTIONS = (("IN", "入库"), ("OUT", "出库"))
-    NO_PROJECT = "不指定项目"
-
-    def __init__(self, parent, app: App):
-        super().__init__(parent, padding=8)
+    def __init__(self, parent, app: App, action: str, on_done=None):
+        super().__init__(parent)
         self.app = app
         self.con = app.con
-        self._items = {}
-        self._projects = []
-        self.action = "IN"
-        self.project_id = None      # None = 停在项目首页;0 = 不指定项目;>0 = 项目 id
-        self.view = "home"
-
-        bar = ttk.Frame(self)
-        bar.pack(fill="x", pady=(0, 8))
-        self.btn = {}
-        for val, label in self.ACTIONS:
-            b = ttk.Button(bar, text=label, width=10,
-                           command=lambda v=val: self.set_action(v))
-            b.pack(side="left", padx=(0, 6))
-            self.btn[val] = b
-        self.head = tk.StringVar()
-        ttk.Label(bar, textvariable=self.head, style="Dim.TLabel").pack(side="left", padx=12)
-        ttk.Button(bar, text="盘点 / 移库…", command=self.other_move).pack(side="right")
-        ttk.Button(bar, text="刷新", command=self.reload).pack(side="right", padx=6)
-
-        self.holder = ttk.Frame(self)
-        self.holder.pack(fill="both", expand=True)
-        self.page_home = ttk.Frame(self.holder)
-        self.page_proj = ttk.Frame(self.holder)
-
-        self._build_home()
-        self._build_proj()
-        self.set_action("IN")
-
-    @property
-    def cards(self):
-        return self.board.cards
-
-    # ------------------------------------------------------ 顶部动作切换
-
-    def set_action(self, val):
-        self.action = val
-        for k, b in self.btn.items():
-            b.state(["pressed"] if k == val else ["!pressed"])
-        self.go_home()
-        self.reload()
-
-    def _act_label(self):
-        return dict(self.ACTIONS)[self.action]
-
-    # ------------------------------------------------------ 页面:项目卡片
-
-    def _build_home(self):
-        # 只有**真的发生过出入库**的项目才摆卡片。导入 BOM 会建项目,但那一刻
-        # 一件货都还没动过 —— 把它当成一条出入库记录摆出来是误导。
-        # 不过卡片同时是「给这个项目开第一单」的唯一入口,直接藏死就成了死路,
-        # 所以留一个默认关闭的开关兜底。
-        bar = ttk.Frame(self.page_home)
-        bar.pack(fill="x", pady=(0, 6))
-        self.show_empty = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="显示还没出入过库的项目",
-                        variable=self.show_empty,
-                        command=self._render_cards).pack(side="left")
-        self.home_hint = tk.StringVar()
-        ttk.Label(bar, textvariable=self.home_hint,
-                  style="Dim.TLabel").pack(side="left", padx=10)
-        self.board = CardBoard(self.page_home, self.open_project)
-        self.board.pack(fill="both", expand=True)
-
-    def open_project(self, key):
-        self.view = "proj"
-        self.project_id = int(key)
-        if self.project_id:
-            proj = next((p for p in self._projects if p["id"] == self.project_id), {})
-            name = proj.get("name") or f"项目 {self.project_id}"
-        else:
-            name = self.NO_PROJECT
-        self.proj_title.set(f"{self._act_label()} · {name}")
-        self._swap(self.page_proj)
-        self._load_records()
-        self.reload()
-
-    def go_home(self):
-        self.view = "home"
+        self.action = action
         self.project_id = None
-        self._swap(self.page_home)
+        self.on_done = on_done
+        self._items = {}
+        self._only_low = False
 
-    def _swap(self, page):
-        self.page_home.pack_forget()
-        self.page_proj.pack_forget()
-        page.pack(fill="both", expand=True)
-
-    def _render_cards(self):
-        # 「不指定项目」那一格永远在(日常补货要用),所以卡片区不会是空的 ——
-        # 「项目都被藏起来了」这件事只能靠上面那行提示说明,不能指望空状态。
-        live = [p for p in self._projects if p.get("moves")]
-        idle = [p for p in self._projects if not p.get("moves")]
-        show_idle = bool(self.show_empty.get())
-        specs = []
-        for i, p in enumerate(live + (idle if show_idle else [])):
-            name = p.get("name") or f"项目 {p['id']}"
-            n = p.get("moves") or 0
-            specs.append((str(p["id"]), name, (name.strip()[:1] or "P").upper(),
-                          PROJECT_COLORS[i % len(PROJECT_COLORS)],
-                          f"{n} 次出入库记录" if n else "还没出入过库", False))
-        specs.append(("0", self.NO_PROJECT, "—", "#8d99a6",
-                      "点开开单 / 看记录", False))
-        self.board.render(specs, empty_text="没有可显示的内容。")
-        if not self._projects:
-            self.home_hint.set("还没有项目。先到「项目 BOM」页导入一个。")
-        elif idle and not show_idle:
-            self.home_hint.set(
-                f"另有 {len(idle)} 个导入过 BOM、但一条出入库记录都还没有的项目,"
-                f"先不显示。要给它们开第一单,勾上左边这个框。")
-        elif idle:
-            self.home_hint.set(f"其中 {len(idle)} 个还没真出入过库,"
-                               f"卡片上写着「还没出入过库」。")
-        else:
-            self.home_hint.set("")
-
-    # ------------------------------------------------------ 页面:某个项目
-
-    def _build_proj(self):
-        head = ttk.Frame(self.page_proj)
-        head.pack(fill="x", pady=(0, 8))
-        ttk.Button(head, text="← 返回", command=self.go_home, width=9).pack(side="left",
-                                                                         padx=(0, 10))
-        self.proj_title = tk.StringVar()
-        ttk.Label(head, textvariable=self.proj_title, style="H1.TLabel").pack(side="left")
-        self.proj_info = tk.StringVar()
-        ttk.Label(head, textvariable=self.proj_info, style="Dim.TLabel").pack(side="left",
-                                                                             padx=12)
-
-        pane = ttk.Panedwindow(self.page_proj, orient="vertical")
-        pane.pack(fill="both", expand=True)
-
-        # ---- 上半:开单(左挑元件,右填单)
-        top = ttk.Frame(pane)
-        left = ttk.Frame(top)
+        left = ttk.Frame(self)
         left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        right = ttk.LabelFrame(self, text=f"{self.label}开单", padding=10)
+        right.pack(side="left", fill="y")
 
         sbar = ttk.Frame(left)
-        sbar.pack(fill="x", pady=(0, 6))
+        sbar.pack(fill="x", pady=(0, 4))
         ttk.Label(sbar, text="找元件").pack(side="left", padx=(0, 4))
         self.q = tk.StringVar()
-        ent = ttk.Entry(sbar, textvariable=self.q, width=24)
+        ent = ttk.Entry(sbar, textvariable=self.q, width=20)
         ent.pack(side="left")
-        ent.bind("<KeyRelease>", lambda _e: self._load_components())
+        ent.bind("<KeyRelease>", lambda _e: self.reload())
         ttk.Button(sbar, text="只看缺货", command=self.only_low).pack(side="left", padx=6)
-        # 导入 BOM 会凭空建出一堆库存为 0 的元件,在这个页面上全是标红的「缺货」。
-        # 它们在任何「出入库」的意义上都还不存在,所以默认挡在外面 ——
-        # 这一页只该出现真正动过的料。要收一批新货时把这个框取消掉。
-        self.only_moved = tk.BooleanVar(value=True)
-        ttk.Checkbutton(sbar, text="只列有过出入库的", variable=self.only_moved,
-                        command=self._load_components).pack(side="left")
+        # 出库默认只列有库存的:没有的东西发不出去,列出来纯属干扰。
+        # 入库反过来必须看得到全部,否则刚导入 BOM 的新料永远收不进来 ——
+        # 入库的前提正是它现在库存为 0。
+        self.only_stocked = tk.BooleanVar(value=(action == "OUT"))
+        ttk.Checkbutton(sbar, text="只列有库存的", variable=self.only_stocked,
+                        command=self.reload).pack(side="left")
 
         self.list_hint = tk.StringVar()
         ttk.Label(left, textvariable=self.list_hint, style="Dim.TLabel",
-                  wraplength=560, justify="left").pack(anchor="w", pady=(0, 4))
+                  wraplength=520, justify="left").pack(anchor="w", pady=(0, 4))
 
         f, self.tree = make_tree(left, [
-            ("name", "名称", 190, "w", True),
-            ("lcsc_pn", "立创编号", 90, "center"),
-            ("package", "封装", 100, "w"),
-            ("on_hand", "库存", 60, "e"),
-            ("state", "状态", 60, "center")], height=12)
+            ("name", "名称", 175, "w", True),
+            ("lcsc_pn", "立创编号", 86, "center"),
+            ("package", "封装", 88, "w"),
+            ("on_hand", "库存", 54, "e"),
+            ("state", "状态", 54, "center")], height=10)
         f.pack(fill="both", expand=True)
         self.tree.tag_configure("out", background="#ffe3e3")
         self.tree.tag_configure("low", background="#fff6dd")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
-        right = ttk.LabelFrame(top, text="开单", padding=10)
-        right.pack(side="left", fill="y")
         self.target = tk.StringVar(value="（左侧选一个元件）")
         ttk.Label(right, textvariable=self.target, style="Big.TLabel",
-                  wraplength=260).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky="w")
-
+                  wraplength=230).grid(row=0, column=0, columnspan=2,
+                                       pady=(0, 8), sticky="w")
         ttk.Label(right, text="数量").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=3)
         self.qty = tk.StringVar()
-        ttk.Entry(right, textvariable=self.qty, width=14).grid(row=1, column=1, sticky="w")
-
+        ttk.Entry(right, textvariable=self.qty, width=12).grid(row=1, column=1, sticky="w")
         ttk.Label(right, text="仓位").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=3)
         self.loc = tk.StringVar(value="未分类")
-        self.cb_loc = ttk.Combobox(right, textvariable=self.loc, width=12)
+        self.cb_loc = ttk.Combobox(right, textvariable=self.loc, width=14)
         self.cb_loc.grid(row=2, column=1, sticky="w")
-
-        # 移库才用得到,平时藏起来
-        self.lbl_to = ttk.Label(right, text="移到")
-        self.lbl_to.grid(row=3, column=0, sticky="e", padx=(0, 6), pady=3)
-        self.to_loc = tk.StringVar()
-        self.cb_to = ttk.Combobox(right, textvariable=self.to_loc, width=12)
-        self.cb_to.grid(row=3, column=1, sticky="w")
-
-        ttk.Label(right, text="操作人").grid(row=4, column=0, sticky="e", padx=(0, 6), pady=3)
+        ttk.Label(right, text="操作人").grid(row=3, column=0, sticky="e", padx=(0, 6), pady=3)
         self.who = tk.StringVar(value="本地用户")
-        ttk.Entry(right, textvariable=self.who, width=14).grid(row=4, column=1, sticky="w")
-
-        ttk.Label(right, text="备注").grid(row=5, column=0, sticky="e", padx=(0, 6), pady=3)
+        ttk.Entry(right, textvariable=self.who, width=14).grid(row=3, column=1, sticky="w")
+        ttk.Label(right, text="备注").grid(row=4, column=0, sticky="e", padx=(0, 6), pady=3)
         self.note = tk.StringVar()
-        ttk.Entry(right, textvariable=self.note, width=22).grid(row=5, column=1,
-                                                               columnspan=2, sticky="w")
+        ttk.Entry(right, textvariable=self.note, width=20).grid(row=4, column=1, sticky="w")
 
         self.hint = tk.StringVar()
         ttk.Label(right, textvariable=self.hint, style="Dim.TLabel",
-                  wraplength=260, justify="left").grid(
-            row=6, column=0, columnspan=2, pady=(6, 0), sticky="w")
-        ttk.Button(right, text="提交", command=self.submit, width=16).grid(
-            row=7, column=0, columnspan=2, pady=12)
-        pane.add(top, weight=3)
+                  wraplength=230, justify="left").grid(
+            row=5, column=0, columnspan=2, pady=(6, 0), sticky="w")
+        ttk.Button(right, text=f"确认{self.label}", command=self.submit,
+                   width=14).grid(row=6, column=0, columnspan=2, pady=10)
 
-        # ---- 下半:这个项目在这个动作下的记录,按时间倒序
-        box = ttk.LabelFrame(pane, text=f"{self._act_label()}记录(按时间倒序)", padding=6)
-        f2, self.t_rec = make_tree(box, [
-            ("created_at", "时间", 150, "center"),
-            ("component_name", "元件", 200, "w", True),
-            ("lcsc_pn", "立创编号", 95, "center"),
-            ("qty", "数量", 60, "e"),
-            ("location_code", "仓位", 90, "w"),
-            ("operator", "操作人", 90, "w"),
-            ("note", "备注", 200, "w", True)], height=7)
-        f2.pack(fill="both", expand=True)
-        self.box_rec = box
-        pane.add(box, weight=2)
+    @property
+    def label(self):
+        return KIND_LABEL.get(self.action, self.action)
+
+    # ------------------------------------------------------ 上下文
+
+    def set_project(self, pid):
+        self.project_id = pid or None
+        if self.action == "OUT":
+            self.hint.set("出库:数量填出库数量,库存不足会被拒绝。")
+        else:
+            self.hint.set("入库:数量填入库数量。提交后记在这个项目名下,并按时间排在下面。")
+        self.load_locations()
+
+    def load_locations(self):
+        meta = call(self.con, server.meta, quiet=True) or {}
+        codes = [l["code"] for l in meta.get("locations") or []]
+        self.cb_loc.configure(values=codes)
+        if not self.loc.get() and codes:
+            self.loc.set(codes[0])
 
     # ------------------------------------------------------ 数据
 
     def reload(self):
-        meta = call(self.con, server.meta, quiet=True) or {}
-        codes = [l["code"] for l in meta.get("locations") or []]
-        self.cb_loc.configure(values=codes)
-        self.cb_to.configure(values=codes or ["未分类"])
-        if not self.to_loc.get() and codes:
-            self.to_loc.set(codes[0])
-
-        projects = call(self.con, server.list_projects, quiet=True) or {}
-        self._projects = projects.get("items") or []
-
-        self._render_cards()
-        self._load_components()
-        self._sync_hint()
-        if self.view == "proj":
-            self.head.set(f"{self._act_label()}:下面是这个项目的开单区和记录")
-            self.box_rec.configure(text=f"{self._act_label()}记录(按时间倒序)")
-            # 开完单 app.refresh_all() 会走到这里 —— 必须重读记录表,
-            # 否则提交成功了但下面那半张表还是旧的
-            self._load_records()
-        else:
-            self.head.set(f"{self._act_label()}:先选一个项目,进去开单并看记录"
-                          f"(只列真的有过出入库的项目)")
-
-    def _load_components(self):
         keep = self._current_id()      # 刷之前选中的是谁,刷完要还选回去
         query = {"limit": 500}
-        if self.q.get().strip():
-            query["q"] = self.q.get().strip()
-        only_moved = bool(self.only_moved.get())
-        if only_moved:
-            query["moved"] = "1"
-        if getattr(self, "_only_low", False):
+        kw = self.q.get().strip()
+        if kw:
+            query["q"] = kw
+        if self.only_stocked.get():
+            query["stocked"] = "1"
+        if self._only_low:
             data = call(self.con, server.lowstock, query=query, quiet=True)
         else:
             data = call(self.con, server.list_components, query=query, quiet=True)
@@ -1371,76 +1208,44 @@ class StockTab(ttk.Frame):
                 tags=(it.get("stock_state") or "",))
             self._items[it["id"]] = it
         n = len(self._items)
-        if n:
-            self.list_hint.set(
-                f"只列有过出入库的元件:{n} 个。" if only_moved
-                else f"库里全部元件:{n} 个(含刚导入 BOM、还没动过的)。")
-        elif only_moved:
-            # 空列表必须解释清楚,否则看起来像坏了。而且要说清是「筛掉了」还是
-            # 「没搜到」—— 明明搜了东西却回一句「取消勾选就能看到全部」,
-            # 用户会以为搜索坏了。
-            kw = self.q.get().strip()
-            if kw:
-                self.list_hint.set(
-                    f"有过出入库的元件里没有匹配「{kw}」的。要连刚导入 BOM、"
-                    f"还没动过的也一起找,取消勾选上面的「只列有过出入库的」。")
-            else:
-                self.list_hint.set(
-                    "这里还没有任何有过出入库的元件。导入 BOM 建出来的新料不算 —— "
-                    "它们库存还是 0,一次都没动过。要收一批新货,把上面"
-                    "「只列有过出入库的」取消勾选,就能看到全部元件。")
-        else:
-            self.list_hint.set("没有匹配的元件。")
+        tips = []
+        if self.only_stocked.get():
+            tips.append("只列有库存的")
+        if self._only_low:
+            tips.append("只看缺货")
+        self.list_hint.set(f"{n} 个元件" + (f"({'、'.join(tips)})" if tips else ""))
+        if n == 0 and tips:
+            self.list_hint.set(f"当前条件下没有元件({'、'.join(tips)})。"
+                               f"取消勾选就能看到全部。")
         # 开完单 app.refresh_all() 会走到这里。不把选中还回去的话,左侧会变成
         # 没选中任何元件的状态,下一次开单得重新点一遍 —— 连续入库很难用。
         if keep and keep in self._items:      # _items 的键是 int,别拿 str 去比
             self.tree.selection_set(str(keep))
             self.tree.see(str(keep))
 
-    def _load_records(self):
-        clear_tree(self.t_rec)
-        query = {"kind": self.action, "limit": 500}
-        if self.project_id:
-            query["project_id"] = str(self.project_id)
-        else:
-            query["project"] = "none"
-        data = call(self.con, server.list_movements, query=query, quiet=True) or {}
-        items = data.get("items") or []
-        for mv in items:
-            self.t_rec.insert("", "end", values=(
-                (mv.get("created_at") or "")[:19], mv.get("component_name") or "",
-                mv.get("lcsc_pn") or "", mv.get("qty") or 0,
-                mv.get("location_code") or "", mv.get("operator") or "",
-                mv.get("note") or ""))
-        self.proj_info.set(f"{len(items)} 条记录" if items else "还没有记录")
-
     def only_low(self):
-        self._only_low = not getattr(self, "_only_low", False)
-        self._load_components()
+        self._only_low = not self._only_low
+        self.reload()
 
     def _on_select(self, _event=None):
         sel = self.tree.selection()
         if not sel:
             return
         it = self._items.get(int(sel[0])) or {}
-        self.target.set(f"{it.get('name')}\n现有 {it.get('on_hand') or 0} {it.get('unit') or '个'}")
+        self.target.set(f"{it.get('name')}\n现有 {it.get('on_hand') or 0} "
+                        f"{it.get('unit') or '个'}")
 
     def _current_id(self):
         sel = self.tree.selection()
         return int(sel[0]) if sel else None
 
-    def _sync_hint(self):
-        if self.action == "IN":
-            self.hint.set("入库:数量填入库数量。提交后记在这个项目名下,并按时间排在下面。")
-        else:
-            self.hint.set("出库:数量填出库数量,库存不足会被拒绝。")
-
-    def _sync(self):        # 兼容老代码的调用
-        self._sync_hint()
-
     # ------------------------------------------------------ 动作
 
     def submit(self):
+        if not self.project_id:
+            messagebox.showinfo("提示", "先在左边选一个项目,入库/出库都要记在项目名下。",
+                                parent=self)
+            return
         cid = self._current_id()
         if not cid:
             messagebox.showinfo("提示", "请先在左边选中一个元件。", parent=self)
@@ -1452,30 +1257,256 @@ class StockTab(ttk.Frame):
         body = {"kind": self.action, "component_id": cid, "qty": int(raw),
                 "location": self.loc.get().strip() or "未分类",
                 "operator": self.who.get().strip() or "本地用户",
-                "note": self.note.get().strip()}
-        if self.project_id:
-            body["project_id"] = self.project_id
+                "note": self.note.get().strip(),
+                "project_id": self.project_id}
         res = call(self.con, server.stock_move, body=body, parent=self)
         if res is None:
             return
         self.qty.set("")
         self.note.set("")
         self.app.set_status(
-            f"{self._act_label()}完成:该仓位现有 {res['qty_at_location']},"
+            f"{self.label}完成:该仓位现有 {res['qty_at_location']},"
             f"总库存 {res['on_hand']}")
+        if self.on_done:
+            self.on_done()
         self.app.refresh_all()
 
-    def other_move(self):
-        """盘点 / 移库:不是「进 / 出」这种方向性动作,单独开弹窗做。"""
-        cid = self._current_id()
-        if not cid:
-            messagebox.showinfo("提示", "请先在左边选中一个元件,再选盘点或移库。",
-                                parent=self)
+
+class MovePane(ttk.Frame):
+    """一个方向的开单 + 这个项目在这个方向的记录。
+
+    记录就留在开单区下面,因为「刚收的这笔进去没有」是紧接着要确认的事。
+    让人切到别的页去核对,录错的那一笔就会一直错下去。
+    """
+
+    def __init__(self, parent, app: App, action: str):
+        super().__init__(parent, padding=6)
+        self.app = app
+        self.con = app.con
+        self.action = action
+        self.project_id = None
+
+        pane = ttk.Panedwindow(self, orient="vertical")
+        pane.pack(fill="both", expand=True)
+        self.form = MoveForm(pane, app, action, on_done=self.load_records)
+        pane.add(self.form, weight=3)
+
+        box = ttk.LabelFrame(pane, text=f"{KIND_LABEL.get(action, action)}记录"
+                                        f"(按时间倒序)", padding=6)
+        head = ttk.Frame(box)
+        head.pack(fill="x")
+        self.rec_hint = tk.StringVar()
+        ttk.Label(head, textvariable=self.rec_hint, style="Dim.TLabel").pack(side="left")
+        ttk.Button(head, text="↶ 撤销选中的记录", command=self.undo).pack(side="right")
+        f, self.t_rec = make_tree(box, [
+            ("created_at", "时间", 140, "center"),
+            ("component_name", "元件", 170, "w", True),
+            ("lcsc_pn", "立创编号", 86, "center"),
+            ("qty", "数量", 52, "e"),
+            ("location_code", "仓位", 84, "w"),
+            ("operator", "操作人", 76, "center"),
+            ("note", "备注", 165, "w", True)], height=6)
+        f.pack(fill="both", expand=True)
+        # 撤销过的淡掉但不隐藏 —— 历史要看得见,只是别再当它是有效的
+        self.t_rec.tag_configure("voided", foreground="#95a5a6")
+        self.t_rec.tag_configure("reversal", foreground="#2471a3")
+        pane.add(box, weight=2)
+
+    def set_project(self, pid):
+        """换项目:上下文、元件列表、记录表一起更新。
+
+        三件事必须一起做。只设上下文不刷元件列表的话,开单区左边是空的,
+        看起来像「库里没有元件」—— 那是这一页最不能出的错。
+        """
+        self.project_id = pid or None
+        self.form.set_project(self.project_id)
+        self.form.reload()
+        self.load_records()
+
+    def reload(self):
+        self.set_project(self.project_id)
+
+    def load_records(self):
+        clear_tree(self.t_rec)
+        if not self.project_id:
+            self.rec_hint.set("先在左边选一个项目。")
             return
-        dlg = MoveDialog(self, self.app, cid, "ADJUST")
-        self.app.wait_window(dlg)
-        if dlg.done:
-            self.app.refresh_all()
+        data = call(self.con, server.list_movements,
+                    query={"kind": self.action, "project_id": str(self.project_id),
+                           "limit": 500}, quiet=True) or {}
+        items = data.get("items") or []
+        for mv in items:
+            if mv.get("voided"):
+                tags = ("voided",)
+            elif mv.get("void_of"):
+                tags = ("reversal",)
+            else:
+                tags = ()
+            self.t_rec.insert("", "end", iid=str(mv["id"]), values=(
+                (mv.get("created_at") or "")[:19], mv.get("component_name") or "",
+                mv.get("lcsc_pn") or "", mv.get("qty") or 0,
+                mv.get("location_code") or "", mv.get("operator") or "",
+                mv.get("note") or ""), tags=tags)
+        live = [mv for mv in items if not mv.get("voided")]
+        total = sum(int(mv.get("qty") or 0) for mv in live)
+        self.rec_hint.set(f"{len(items)} 条,有效合计 {total} 个" if items
+                          else "还没有记录")
+
+    def undo(self):
+        sel = self.t_rec.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先点一行要撤销的记录。", parent=self)
+            return
+        vals = self.t_rec.item(sel[0], "values")
+        label = (f"{KIND_LABEL.get(self.action, '')}  {vals[1]}  {vals[3]} 个  "
+                 f"{vals[4]}\n{vals[0]}")
+        if vals[6]:
+            label += f"\n{vals[6]}"
+        undo_movement(self, self.app, int(sel[0]), label)
+
+
+class StockTab(ttk.Frame):
+    """出入库 —— 只查账,不开单。
+
+    「出入库」到底该是什么?结论是**流水**:它回答的是「什么时候进了什么、
+    什么时候出了什么」。而真正的收料/发料动作天生属于某个项目,所以在
+    「项目 BOM」页里做(见 MovePane)—— 那边才有这张 BOM 缺什么可看。
+
+    拆成【入库流水】和【出库流水】两页,是因为看这两件事的时机不同:
+    收料时对着入库流水核对这批来了没有,发料时对着出库流水核对这块板领齐没有。
+
+    盘点 / 移库既不是进也不是出,所以只出现在「流水」页,不在这里。
+    """
+
+    ACTIONS = (("IN", "入库流水"), ("OUT", "出库流水"))
+    ALL, NONE_PROJ = "全部项目", "不指定项目"
+
+    def __init__(self, parent, app: App):
+        super().__init__(parent, padding=8)
+        self.app = app
+        self.con = app.con
+        self.action = "IN"
+        self._projects = []
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", pady=(0, 6))
+        self.btn = {}
+        for val, label in self.ACTIONS:
+            b = ttk.Button(bar, text=label, width=11,
+                           command=lambda v=val: self.set_action(v))
+            b.pack(side="left", padx=(0, 6))
+            self.btn[val] = b
+
+        ttk.Label(bar, text="项目").pack(side="left", padx=(14, 4))
+        self.proj = tk.StringVar(value=self.ALL)
+        self.cb_proj = ttk.Combobox(bar, textvariable=self.proj, width=20,
+                                    state="readonly", values=[self.ALL])
+        self.cb_proj.pack(side="left")
+        self.cb_proj.bind("<<ComboboxSelected>>", lambda _e: self.reload())
+
+        ttk.Label(bar, text="条数").pack(side="left", padx=(14, 4))
+        self.limit = tk.StringVar(value="300")
+        ttk.Combobox(bar, textvariable=self.limit, width=6, state="readonly",
+                     values=["100", "300", "1000", "5000"]).pack(side="left")
+        ttk.Button(bar, text="刷新", command=self.reload).pack(side="left", padx=6)
+        ttk.Button(bar, text="↶ 撤销选中的记录", command=self.undo).pack(side="right")
+
+        self.summary = tk.StringVar()
+        ttk.Label(self, textvariable=self.summary, style="Dim.TLabel",
+                  justify="left").pack(anchor="w", pady=(0, 4))
+
+        f, self.tree = make_tree(self, [
+            ("created_at", "时间", 145, "center"),
+            ("kind", "动作", 96, "center"),
+            ("component_name", "元件", 190, "w", True),
+            ("lcsc_pn", "立创编号", 88, "center"),
+            ("qty", "数量", 52, "e"),
+            ("location_code", "仓位", 86, "w"),
+            ("project_name", "项目", 130, "w", True),
+            ("operator", "操作人", 76, "center"),
+            ("note", "备注", 190, "w", True)], height=20)
+        f.pack(fill="both", expand=True)
+        # 撤销过的淡掉但不隐藏 —— 历史要看得见,只是别再当它是有效的
+        self.tree.tag_configure("voided", foreground="#95a5a6")
+        self.tree.tag_configure("reversal", foreground="#2471a3")
+
+        self.set_action("IN")
+
+    def set_action(self, val):
+        self.action = val
+        for k, b in self.btn.items():
+            b.state(["pressed"] if k == val else ["!pressed"])
+        self.reload()
+
+    def reload(self):
+        data = call(self.con, server.list_projects, quiet=True) or {}
+        self._projects = data.get("items") or []
+        # 下拉里只放「选了一定看得到东西」的项目。导入 BOM 会建出一堆一次库都没
+        # 出入过的项目,全列进来的话每挑一个都是一张空表 —— 那才是这一页真正的噪音。
+        # 关键是这里不会造成死路:第一单在「项目 BOM」页里开,那边列的是全部项目。
+        key = "moves_in" if self.action == "IN" else "moves_out"
+        live = [p for p in self._projects if p.get(key)]
+        idle = len(self._projects) - len(live)
+        names = [self.ALL, self.NONE_PROJ] + [self._proj_name(p) for p in live]
+        self.cb_proj.configure(values=names)
+        if self.proj.get() not in names:
+            self.proj.set(self.ALL)
+
+        query = {"kind": self.action, "limit": self.limit.get()}
+        pick = self.proj.get()
+        if pick == self.NONE_PROJ:
+            # 「不挂项目」的日常补货/领用:project_id 为空的那种流水
+            query["project"] = "none"
+        elif pick != self.ALL:
+            hit = [p for p in live if self._proj_name(p) == pick]
+            if hit:
+                query["project_id"] = str(hit[0]["id"])
+        data = call(self.con, server.list_movements, query=query, quiet=True) or {}
+        items = data.get("items") or []
+        clear_tree(self.tree)
+        for mv in items:
+            # 「动作」列不是多余的:撤销一笔出库补的是入库、撤销一笔入库补的是出库,
+            # 所以这一页里混着正常流水和反向流水,得一眼分得清。
+            kind_txt = KIND_LABEL.get(mv.get("kind"), mv.get("kind"))
+            if mv.get("voided"):
+                kind_txt += "(已撤销)"
+                tags = ("voided",)
+            elif mv.get("void_of"):
+                kind_txt += "·撤销"
+                tags = ("reversal",)
+            else:
+                tags = ()
+            self.tree.insert("", "end", iid=str(mv["id"]), values=(
+                (mv.get("created_at") or "")[:19], kind_txt,
+                mv.get("component_name") or "",
+                mv.get("lcsc_pn") or "", mv.get("qty") or 0,
+                mv.get("location_code") or "", mv.get("project_name") or "—",
+                mv.get("operator") or "", mv.get("note") or ""), tags=tags)
+        voided = sum(1 for mv in items if mv.get("voided"))
+        total = sum(int(mv.get("qty") or 0) for mv in items if not mv.get("voided"))
+        label = dict(self.ACTIONS)[self.action]
+        hidden = (f"另有 {idle} 个项目还没有{'入库' if self.action == 'IN' else '出库'}"
+                  f"记录,没列进下拉。" if idle else "")
+        self.summary.set(
+            f"{label} {len(items)} 条" + (f"(其中已撤销 {voided} 条)" if voided else "")
+            + f",有效合计 {total} 个。" + hidden
+            + "　这一页只查账 —— 真正的入库/出库在「项目 BOM」页里做,"
+              + "盘点/移库在「流水」页.")
+
+    @staticmethod
+    def _proj_name(p):
+        return p.get("name") or f"项目 {p['id']}"
+
+    def undo(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先点一行要撤销的记录。", parent=self)
+            return
+        vals = self.tree.item(sel[0], "values")
+        label = (f"{vals[1]}  {vals[2]}  {vals[4]} 个  {vals[5]}\n{vals[0]}")
+        if vals[8]:
+            label += f"\n{vals[8]}"
+        undo_movement(self, self.app, int(sel[0]), label)
 
 
 # --------------------------------------------------------------------- 项目 BOM
@@ -1529,7 +1560,13 @@ class ProjectsTab(ttk.Frame):
         self.lbl_shortage = ttk.Label(head, textvariable=self.shortage, foreground="#c0392b")
         self.lbl_shortage.pack(side="right")
 
-        tools = ttk.Frame(right)
+        # 「这张 BOM 还缺什么」和「给它收料 / 发料」是同一件事的前后两步,
+        # 放在一个项目的三个子页签里,不用在页面之间来回跳。
+        self.sub = ttk.Notebook(right)
+        self.sub.pack(fill="both", expand=True)
+
+        detail = ttk.Frame(self.sub, padding=6)
+        tools = ttk.Frame(detail)
         tools.pack(fill="x", pady=(0, 4))
         ttk.Button(tools, text="编辑选中行…", command=self.edit_line).pack(side="left")
         ttk.Button(tools, text="替代料…", command=self.substitutes).pack(side="left", padx=6)
@@ -1538,7 +1575,7 @@ class ProjectsTab(ttk.Frame):
         ttk.Label(tools, text="双击一行可直接改用量/损耗/可选/免点。",
                   style="Dim.TLabel").pack(side="left", padx=8)
 
-        f2, self.t_bom = make_tree(right, [
+        f2, self.t_bom = make_tree(detail, [
             ("name", "名称", 150, "w", True),
             ("lcsc_pn", "立创编号", 80, "center"),
             ("value", "值", 62, "w"),
@@ -1550,11 +1587,18 @@ class ProjectsTab(ttk.Frame):
             ("sub_qty", "替代", 44, "e"),
             ("gap", "缺口", 48, "e"),
             ("flag", "标记", 56, "center"),
-            ("designators", "位号", 140, "w", True)], height=20)
+            ("designators", "位号", 140, "w", True)], height=16)
         f2.pack(fill="both", expand=True)
         self.t_bom.tag_configure("short", background="#ffe3e3")
         self.t_bom.tag_configure("done", foreground="#888")
         self.t_bom.bind("<Double-1>", lambda _e: self.edit_line())
+        self.sub.add(detail, text="  BOM 明细  ")
+
+        self.pane_in = MovePane(self.sub, app, "IN")
+        self.pane_out = MovePane(self.sub, app, "OUT")
+        self.sub.add(self.pane_in, text="  元件入库  ")
+        self.sub.add(self.pane_out, text="  元件出库  ")
+        self.sub.bind("<<NotebookTabChanged>>", lambda _e: self._sync_panes())
         pane.add(right, weight=3)
 
     def reload(self):
@@ -1573,6 +1617,11 @@ class ProjectsTab(ttk.Frame):
         elif self.t_proj.get_children():
             self.t_proj.selection_set(self.t_proj.get_children()[0])
             self._on_pick_project()
+        else:
+            # 一个项目都没有:两个方向的开单区要明确说「先在左边选一个项目」,
+            # 而不是留着上一次的项目 id 继续往旧项目里记账
+            self._pid = None
+            self._sync_panes()
 
     def _has_project(self, iid):
         try:
@@ -1587,6 +1636,17 @@ class ProjectsTab(ttk.Frame):
             return
         self._pid = int(sel[0])
         self.load_bom()
+        self._sync_panes()
+
+    def _sync_panes(self):
+        """把「现在选的是哪个项目」同步给两个方向的开单区。
+
+        没有项目就没有上下文:入库/出库都要记在项目名下,否则「这批料是为谁收的」
+        就丢了。项目页自己的子页签在没选项目时会写明「先在左边选一个项目」。
+        """
+        for p in (getattr(self, "pane_in", None), getattr(self, "pane_out", None)):
+            if p is not None:
+                p.set_project(self._pid)
 
     def load_bom(self):
         if not self._pid:
