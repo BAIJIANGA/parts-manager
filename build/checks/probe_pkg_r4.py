@@ -246,10 +246,24 @@ try:
         got_attrs.add(var_v.get())
     ck("元件编辑窗口里能改回那两个属性",
        {"耐压", "50V", "精度", "±5%"} <= got_attrs, True)
-    ck("品类下拉里能看到子类全路径",
-       "成品包菜单测试 / 陶瓷子类" in list(d.cb_cat.cget("values")), True)
+    ck("品类那格是只读的,改它得点「换…」(不再是能随便打字的框)",
+       "readonly" in d.cb_cat.state(), True)
     ck("打开时显示的就是全路径(不然一保存子类归属就被冲掉)",
        d.vars["category"].get(), "成品包菜单测试 / 陶瓷子类")
+
+    # #9:选品类改成一级一级弹 —— 框里只放这一级的名字,不放「大类 / 子类」长路径
+    pick = gui.CategoryPickerDialog(app, app, d._picked_cat_id)
+    pick.update()
+    lv1 = list(pick.step._rows[0][1].cget("values"))
+    ck("逐级选:第一级只有大类,没有「大类 / 子类」拼起来的长路径",
+       [v for v in lv1 if " / " in v], [])
+    ck("第一级里选中的就是这颗料的大类", pick.step._rows[0][1].get(),
+       "成品包菜单测试")
+    ck("有子类才会长出第二级", len(pick.step._rows), 2)
+    ck("第二级里就是那个子类", pick.step._rows[1][1].get(), "陶瓷子类")
+    ck("顺着选到底拿到的是子类那个节点,不是大类",
+       pick.step.current_node()["name"], "陶瓷子类")
+    pick.destroy()
     d.destroy()
 
     # 收料/出库这两屏才是用户点名要看属性的地方 —— 现造一个项目和一条需求
@@ -337,13 +351,29 @@ try:
     ck("删项目之后明细一条不剩(#4 的原始毛病)",
        app.con.execute("SELECT COUNT(*) FROM project_bom WHERE project_id=?",
                        (pj["id"],)).fetchone()[0], 0)
-    ck("明细表里也没有残留行", len(tt.t_bom.get_children()), 0)
-    ck("收料清单跟着空了", len(recv.get_children()), 0)
-    ck("标题回到「选一个项目」,没留着那个已经不存在的项目",
-       "选一个项目" in tt.title.get(), True)
     ck("项目列表里也没有它了",
        [i for i in t_proj.get_children()
         if "成品包属性项目" in str(t_proj.item(i, "values"))], [])
+    # 这份库是用户自己的,可能本来就有他的项目 —— 有的话,删完会自动切到那个项目上,
+    # 那是对的行为。所以分两种情形断言,但都不能出现「已删项目」的痕迹。
+    _rest = app.con.execute("SELECT id FROM project ORDER BY id").fetchall()
+    if not _rest:
+        ck("库里没别的项目时,明细表一张干净的表", len(tt.t_bom.get_children()), 0)
+        ck("收料清单也跟着空了", len(recv.get_children()), 0)
+        ck("标题回到「选一个项目」,没留着那个已经不存在的项目",
+           "选一个项目" in tt.title.get(), True)
+    else:
+        _ids = [r["id"] for r in _rest]
+        ck("删掉之后切到了库里还存在的项目(没赖在已删的那个上)",
+           tt._pid in _ids, True)
+        ck("标题不再写着那个已经删掉的项目",
+           "成品包属性项目" in tt.title.get(), False)
+        ck("明细表里那个项目一行都不剩",
+           [str(tt.t_bom.item(i, "values")) for i in tt.t_bom.get_children()
+            if "成品包属性项目" in str(tt.t_bom.item(i, "values"))], [])
+        ck("标题上的数字是还存在的那个项目",
+           tt.title.get() != "", True)
+        print(f"       (库里另有 {len(_ids)} 个项目,删完自动切到了 id={tt._pid})")
 
     app.destroy()
     app = None

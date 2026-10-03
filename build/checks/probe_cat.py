@@ -62,9 +62,10 @@ def main():
         "SELECT name FROM category WHERE parent_id IS NULL ORDER BY sort")]
     check("而且顺序就是内置清单的顺序", names, list(bom.CATEGORIES))
     check("新库里一个元件都没有", count(con, "SELECT COUNT(*) FROM component"), 0)
-    check("schema_version 提到 4",
+    check("schema_version 提到 5",
           con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
-          "4")
+          # 别写死数字:每加一列都要回来改一次这种断言,迟早忘
+          str(db.SCHEMA_VERSION))
 
     OUT.append("")
     OUT.append("【2】老库升上来:文本品类变成真正的行")

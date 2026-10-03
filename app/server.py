@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import attrs  # noqa: E402
 import bom  # noqa: E402
 import db  # noqa: E402
+import footprint  # noqa: E402
 import values  # noqa: E402
 import xlsx  # noqa: E402
 
@@ -256,6 +257,21 @@ def norm_package(text) -> str:
     return bom.norm_package(text)
 
 
+def _value_hits(text, want_num) -> bool:
+    """这个「值」是不是和要找的数值一样(写法可以不同:4.7k 与 4.7kΩ)。
+
+    单独抽出来是给「能不能靠封装索引提前收工」那个判断用的 —— 判断和打分
+    必须用同一套比较,否则收工条件会算错,候选就少了。
+    """
+    if want_num is None:
+        return False
+    num, _unit = values.parse_value(text or "")
+    if num is None:
+        return False
+    # 相对容差:4.7kΩ 解析出来是 4700.000000000001 这种也别漏判
+    return abs(num - want_num) <= abs(want_num) * 1e-9 + 1e-15
+
+
 def similar_components(con, *, value="", package="", category="", limit=8,
                        in_stock_only=False) -> list[dict]:
     """按「值 + 封装」找相似元件,给人确认用。
@@ -267,18 +283,48 @@ def similar_components(con, *, value="", package="", category="", limit=8,
     打分:
       值和单位都相同      +60
       数值相同(写法不同)  +50   4.7k 与 4.7kΩ 属于这一类
-      封装相同            +30
+      封装尺寸相同        +30   C0805 与 0805 是同一颗(立创导出就写 C0805)
       封装写法相近        +15   一方包含另一方,比如 CAP-0805 与 0805
       品类相同            +10
     得分越高越像,但**只是像**。界面必须把「值对上了、封装要自己看」这种区别说清楚,
     不能笼统地显示一个「匹配」。
+
+    两条实现上的讲究:
+      * 封装比较走 footprint:同尺寸不同写法(C0805 / R0805 / 1005 / 0805)
+        一律算「封装一样」—— 它们物理上是同一个尺寸,能不能互换看的就是尺寸。
+      * 先用 package_key 索引把范围缩到同一尺寸的那些行,再去算分。几百上千颗
+        电容的时候,全表逐行算和走索引拿几十行是两种手感。索引里一条都没命中
+        (老库还没回填、或者封装那一栏根本没写)才退回全表,免得漏掉候选。
     """
     want_num, want_unit = values.parse_value(value)
     want_pkg = norm_package(package)
+    # 尺寸级的封装键。「C0805 和 0805 是不是同一个封装」只有 footprint 说了算,
+    # 认不出来(比如 DIP-8)就是空串,后面退回字面比较,行为和以前一模一样。
+    want_fp = footprint.size(package)
     want_cat = str(category or "").strip()
 
+    where = " WHERE c.merged_into IS NULL"
+    rows = None
+    if want_fp:
+        # 走封装索引先把同一尺寸的那批拿出来。**注意这只用来提前收工,
+        # 不能用来缩小候选范围** —— 值对得上、封装不同的料也必须列出来
+        # (判定会写着「值对上了,封装要自己看」),那正是最容易发错货的地方。
+        fast = con.execute(COMPONENT_SELECT + where + " AND c.package_key=?",
+                           (want_fp,)).fetchall()
+        # 安全收工的条件:同尺寸 + 值也命中的候选一定 >= 90 分(60 + 30);
+        # 别的尺寸最多 60 + 15(写法相近)+ 10(品类相同)= 85,抢不到前面去。
+        # 凑够 limit 条就不必再扫全表了;凑不够就老实全表扫,一条都不会少。
+        enough = sum(
+            1 for r in fast
+            if (not in_stock_only or (r["on_hand"] or 0) > 0)
+            and _value_hits(r["value"], want_num))
+        if enough >= limit:
+            rows = fast
+    if rows is None:
+        rows = con.execute(COMPONENT_SELECT + where).fetchall()
+
     out: list[dict] = []
-    for r in con.execute(COMPONENT_SELECT + " WHERE c.merged_into IS NULL"):
+    for r in rows:
         score, why = 0, []
         value_hit = False
 
@@ -297,7 +343,17 @@ def similar_components(con, *, value="", package="", category="", limit=8,
                     why.append("数值相同(写法不同)")
 
         got_pkg = norm_package(r["package"] or "")
-        if want_pkg and got_pkg:
+        got_fp = footprint.size(r["package"] or "") or (r["package_key"] or "")
+        fp_hit = bool(want_fp) and got_fp == want_fp
+        if fp_hit and got_pkg == want_pkg:
+            score += 30
+            why.append("封装相同")
+        elif fp_hit:
+            # 尺寸一样就是同一个封装,只是写法不同(C0805 与 0805、1005 与 0402)。
+            # 把尺寸写出来,用户才知道凭什么说它们一样。
+            score += 30
+            why.append(f"封装一样({want_fp})")
+        elif want_pkg and got_pkg:
             if got_pkg == want_pkg:
                 score += 30
                 why.append("封装相同")
@@ -324,14 +380,21 @@ def similar_components(con, *, value="", package="", category="", limit=8,
         elif score >= 50:
             verdict = "值对上了,封装要自己看"
         else:
-            verdict = "只是有点像"
+            # 只对上了封装(值还没对上)。封装一样的话,这一句比「只是有点像」
+            # 有用得多 —— 至少知道它装得上去。
+            verdict = "封装一样,值还没对上" if fp_hit else "只是有点像"
         d["score"] = score
         d["match"] = "、".join(why)
         d["verdict"] = verdict
+        # 界面要单独标「封装一致」并把它们排在前面:出库发错货,十有八九就是
+        # 值一样、封装不一样(或反过来)的那两颗。
+        d["fp_match"] = fp_hit
         out.append(d)
 
-    # 同样像的时候,有库存的排前面 —— 找相似多半是为了出库,没库存的帮不上忙
-    out.sort(key=lambda c: (-c["score"], -(c["on_hand"] or 0), c["name"] or ""))
+    # 同样像的时候:封装一致的排前面(能直接装上去),再比有没有库存
+    # —— 找相似多半是为了出库,没库存的帮不上忙。
+    out.sort(key=lambda c: (-c["score"], -int(c.get("fp_match") or 0),
+                            -(c["on_hand"] or 0), c["name"] or ""))
     return out[:max(1, limit)]
 
 
@@ -365,12 +428,15 @@ def list_components(ctx: Ctx, m):
         # 搜索是主入口,不是分类的补充 —— 所以凡是用户可能记得的碎片都要命中:
         # 名称、立创编号、厂家料号、厂家、值、封装、**丝印**、**参数 JSON**、备注、品类。
         # 丝印那一条是给拆机料用的:SOT-23 上只印着三个字母,查不到就等于没存。
+        # 最后那一条是封装索引键:搜「C0805」要能搜到写成「0805」的那颗,
+        # 搜「1005」也要能搜到 0402 —— 立创导出写 C0805、手写常常就是 0805,
+        # 用户心里它们是同一个东西。
         base_where.append(
             "(c.name LIKE ? OR c.lcsc_pn LIKE ? OR c.mpn LIKE ? OR c.manufacturer LIKE ?"
             " OR c.value LIKE ? OR c.package LIKE ? OR c.marking LIKE ? OR c.params LIKE ?"
-            " OR c.note LIKE ? OR c.category LIKE ?)"
+            " OR c.note LIKE ? OR c.category LIKE ? OR c.package_key = ?)"
         )
-        base_args += [like] * 10
+        base_args += [like] * 10 + [footprint.canon(keyword)]
     if ctx.q("category"):
         base_where.append("c.category = ?")
         base_args.append(ctx.q("category"))
@@ -412,8 +478,10 @@ def list_components(ctx: Ctx, m):
 
     where, args = list(base_where), list(base_args)
     if ctx.q("package"):
-        where.append("c.package LIKE ?")
-        args.append(f"%{ctx.q('package')}%")
+        # 按封装筛也认尺寸:点「0805」这个按钮,写 C0805 和写 1005 的那些料
+        # 都该出来 —— 它们装的是同一个位置。
+        where.append("(c.package LIKE ? OR c.package_key = ?)")
+        args += [f"%{ctx.q('package')}%", footprint.canon(ctx.q("package"))]
     if ctx.q("unit"):
         where.append("c.value_unit = ?")
         args.append(ctx.q("unit"))
@@ -550,12 +618,13 @@ def create_component(ctx: Ctx, m):
     cat_text, cat_id = _resolve_category(ctx)
     cur = ctx.con.execute(
         """INSERT INTO component(lcsc_pn, mpn, manufacturer, name, category, category_id,
-                                value, package, marking, params, datasheet_url,
+                                value, package, package_key, marking, params, datasheet_url,
                                 product_url, unit, min_stock, reorder_qty, supplier,
                                 unit_price, default_loc_id, note, identity_key)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ctx.b("lcsc_pn"), ctx.b("mpn"), ctx.b("manufacturer"), name,
          cat_text, cat_id, ctx.b("value"), ctx.b("package"),
+         footprint.canon(ctx.b("package")),
          ctx.b("marking"), db.dump_params(ctx.b("params")),
          ctx.b("datasheet_url"), ctx.b("product_url"),
          ctx.b("unit") or "个", ctx.bi("min_stock", 0) or 0,
@@ -636,6 +705,9 @@ def update_component(ctx: Ctx, m):
             "UPDATE component SET identity_key=? WHERE id=?",
             (bom.identity_key(fresh["value"], fresh["package"], fresh["mpn"],
                               fresh["lcsc_pn"], fresh["name"]), cid))
+        # 封装索引键同理:改了封装不重算,按封装筛就会按老尺寸筛,查不到。
+        ctx.con.execute("UPDATE component SET package_key=? WHERE id=?",
+                        (footprint.canon(fresh["package"]), cid))
     ctx.con.commit()
     return 200, {"ok": True}
 
@@ -836,40 +908,104 @@ def update_category(ctx: Ctx, m):
 
 
 @route("DELETE", r"/api/categories/(\d+)")
-def delete_category(ctx: Ctx, m):
-    """删品类。**绝不删元件** —— 先把元件挪到上一级,再删节点。
+def _retag_category_subtree(ctx: Ctx, cat_id: int, root_name: str) -> int:
+    """把某个品类子树下所有元件的「大类文本」改成 root_name。返回改了几条。
 
-    用户的诉求是「库存种类也要能够添加和修改」,不是「删掉一个品类顺手清掉
-    底下所有料」。所以这里默认是「扁平化」:删掉「电容/无极性陶瓷电容」之后,
-    原来挂在它下面的料落到「电容」下面,一颗不少。
+    只在「这一支换了顶层」时才需要 —— 比如删掉一个顶层大类,它的下级自己当了
+    顶层。不跟着改的话,那些元件的文本还写着那个已经不存在的大类名,而全程序里
+    「按品类分组 / 筛选 / 显示」读的都是这个文本列,对不上就等于哪儿都找不到。
+    """
+    ids = _category_subtree(ctx, cat_id)
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    return max(int(ctx.con.execute(
+        f"UPDATE component SET category=? WHERE category_id IN ({marks}) AND category <> ?",
+        [root_name] + ids + [root_name]).rowcount), 0)
+
+
+def _attach_category(ctx: Ctx, node_id: int, new_parent_id):
+    """把一个品类节点挂到 new_parent_id 下面。返回它最终落在哪个节点上。
+
+    新位置已经有同名节点时**并进去**(把它的下级和元件都挪过去,再删掉这个空壳),
+    而不是报错。理由:删中间一层是大扫除,这时候被一句「已经有同名品类了」挡住,
+    用户只能自己先去改名 —— 而他要的只是把这一层拿掉。
+
+    传 None 表示「挂到顶层」,和 parent_id IS NULL 对应(SQLite 的 IS 能配 NULL,
+    所以顶层重名也能被这条找到)。
+    """
+    row = _category_row(ctx, node_id)
+    twin = ctx.con.execute(
+        "SELECT id FROM category WHERE parent_id IS ? AND name=? AND id<>?",
+        (new_parent_id, row["name"], node_id)).fetchone()
+    if twin is None:
+        ctx.con.execute(
+            "UPDATE category SET parent_id=?, sort=? WHERE id=?",
+            (new_parent_id, _category_sort_tail(ctx, new_parent_id), node_id))
+        return node_id
+    for kid in [r["id"] for r in ctx.con.execute(
+            "SELECT id FROM category WHERE parent_id=? ORDER BY sort, id", (node_id,))]:
+        _attach_category(ctx, kid, twin["id"])
+    ctx.con.execute("UPDATE component SET category_id=? WHERE category_id=?",
+                    (twin["id"], node_id))
+    ctx.con.execute("DELETE FROM category WHERE id=?", (node_id,))
+    return twin["id"]
+
+
+@route("DELETE", r"/api/categories/(\d+)")
+def delete_category(ctx: Ctx, m):
+    """删品类。**绝不删元件,也绝不连坐子类。**
+
+    删掉这一级的节点:下级接到上一级去(层级少一层,节点一个不少),直接挂在
+    它下面的元件挪到上一级。用户的原话是「这个选项只改这一级的,不涉及子级和
+    父级」—— 整理货架的时候,不该顺手把下面整枝也扔掉,那正是最容易误删的地方。
+
+    两种边界:
+      * 删的是顶层大类 -> 下级各自成为顶层(自己的名字就是大类名),直接挂在它
+        下面的元件落到「未分类」。这是唯一一个「大类」级的兜底,和界面上
+        显示「未分类」的地方是同一个词。
+      * 下级和上一级已有的节点撞名 -> 并进去(下级的下级、元件一起挪)。
+        不并的话 UNIQUE(parent_id, name) 会直接报错,而用户只能自己去改名。
     """
     cid = int(m.group(1))
     row = _category_row(ctx, cid)
-    subtree = _category_subtree(ctx, cid)
-    marks = ",".join("?" * len(subtree))
-    n_comp = ctx.con.execute(
-        f"SELECT COUNT(*) AS n FROM component WHERE category_id IN ({marks})",
-        subtree).fetchone()["n"]
+    parent_id = row["parent_id"]
 
-    if row["parent_id"] is None:
-        # 顶层节点被删:底下的料落到「未分类」。这是唯一一个「大类」级的兜底,
-        # 和界面里显示「未分类」的地方是同一个词。
-        dest_id = db.ensure_category(ctx.con, UNCATEGORIZED)
-        dest_path = UNCATEGORIZED
+    kids = [(r["id"], r["name"]) for r in ctx.con.execute(
+        "SELECT id, name FROM category WHERE parent_id=? ORDER BY sort, id", (cid,))]
+    n_comp = int(ctx.con.execute(
+        "SELECT COUNT(*) AS n FROM component WHERE category_id=?", (cid,)).fetchone()["n"])
+
+    if parent_id is None:
+        comp_dest_id = db.ensure_category(ctx.con, UNCATEGORIZED)
+        comp_dest_text = comp_dest_path = UNCATEGORIZED
     else:
-        dest_id = row["parent_id"]
-        dest_path = db.category_path(ctx.con, dest_id)
-    dest_root = db.category_root(ctx.con, dest_id) if dest_id else None
-    dest_text = dest_root["name"] if dest_root else UNCATEGORIZED
+        comp_dest_id = parent_id
+        dest_root = db.category_root(ctx.con, parent_id)
+        comp_dest_text = dest_root["name"] if dest_root else UNCATEGORIZED
+        comp_dest_path = db.category_path(ctx.con, parent_id)
 
+    # 1. 直接挂在这一级上的元件 -> 上一级
     if n_comp:
         ctx.con.execute(
-            f"UPDATE component SET category_id=?, category=? "
-            f"WHERE category_id IN ({marks})", [dest_id, dest_text] + subtree)
+            "UPDATE component SET category_id=?, category=? WHERE category_id=?",
+            (comp_dest_id, comp_dest_text, cid))
+
+    # 2. 下级接到上一级。顶层被删时接到 None(自己当顶层),这时它们底下元件的
+    #    大类文本必须跟着改成自己的名字,否则文本还写着那个已经不存在的大类。
+    for kid_id, kid_name in kids:
+        landed = _attach_category(ctx, kid_id, parent_id)
+        if parent_id is None:
+            _retag_category_subtree(ctx, landed, kid_name)
+
+    # 3. 这时候它已经是个空壳了,删掉不会连坐任何东西
     ctx.con.execute("DELETE FROM category WHERE id=?", (cid,))
     ctx.con.commit()
-    return 200, {"ok": True, "moved_components": int(n_comp), "to": dest_path,
-                 "deleted_nodes": len(subtree)}
+    # 兜底收尾:上面合并同名的分支如果让某条元件的文本和它所在支的顶层名字
+    # 对不上,这里补齐。reconcile 本来就每次启动都跑,幂等。
+    db.reconcile_categories(ctx.con)
+    return 200, {"ok": True, "moved_components": n_comp, "to": comp_dest_path,
+                 "moved_children": len(kids), "deleted_nodes": 1}
 
 
 @route("GET", r"/api/meta")

@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.join(ROOT, "app"))
 
 import bom       # noqa: E402
 import db        # noqa: E402
+import footprint  # noqa: E402  ← #10 标准封装识别
 import server    # noqa: E402
 
 CACHE = os.path.join(ROOT, "build", "cache")
@@ -1051,11 +1052,12 @@ _same = [i["on_hand"] > 0 for i in sim3["items"] if i["score"] == _top]
 check("分数一样时有库存的排在前面(没库存的帮不上出库)",
       _same, sorted(_same, reverse=True))
 
-# 只给封装时只是「有点像」—— 不能让人以为这就是那颗料
+# 只给封装时把握只能是「封装一样,值还没对上」—— 不能让人以为这就是那颗料,
+# 但也不该只说「有点像」:封装一样至少说明它装得上去。
 _s, sim5 = call(server.components_similar, query={"package": "0603"})
 check("只给封装时也找得到东西", len(sim5["items"]) > 0, True)
-check("但把握一律是「只是有点像」",
-      {i["verdict"] for i in sim5["items"]}, {"只是有点像"})
+check("但把握只说「封装一样,值还没对上」",
+      {i["verdict"] for i in sim5["items"]}, {"封装一样,值还没对上"})
 _s, sim6 = call(server.components_similar, query={"package": "R_0603"})
 check("封装归一化后 C0805 / c-0805 / 0805 这类写法能对上",
       any(i["id"] == S_A for i in sim6["items"]), True)
@@ -1436,6 +1438,156 @@ check("没挂品类的元件会被单独报数 —— 否则用户会在菜单�
 db.reconcile_categories(CON)
 _s, _t5 = call(server.list_categories)
 check("启动对账会把野数据挂回去", _t5["loose"], 0)
+
+
+p("\n【33】封装索引:C0805 / R0603 / L0402 认得出来,同尺寸算同一个")
+
+# ---- 纯函数:标准写法、公制写法、少一位的常见写法,都归到一个尺寸
+check("C0805 认成 0805", footprint.size("C0805"), "0805")
+check("R0603 认成 0603", footprint.size("R0603"), "0603")
+check("L0402 认成 0402", footprint.size("L0402"), "0402")
+check("公制 1005 就是 0402(同一颗,两种叫法)", footprint.size("1005"), "0402")
+check("公制 1608 就是 0603", footprint.size("1608"), "0603")
+check("写 805 也认(少一位的常见写法)", footprint.size("805"), "0805")
+check("SMD0805 / 0805_1.6x0.8 都能挖出 0805",
+      [footprint.size("SMD0805"), footprint.size("0805_1.6x0.8")], ["0805", "0805"])
+check("认不出尺寸的就不认(footprint 只认标准封装)",
+      footprint.size("DIP-8"), "")
+check("但字面归一化照样管用(和 bom.norm_package 一致)",
+      footprint.canon("DIP-8"), "DIP8")
+check("0603 和 0201 不是一回事", footprint.similar("0603", "0201"), False)
+check("DIP-8 和 DIP-16 也不是一回事", footprint.similar("DIP-8", "DIP-16"), False)
+check("0805 和 C0805 是一回事", footprint.similar("0805", "C0805"), True)
+check("1005 和 0402 是一回事", footprint.similar("1005", "0402"), True)
+
+# ---- 落库:package_key 由后端维护,用户什么都不用做
+_s, _c33 = call(server.create_component, body={
+    "name": "封装索引料", "value": "10uF", "package": "C0805", "category": "电容"})
+_r33 = CON.execute("SELECT package, package_key FROM component WHERE id=?",
+                   (_c33["id"],)).fetchone()
+check("用户写的封装原样存着(显示不改他的字)", _r33["package"], "C0805")
+check("索引列记下了尺寸", _r33["package_key"], "0805")
+_s, _u33 = call(server.update_component, match=(str(_c33["id"]),),
+                body={"package": "R0603"})
+check("改封装时索引列跟着重算",
+      CON.execute("SELECT package_key FROM component WHERE id=?",
+                  (_c33["id"],)).fetchone()[0], "0603")
+call(server.update_component, match=(str(_c33["id"]),), body={"package": "C0805"})
+
+# ---- 按封装筛:写 C0805 的和写 0805 的,点一下该一起出来
+_s, _p33 = call(server.list_components, query={"package": "0805", "limit": "0"})
+check("按 0805 筛,写 C0805 的那颗也出来",
+      _c33["id"] in {i["id"] for i in _p33["items"]}, True)
+_s, _pa = call(server.list_components, query={"package": "1005", "limit": "0"})
+_s, _pb = call(server.list_components, query={"package": "0402", "limit": "0"})
+check("按 1005 筛等价于按 0402 筛(用户心里它们是一个)",
+      {i["id"] for i in _pa["items"]} - {i["id"] for i in _pb["items"]}, set())
+
+# ---- 搜索也认尺寸
+_s, _k33 = call(server.list_components, query={"q": "C0805", "limit": "0"})
+check("按关键字搜 C0805 搜得到", _c33["id"] in {i["id"] for i in _k33["items"]}, True)
+_s, _k33b = call(server.list_components, query={"q": "1005", "limit": "0"})
+_bad33 = [i["id"] for i in _k33b["items"]
+          if (CON.execute("SELECT package_key FROM component WHERE id=?",
+                          (i["id"],)).fetchone()[0] or "") != "0402"]
+check("搜 1005 把 0402 那批都带出来(没有漏网)", _bad33, [])
+
+# ---- 相似候选:同尺寸的带 fp_match,而且写在「像在哪儿」里
+_s, _s33 = call(server.components_similar,
+                query={"value": "10uF", "package": "0805"})
+_fp33 = [i for i in _s33["items"] if i["id"] == _c33["id"]]
+check("同尺寸的候选被认出来了", bool(_fp33) and bool(_fp33[0]["fp_match"]), True)
+check("而且说清了为什么一样(把尺寸写出来)",
+      any("封装一样(0805)" in i["match"] for i in _fp33), True)
+check("同尺寸的排在没有 fp_match 的前面",
+      [bool(i["fp_match"]) for i in _s33["items"]],
+      sorted([bool(i["fp_match"]) for i in _s33["items"]], reverse=True))
+
+
+p("\n【34】删品类只动这一级:子类接到上一级,元件挪上去,一件都不删")
+
+
+def _tree34(tag):
+    """建一棵 顶层 -> 中间 -> 叶子 的树,每一级各挂一颗料。"""
+    top = call(server.create_category, body={"name": f"删测{tag}-顶层"})[1]["id"]
+    mid = call(server.create_category,
+               body={"name": f"删测{tag}-中间", "parent_id": top})[1]["id"]
+    leaf = call(server.create_category,
+                body={"name": f"删测{tag}-叶子", "parent_id": mid})[1]["id"]
+    ids = {"top": top, "mid": mid, "leaf": leaf}
+    for key in ("top", "mid", "leaf"):
+        ids["c_" + key] = call(server.create_component, body={
+            "name": f"删测{tag}-{key}", "category_id": ids[key],
+            "value": "1k", "package": "0603"})[1]["id"]
+    return ids
+
+
+# ---- 删中间层:叶子接到顶层,只有这一个节点消失
+T = _tree34("A")
+_st34, _r34 = call(server.delete_category, match=(str(T["mid"]),))
+check("删中间层:报出挪走了几个元件", _r34["moved_components"], 1)
+check("删中间层:报出几个子类接到了上一级", _r34["moved_children"], 1)
+check("只删掉这一个节点", _r34["deleted_nodes"], 1)
+check("叶子接到顶层去了",
+      CON.execute("SELECT parent_id FROM category WHERE id=?",
+                  (T["leaf"],)).fetchone()[0], T["top"])
+check("挂在中间层的那颗料挪到了顶层",
+      CON.execute("SELECT category_id FROM component WHERE id=?",
+                  (T["c_mid"],)).fetchone()[0], T["top"])
+check("另外两颗料一动没动",
+      [CON.execute("SELECT category_id FROM component WHERE id=?",
+                   (T["c_top"],)).fetchone()[0],
+       CON.execute("SELECT category_id FROM component WHERE id=?",
+                   (T["c_leaf"],)).fetchone()[0]], [T["top"], T["leaf"]])
+check("中间那个节点确实没了",
+      CON.execute("SELECT COUNT(*) AS n FROM category WHERE id=?",
+                  (T["mid"],)).fetchone()["n"], 0)
+check("路径少了一层(叶子上面直接是顶层)",
+      db.category_path(CON, T["leaf"]), "删测A-顶层 / 删测A-叶子")
+check("挪上去那颗料的文本列仍旧等于顶层名字",
+      CON.execute("SELECT category FROM component WHERE id=?",
+                  (T["c_mid"],)).fetchone()[0], "删测A-顶层")
+
+# ---- 删顶层:下级各自成为顶层,元件的文本必须跟着换(否则写着一个不存在的大类)
+T2 = _tree34("B")
+_st34b, _r34b = call(server.delete_category, match=(str(T2["top"]),))
+check("删顶层:直接挂在它下面的料落到未分类",
+      CON.execute("SELECT category FROM component WHERE id=?",
+                  (T2["c_top"],)).fetchone()[0], "未分类")
+check("中间层自己当了顶层",
+      CON.execute("SELECT parent_id FROM category WHERE id=?",
+                  (T2["mid"],)).fetchone()[0], None)
+check("中间层那颗料的文本换成了新的顶层名",
+      CON.execute("SELECT category FROM component WHERE id=?",
+                  (T2["c_mid"],)).fetchone()[0], "删测B-中间")
+check("整支下面的料(含叶子)文本都跟着换了",
+      CON.execute("SELECT category FROM component WHERE id=?",
+                  (T2["c_leaf"],)).fetchone()[0], "删测B-中间")
+
+# ---- 撞名:下级接到上一级时遇到同名节点 -> 并进去,既不报错也不丢东西
+T3 = _tree34("C")
+_twin34 = call(server.create_category,
+               body={"name": "删测C-叶子", "parent_id": T3["top"]})[1]["id"]
+_st34c, _r34c = call(server.delete_category, match=(str(T3["mid"]),))
+check("撞名时并进去,不报错", _st34c, 200)
+check("并进去之后同名节点只剩一个",
+      CON.execute("SELECT COUNT(*) AS n FROM category WHERE name=? AND parent_id=?",
+                  ("删测C-叶子", T3["top"])).fetchone()["n"], 1)
+check("叶子那颗料挪到了那个已经存在的同名节点上",
+      CON.execute("SELECT category_id FROM component WHERE id=?",
+                  (T3["c_leaf"],)).fetchone()[0], _twin34)
+
+# ---- 绝不连坐:删一整支行,一颗元件都不许少
+T4 = _tree34("D")
+_before34 = CON.execute("SELECT COUNT(*) AS n FROM component "
+                        "WHERE merged_into IS NULL").fetchone()["n"]
+call(server.delete_category, match=(str(T4["top"]),))
+_after34 = CON.execute("SELECT COUNT(*) AS n FROM component "
+                       "WHERE merged_into IS NULL").fetchone()["n"]
+check("删顶层一整支,元件一颗都没少", _after34, _before34)
+check("整支的节点都还在(只是层级变了)",
+      CON.execute("SELECT COUNT(*) AS n FROM category WHERE id IN (?,?,?)",
+                  (T4["top"], T4["mid"], T4["leaf"])).fetchone()["n"], 2)
 
 # ---- 全库扫描:文本和树上顶层名字必须处处一致
 _mism = 0

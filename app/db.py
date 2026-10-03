@@ -24,7 +24,7 @@ import os
 import sqlite3
 from datetime import datetime
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 TABLES = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS component (
   value         TEXT,                           -- 1uF / 10k
   value_num     REAL,                           -- 由 value 解析出的数值,用来正确排序/筛选
   value_unit    TEXT,                           -- 解析出的单位(F / Ω / H …)
-  package       TEXT,                           -- 0805 / SOT-23
+  package       TEXT,                           -- 0805 / SOT-23,原样保留用户写的字
+  package_key   TEXT,                           -- 归并后的尺寸:C0805 / R0805 / 0805 都是 0805
   marking       TEXT,                           -- 丝印/顶标:SOT-23 上那三个字母,拆机料全靠它认
   params        TEXT NOT NULL DEFAULT '{}',     -- JSON:{"耐压":"50V"}
   datasheet_url TEXT,
@@ -181,6 +182,10 @@ CREATE INDEX IF NOT EXISTS idx_category_parent ON category(parent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_category_root_name
   ON category(name) WHERE parent_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_component_pkg ON component(package);
+-- 封装索引键。为什么值得单独一列而不是每次现算:封装按钮要按它分组、搜索要按它
+-- 命中、出入库候选要先按它筛一遍。几百上千颗电容的时候,「全表取出来在 Python
+-- 里逐行算」和「走索引拿几十行」是两种手感 —— 用户要的就是后者。
+CREATE INDEX IF NOT EXISTS idx_component_pkgkey ON component(package_key);
 CREATE INDEX IF NOT EXISTS idx_component_val ON component(value);
 CREATE INDEX IF NOT EXISTS idx_component_valnum ON component(value_num);
 CREATE INDEX IF NOT EXISTS idx_component_ident ON component(identity_key);
@@ -222,6 +227,9 @@ ADDED_COLUMNS = {
         "identity_key": "TEXT",
         # 品类树里的位置。老库启动时由 reconcile_categories() 补上。
         "category_id": "INTEGER REFERENCES category(id) ON DELETE SET NULL",
+        # 封装索引键(C0805 / R0603 / L0402 一律归到 0805 / 0603 / 0402)。
+        # 单独存一列才好建索引 —— 见 INDEXES 里的说明。
+        "package_key": "TEXT",
     },
     "location": {
         "parent_id": "INTEGER REFERENCES location(id) ON DELETE CASCADE",
@@ -301,6 +309,7 @@ def init_db(con: sqlite3.Connection) -> list:
     # 补列之后、用之前,把老数据的身份键补上 —— 否则老元件一条都匹配不上,
     # 重新导入 BOM 会把整块板重复长一遍。
     backfill_identity(con)
+    backfill_package_key(con)
     # 品类表要在元件都就位之后才对账:第 1 步的种子、第 2 步的挂靠都靠读 component
     reconcile_categories(con)
     con.commit()
@@ -405,6 +414,25 @@ def backfill_identity(con: sqlite3.Connection) -> tuple:
     if keys or names:
         con.commit()
     return keys, names
+
+
+def backfill_package_key(con: sqlite3.Connection) -> int:
+    """给元件补「封装索引键」。每次启动都跑,幂等,返回改了几条。
+
+    C0805 / R0603 / L0402 / 1005 这些写法的归并全交给 footprint.canon ——
+    它是这件事唯一的判断标准,免得几处各写一份规则然后慢慢漂移。
+    """
+    import footprint
+    rows = con.execute("SELECT id, package, package_key FROM component").fetchall()
+    fixed = 0
+    for r in rows:
+        key = footprint.canon(r["package"])
+        if (r["package_key"] or "") != key:
+            con.execute("UPDATE component SET package_key=? WHERE id=?", (key, r["id"]))
+            fixed += 1
+    if fixed:
+        con.commit()
+    return fixed
 
 
 # 品类树的起点。和 bom.CATEGORIES 一致 —— 新装的库打开就能直接挑,

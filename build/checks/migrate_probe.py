@@ -78,6 +78,45 @@ try:
 except sqlite3.Error as exc:
     problems.append(f"旧库上跑新功能的 SQL 报错: {exc}")
 
+# ---- #10:identity_key 的算法变了(封装按标准尺寸归一,C0805 和 0805 算同一个)。
+#      老库里存的是旧算法留下的键 —— 启动时必须整体重算,否则同一颗料会分裂成两条。
+try:
+    import bom as _bom
+    _row = con.execute("SELECT id, value, package, mpn, lcsc_pn, name FROM component "
+                       "WHERE merged_into IS NULL ORDER BY id LIMIT 1").fetchone()
+    if _row is None:
+        problems.append("库里一个元件都没有,没法验 identity_key 重算")
+    else:
+        con.execute("UPDATE component SET identity_key='旧算法留下的键' WHERE id=?",
+                    (_row["id"],))
+        con.commit()
+        db.init_db(con)                 # 模拟用户双击 exe:启动就会跑这一下
+        _now = con.execute("SELECT identity_key FROM component WHERE id=?",
+                           (_row["id"],)).fetchone()[0]
+        _want = _bom.identity_key(_row["value"], _row["package"], _row["mpn"],
+                                  _row["lcsc_pn"], _row["name"])
+        if _now == "旧算法留下的键":
+            problems.append("旧 identity_key 没被重算(启动迁移没起作用)")
+        elif _now != _want:
+            problems.append(f"重算出来的键和现算法对不上: {_now!r} != {_want!r}")
+        else:
+            print(f"identity_key 旧键重算:OK -> {_now!r}")
+        # 换个封装写法写同一颗料,键必须一样(这才是这次改算法要的效果)
+        import footprint as _fp
+        _pkg = _row["package"] or ""
+        _alt = "C" + _pkg
+        if _fp.size(_pkg) and _fp.size(_alt) == _fp.size(_pkg):
+            _k1 = _bom.identity_key(_row["value"], _pkg, _row["mpn"],
+                                    _row["lcsc_pn"], _row["name"])
+            _k2 = _bom.identity_key(_row["value"], _alt, _row["mpn"],
+                                    _row["lcsc_pn"], _row["name"])
+            if _k1 != _k2:
+                problems.append(f"{_pkg} 和 {_alt} 是同一个尺寸,键却不一样")
+            else:
+                print(f"{_pkg} 与 {_alt} 算同一个键:OK")
+except sqlite3.Error as exc:
+    problems.append(f"重算 identity_key 时出错: {exc}")
+
 con.close()
 os.remove(COPY)
 

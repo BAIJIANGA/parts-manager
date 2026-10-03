@@ -19,6 +19,9 @@ import re
 from typing import Any, Iterable
 
 import db
+# 注意别名:这个模块里 classify(designators, footprint, ...) 的参数就叫 footprint,
+# 直接 `import footprint` 会被参数遮住,于是 footprint.canon 变成「字符串没有 canon」。
+import footprint as fprint
 import values
 import xlsx
 
@@ -196,9 +199,14 @@ def classify(designators: Iterable[str] | None = None, footprint: Any = "",
     if not any(v[0] <= 3 for v in votes):       # 还没有明确依据,试试弱证据
         if any(k in fp for k in CHIP_FOOTPRINTS):
             votes.append((4, "芯片/IC", f"封装 {footprint} 是芯片常见的封装(弱证据)"))
-        elif fp[:1] in ("R", "C", "L") and any(ch.isdigit() for ch in fp):
-            cat = {"R": "电阻", "C": "电容", "L": "电感"}[fp[0]]
-            votes.append((4, cat, f"封装 {footprint} 以 {fp[0]} 开头且带数字(弱证据)"))
+        else:
+            # 只认「尺寸 + 类别前缀」这种标准写法(R0603 / C0805 / L0402 / CAP0805 …)。
+            # 以前是拿首字母 + 有没有数字硬判,于是 SMD0805 这种认不出来、
+            # RES-0805 又要靠另一个判断兜。现在统一交给 footprint,
+            # 规则只有一份,而且和身份键、相似度用的是同一份。
+            wcat = fprint.category(fp)
+            if wcat:
+                votes.append((4, wcat, f"封装 {footprint} 是{wcat}的标准写法(弱证据)"))
 
     if not votes:
         return "其他", CONF_NONE, "位号、值、封装里都没有能认出品类的线索"
@@ -290,6 +298,11 @@ def norm_package(text) -> str:
 
     这个函数原来只在 server.py 里(给相似度打分用的)。身份键也得用同一套规则 ——
     两处各写一份迟早会漂移,所以挪到这里当成唯一的实现,server 那边改成转发。
+
+    **只去分隔符,不认尺寸** —— 它答的是「这两个写法是不是字面一样」。
+    「C0805 和 0805 是不是同一个封装」是 footprint.canon 的事(认公制英制、
+    认 R/C/L 那种类别前缀,认不出来才退回这个函数)。两件事分开,
+    免得哪天有人想把 1005 也认成 0402 时,把只看字面相等的地方一起改了。
     """
     return re.sub(r"[\s\-_/]+", "", str(text or "").upper())
 
@@ -320,7 +333,11 @@ def identity_key(value: str | None, package: str | None, mpn: str | None,
     if mpn and str(mpn).strip():
         return "mpn:" + str(mpn).strip()
     val = _ident_part(value)
-    pkg = norm_package(package)
+    # 用 footprint.canon 而不是 norm_package:同一个 0805 电容,一条记录写 0805、
+    # 另一条写 C0805(立创导出就是这种),字面上不相等,但它们是**同一颗料** ——
+    # 不归并的话,重新导入 BOM 会把一颗料并成两条。canon 认不出尺寸时退回
+    # norm_package 的行为,所以 DIP-8 / SOT-23 这些非标准封装完全不受影响。
+    pkg = fprint.canon(package)
     if val or pkg:
         return f"vp:{val}|{pkg}"
     nm = _ident_part(name)
@@ -685,7 +702,8 @@ def build_report(con, project_id: int) -> dict:
     rows = con.execute(
         """SELECT b.id AS bom_id, b.component_id, b.required_qty, b.designators,
                   b.placed_qty, b.optional, b.consumable, b.attrition, b.setup_qty, b.note,
-                  c.lcsc_pn, c.mpn, c.name, c.category, c.package, c.value, c.unit,
+                  c.lcsc_pn, c.mpn, c.name, c.category, c.package, c.package_key,
+                  c.value, c.unit,
                   c.unit_price, c.min_stock, c.params,
                   COALESCE((SELECT SUM(qty) FROM stock s
                              WHERE s.component_id = b.component_id), 0) AS on_hand,
@@ -748,7 +766,8 @@ def build_report(con, project_id: int) -> dict:
             "bom_id": r["bom_id"],
             "component_id": r["component_id"],
             "lcsc_pn": r["lcsc_pn"], "mpn": r["mpn"], "name": r["name"],
-            "category": r["category"], "package": r["package"], "value": r["value"],
+            "category": r["category"], "package": r["package"],
+            "package_key": r["package_key"], "value": r["value"],
             "unit": r["unit"], "unit_price": float(r["unit_price"] or 0),
             "per_board": per_board,
             "required_qty": per_board,          # 兼容既有调用

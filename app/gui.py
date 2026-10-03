@@ -28,12 +28,38 @@ if BASE_DIR not in sys.path:
 
 import attrs       # noqa: E402  ← 属性名的建议、归一化和显示格式
 import db          # noqa: E402
+import footprint   # noqa: E402  ← 标准封装识别:C0805 / R0603 / L0402 归到同一个尺寸
 import server      # noqa: E402  ← 复用全部业务逻辑
 import values      # noqa: E402  ← 值区间筛选要把 1k 这种写法解析成数值
 
 DEFAULT_DB = os.path.join(server.PROJECT_ROOT, "data", "parts.db")
 ICON_PATH = os.path.join(server.PROJECT_ROOT, "app", "static", "app.ico")
 BACKUP_DIR = os.path.join(server.PROJECT_ROOT, "data", "backups")
+
+
+def pkg_groups(pkgs):
+    """把一堆封装写法按尺寸归并:[(显示标签, 筛选用值, 原始写法列表)]。
+
+    归类规则只有 footprint 一套 —— 菜单、筛选、身份键必须用同一套,否则会出现
+    「菜单里合成一个、匹配时算两个」这种自相矛盾。C0805 和 0805 点哪一个都该
+    看到同一批料;1005 和 0402 也是(同一个 0402,两种叫法)。
+
+    显示标签用**能认出尺寸时的尺寸**(认不出就原样),所以按钮上看到的是 0805
+    这种短标签,而不是被截断的一长串。用户存进去的字一个都不改。
+    """
+    out, at = [], {}
+    for p in pkgs:
+        p = str(p or "").strip()
+        if not p:
+            continue
+        key = footprint.canon(p)
+        if key not in at:
+            at[key] = {"label": footprint.label(p) or p, "key": key, "raws": []}
+            out.append(at[key])
+            at[key]["raws"].append(p)
+        else:
+            at[key]["raws"].append(p)
+    return [(g["label"], g["key"], g["raws"]) for g in out]
 
 KIND_LABEL = {"IN": "入库", "OUT": "出库", "ADJUST": "盘点", "TRANSFER": "移库"}
 # 查重的三档依据。前两档是硬证据,第三档只是可疑 —— 界面上要能看出这个区别,
@@ -497,9 +523,12 @@ class CardBoard(ttk.Frame):
     的坑只需要在这里躲一次。
     """
 
-    def __init__(self, parent, on_pick):
+    def __init__(self, parent, on_pick, on_menu=None):
         super().__init__(parent)
         self.on_pick = on_pick
+        # 右键回调(可选)。库存菜单用它做「就地增删这一级」;
+        # 项目页不给,那边右键有自己的意思。
+        self.on_menu = on_menu
         self.cards = {}          # key -> 卡片控件
         self._seq = []           # 显示顺序,重排时用
         self._cols = 0
@@ -588,6 +617,10 @@ class CardBoard(ttk.Frame):
         parts = (card, badge, body, lbl, hint)
         for w in parts:
             w.bind("<Button-1>", lambda _e, k=key: self.on_pick(k))
+            if self.on_menu is not None:
+                # 右键 = 改这一级(加子类 / 改名 / 删除)。左键照旧往下钻,
+                # 多一个右键不改变原来的手感。
+                w.bind("<Button-3>", lambda e, k=key: self.on_menu(k, e))
             w.bind("<Enter>", lambda _e, ws=parts: self._tint(ws, CARD_BG_HOVER))
             w.bind("<Leave>", lambda _e, ws=parts: self._tint(ws, CARD_BG))
         card.bind("<Enter>", lambda _e: card.configure(highlightbackground=CARD_EDGE_HOVER),
@@ -677,7 +710,11 @@ class ComponentsTab(ttk.Frame):
         ttk.Button(head, text="⚡ 快速入库", command=self.quick_in).pack(side="right")
         ttk.Button(head, text="📋 批量入库", command=self.batch_in).pack(side="right", padx=6)
         ttk.Button(head, text="🔍 查重", command=self.app.dedupe).pack(side="right", padx=6)
-        # 品类管理放在首页顶栏:想加一个新的库存种类时,人就在这个页面上
+        # 首页也能直接加大类 —— 「不要只在一级菜单上面做品类管理」的意思是
+        # 每一级都能就地改,不是要把首页那个入口拿掉
+        ttk.Button(head, text="＋ 新增大类", command=self.add_root_cat).pack(
+            side="right", padx=6)
+        # 品类管理放在首页顶栏:想看整棵树、想把某一支挪个位置时用它
         ttk.Button(head, text="🗂 品类管理", command=self.manage_categories).pack(
             side="right", padx=6)
         ttk.Button(head, text="＋ 新增元件", command=self.add).pack(side="right", padx=6)
@@ -694,7 +731,7 @@ class ComponentsTab(ttk.Frame):
         ttk.Label(sbox, text="名称 / 立创编号 / 料号 / 封装 / 值 / 丝印 / 参数 / 备注",
                   style="Dim.TLabel").pack(side="left", padx=6)
 
-        self.board = CardBoard(self.page_home, self.open_category)
+        self.board = CardBoard(self.page_home, self.open_category, self._cat_menu)
         self.board.pack(fill="both", expand=True)
 
     # ------------------------------------------------------ 页面:某个大类
@@ -823,11 +860,15 @@ class ComponentsTab(ttk.Frame):
         self.pick_count = tk.StringVar()
         ttk.Label(head, textvariable=self.pick_count, style="Dim.TLabel").pack(
             side="left", padx=12)
+        # 就地加子类:人已经站在这一级上了,不该逼他先打开整棵树再找位置
+        ttk.Button(head, text="＋ 加子类", command=self.add_here).pack(
+            side="right", padx=6)
         ttk.Button(head, text="🗂 品类管理", command=self.manage_categories).pack(side="right")
         ttk.Label(self.page_pick,
-                  text="这一级是品类树里的子类。要加新的子类,点右上角「品类管理」。",
+                  text="这一级是品类树里的子类。加新子类点右上角「＋ 加子类」,"
+                       "改名或删除在卡片上点右键。只动这一级,不会牵连上面的层级。",
                   style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
-        self.pick_board = CardBoard(self.page_pick, self._pick_one)
+        self.pick_board = CardBoard(self.page_pick, self._pick_one, self._cat_menu)
         self.pick_board.pack(fill="both", expand=True)
 
     def _load_cat_tree(self):
@@ -960,9 +1001,125 @@ class ComponentsTab(ttk.Frame):
         self._descend()
 
     def manage_categories(self):
-        """开品类管理窗口;关掉之后菜单要按新的树重画。"""
+        """开品类管理窗口;关掉之后菜单要按新的树重画。
+
+        这个窗口用来**看整棵树**(哪一支在哪个位置、下面各有多少料)。
+        日常的「加一个 / 改个名 / 删掉」不必开它 —— 在菜单里就地做,
+        人本来就在那一页上。
+        """
         dlg = CategoryManagerDialog(self, self.app)
         self.wait_window(dlg)
+        self.reload()
+
+    # ------------------------------------------------------ 就地改这一级
+
+    def _menu_node(self, key):
+        """右键那张卡片对应树上哪个节点。
+
+        首页的卡片 key 是大类**名字**,中间页的 key 是节点 id —— 两个页面
+        共用同一个回调,所以按当前视图分辨。分不出来的返回 None(调用方
+        直接什么都不做,不能让一次右键崩掉整个界面)。
+        """
+        if self.view == "pick":
+            try:
+                return self._cat_flat.get(int(key))
+            except (TypeError, ValueError):
+                return None
+        for n in self._cat_flat.values():
+            if n["parent_id"] is None and n["name"] == key:
+                return n
+        return None
+
+    def _cat_menu(self, key, event):
+        """卡片右键菜单:只动这一级。"""
+        self._load_cat_tree()          # 数量、子类这些得是新的
+        node = self._menu_node(key)
+        if node is None:
+            self.reload()
+            return
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="＋ 在这下面加子品类…",
+                         command=lambda: self.add_child_cat(node))
+        menu.add_command(label="改名…", command=lambda: self.rename_cat(node))
+        menu.add_command(label="删除…", command=lambda: self.delete_cat(node))
+        if node["parent_id"] is None:
+            menu.add_separator()
+            menu.add_command(label="＋ 再加一个顶级品类…", command=self.add_root_cat)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def add_here(self):
+        """在当前这一页下面加子品类。首页没有「当前页」,那就是加顶级。"""
+        self._load_cat_tree()
+        node = self._last_cat() if self.view == "pick" else None
+        if node is None:
+            self.add_root_cat()
+        else:
+            self.add_child_cat(node)
+
+    def add_root_cat(self):
+        name = ask_text(self, "新增大类", "新的大类叫什么?", "")
+        if not name:
+            return
+        res = call(self.con, server.create_category, parent=self, body={"name": name})
+        if res is None:
+            return
+        self.app.set_status(f"加好了大类「{name}」", 5)
+        self.reload()
+
+    def add_child_cat(self, node):
+        """在某个品类下面新建子品类。加完菜单立刻多一张卡片。"""
+        name = ask_text(self, "新增子品类",
+                        f"挂在「{node['path']}」下面的新品类叫什么?", "")
+        if not name:
+            return
+        res = call(self.con, server.create_category, parent=self,
+                   body={"name": name, "parent_id": node["id"]})
+        if res is None:
+            return
+        self.app.set_status(f"加好了「{node['path']} / {name}」", 5)
+        self.reload()
+
+    def rename_cat(self, node):
+        name = ask_text(self, "改品类名", "新的名字:", node["name"])
+        if not name or name == node["name"]:
+            return
+        res = call(self.con, server.update_category, parent=self,
+                   match=(str(node["id"]),), body={"name": name})
+        if res is None:
+            return
+        n = int((res or {}).get("renamed_components") or 0)
+        self.app.set_status(f"改好了。{n} 个元件的品类跟着更新了。", 5)
+        self.reload()
+
+    def delete_cat(self, node):
+        """删掉这一级。**下游的东西一件都不丢**:子类接到上一级,元件挪到上一级。
+
+        确认框里必须把这两句话写出来:用户点「删除」时最怕的就是
+        「连子类和料一起没了」,而这里一件都不删。
+        """
+        kids = node.get("children") or []
+        n = int(node.get("total") or 0)
+        dest = "上一级" if node.get("parent_id") else "「未分类」"
+        msg = f"删掉「{node['path']}」?"
+        if kids:
+            msg += (f"\n\n它下面的 {len(kids)} 个子品类会接到{dest},"
+                    f"**一个都不会删**。")
+        if n:
+            msg += (f"\n\n挂在它(含子类)下面的 {n} 个元件会被挪到{dest},"
+                    f"**不会被删除**。")
+        if not messagebox.askyesno("确认删除", msg, parent=self):
+            return
+        res = call(self.con, server.delete_category, parent=self,
+                   match=(str(node["id"]),))
+        if res is None:
+            return
+        self.app.set_status(
+            f"删掉了。{res.get('moved_components') or 0} 个元件挪到"
+            f"「{res.get('to')}」,{res.get('moved_children') or 0} 个子品类"
+            f"接到了上一级,一个都没丢。", 6)
         self.reload()
 
     # ------------------------------------------------------ 二级页的筛选
@@ -1056,7 +1213,11 @@ class ComponentsTab(ttk.Frame):
         data = call(self.con, server.list_components, query=query, quiet=True) or {}
         rows = data.get("items") or []
         facets = data.get("facets") or {}
-        self._set_facet(self.cmb_pkg, facets.get("packages") or [], self.f_pkg)
+        # 下拉列归并后的尺寸,和那一排按钮同一套值 —— 两条路筛出不同结果的话,
+        # 用户只会更糊涂(按钮上写着 0805,下拉里却没有 0805 这一项)。
+        self._set_facet(self.cmb_pkg,
+                        [g[1] for g in pkg_groups(facets.get("packages") or [])],
+                        self.f_pkg)
         self._set_facet(self.cmb_unit, facets.get("units") or [], self.f_unit)
         self._render_pkg_chips(facets.get("packages") or [])
 
@@ -1086,9 +1247,12 @@ class ComponentsTab(ttk.Frame):
         ttk.Label(self.pkg_bar, text="封装", style="Dim.TLabel").pack(side="left",
                                                                     padx=(0, 6))
         cur = self._facet_value(self.f_pkg)
-        if len(pkgs) > 14:
+        # 先按尺寸归并:C0805 / 0805 / SMD0805 是同一个位置,摆成三个按钮
+        # 只会让人挑花眼,而且点哪一个都只筛出一部分 —— 看着像漏了数据。
+        groups = pkg_groups(pkgs)
+        if len(groups) > 14:
             # 封装特别多的时候不给芯片了:一行几十个按钮比下拉框还难找
-            ttk.Label(self.pkg_bar, text=f"{len(pkgs)} 种封装,用右边的下拉框筛",
+            ttk.Label(self.pkg_bar, text=f"{len(groups)} 种封装,用右边的下拉框筛",
                       style="Dim.TLabel").pack(side="left")
             self.pkg_chips["__many__"] = None
             return
@@ -1102,8 +1266,8 @@ class ComponentsTab(ttk.Frame):
             self.pkg_chips[value] = btn
 
         chip("全部", "")
-        for p in pkgs:
-            chip(p, p)
+        for label, key, _raws in groups:
+            chip(label, key)
 
     def open_search(self):
         kw = self.q.get().strip()
@@ -1335,8 +1499,183 @@ def category_options(con):
     return list(meta.get("categories") or []) or ["其他"]
 
 
+class CategoryStepBox(ttk.Frame):
+    """一级一个框的品类选择器:选完上一级才出下一级,没有了就停。
+
+    单独做成一个控件,是因为有三处要用:独立的「选品类」窗口、BOM 行上
+    「这一行算哪一类」那个窗口(它还得额外允许直接打字)、还有自检。
+
+    **每个框里只有这一级的名字**。以前是一个装着全路径的长下拉:C0805 那种
+    一长串,框里只看得见结尾那几个字,用户根本不知道自己在选哪一支 ——
+    而选错品类的代价是这颗料以后按品类找不到。
+
+    每一级右边都能「＋ 新建…」:挑到一半发现「钽电容」这一档还没有,当场加上,
+    不用关掉窗口跑去品类管理里加完再回来重挑。新建的节点挂在这一级选中的
+    那个节点下面 —— 用户点的位置就是他想要的位置。
+    """
+
+    LEVELS = ["大类", "二级", "三级", "四级", "五级", "六级"]
+
+    def __init__(self, parent, con, on_change=None):
+        super().__init__(parent)
+        self.con = con
+        self.on_change = on_change
+        self._items, self._by_id = [], {}
+        self._rows, self._sel = [], {}
+        self._busy = False
+        self.fetch()
+        self.seed(None)
+
+    # ---------------------------------------------------------------- 数据
+    def fetch(self):
+        data = call(self.con, server.list_categories, quiet=True) or {}
+        self._items = list(data.get("items") or [])
+        # flat 和 items 里是同一批 dict(后端就建了一份),children 已经挂好了
+        self._by_id = {n["id"]: n for n in (data.get("flat") or [])}
+
+    def kids(self, pid):
+        """某一级的候选。名字不叫 children 是因为 Tkinter 的控件自己有个
+        `children` 实例属性(子控件字典),同名的方法会被它遮住。"""
+        if pid is None:
+            return self._items
+        node = self._by_id.get(pid)
+        return list(node.get("children") or []) if node else []
+
+    # ---------------------------------------------------------------- 铺框
+    def reset(self):
+        """清空重铺。品类在别处改过之后(比如刚在品类管理里加过)要重来一次。"""
+        self.fetch()
+        self.seed(None)
+
+    def seed(self, cat_id):
+        """按已有的归属把框铺好,让人一眼看出它在树的哪一层。"""
+        self._busy = True            # 铺初始状态时别让选择事件再往下铺一级
+        try:
+            for w in self.winfo_children():
+                w.destroy()
+            self._rows, self._sel = [], {}
+            chain, node = [], self._by_id.get(cat_id) if cat_id else None
+            while node is not None:          # 从自己往上数祖先
+                chain.append(node)
+                node = self._by_id.get(node["parent_id"])
+            chain.reverse()                  # 再从上往下铺
+            pid = None
+            for n in chain:
+                self._grow(pid, preselect=n["id"])
+                pid = n["id"]
+            if not chain:
+                self._grow(None)
+            elif self.kids(chain[-1]["id"]):
+                # 它下面还有子类,再铺一级空的 —— 想往里选就能直接选
+                self._grow(chain[-1]["id"])
+        finally:
+            self._busy = False
+        self._notify()
+
+    def _grow(self, pid, preselect=None):
+        level = len(self._rows)
+        kids = self.kids(pid)
+        frame = ttk.Frame(self)
+        frame.pack(fill="x", pady=2)
+        name = self.LEVELS[level] if level < len(self.LEVELS) else f"{level + 1}级"
+        ttk.Label(frame, text=f"选{name}", width=7, style="Dim.TLabel").pack(side="left")
+        var = tk.StringVar()
+        cb = ttk.Combobox(frame, textvariable=var, width=20, state="readonly",
+                          values=[n["name"] for n in kids])
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda _e, lv=level: self._on_pick(lv))
+        ttk.Button(frame, text="＋ 新建…", width=9,
+                   command=lambda lv=level: self.new_here(lv)).pack(side="left", padx=(6, 0))
+        self._rows.append((frame, cb, var, pid))
+        self._sel[level] = None
+        if preselect is not None:
+            for i, n in enumerate(kids):
+                if n["id"] == preselect:
+                    cb.current(i)
+                    self._sel[level] = n
+                    break
+        return level
+
+    def _on_pick(self, level):
+        if self._busy:
+            return
+        _f, cb, _v, pid = self._rows[level]
+        kids = self.kids(pid)
+        idx = cb.current()
+        if idx < 0 or idx >= len(kids):
+            return
+        node = kids[idx]
+        self._sel[level] = node
+        # 改了上一级,底下几级原来的选择就没意义了,一律清掉重铺
+        for lv in [k for k in self._sel if k > level]:
+            del self._sel[lv]
+        while len(self._rows) > level + 1:
+            f, _c, _v2, _p = self._rows.pop()
+            f.destroy()
+        if node.get("children"):
+            self._grow(node["id"])
+        self._notify()
+
+    # ---------------------------------------------------------------- 取值
+    def current_node(self):
+        """选到的最深那个节点。「确定」确定的就是它。"""
+        for lv in sorted(self._sel, reverse=True):
+            if self._sel.get(lv) is not None:
+                return self._sel[lv]
+        return None
+
+    def _notify(self):
+        if self.on_change:
+            self.on_change(self.current_node())
+
+    def new_here(self, level):
+        """在这一级新建一个节点,挂在上一级选中的那个节点下面。
+
+        比如选了大类「电容」、二级「陶瓷贴片电容」,然后在三级那一行点新建,
+        新节点就挂在「陶瓷贴片电容」下面 —— 用户点的位置就是他想要的位置。
+        """
+        if level >= len(self._rows):
+            return
+        pid = self._rows[level][3]
+        parent = self._by_id.get(pid) if pid else None
+        if level > 0 and parent is None:
+            messagebox.showinfo("提示", "先把上一级选好,才知道新品类挂在哪儿。",
+                                parent=self)
+            return
+        where = f"「{parent['path']}」下面" if parent else "顶层"
+        name = ask_text(self, "新建品类", f"在{where}新建一个,叫什么?", "")
+        if not name:
+            return
+        res = call(self.con, server.create_category, parent=self, body={
+            "name": name, "parent_id": parent["id"] if parent else None})
+        if res is None:
+            return
+        new_id = int((res or {}).get("id") or 0)
+        # 不整棵重铺 —— 重铺会把人已经选好的上级路径丢掉;只把新节点接进
+        # 这一级的候选里并选中它,接着往下挑
+        self.fetch()
+        _f, cb, _v, _pid = self._rows[level]
+        kids = self.kids(pid)
+        cb.configure(values=[n["name"] for n in kids])
+        for i, n in enumerate(kids):
+            if n["id"] == new_id:
+                cb.current(i)
+                break
+        # 显式再调一次:_on_pick 是幂等的(先清下面几级再铺一级),
+        # 所以不管 current() 自己有没有触发过,结果都一样
+        self._on_pick(level)
+
+
 class CategoryDialog(tk.Toplevel):
-    """挑一个品类。双击 BOM 行单独改的时候用。"""
+    """改某一行的品类:既能一级一级挑,也能直接打字。
+
+    双击 BOM 行的品类、导入 BOM 前复核品类,走的都是这里。
+
+    为什么两级都要留着:「一级一级挑」解决的是「选项太长看不清选的是啥」,
+    而「直接打字」解决的是「推断不出来的品类得能写进去」(光耦、传感器模块)。
+    只留前者会让用户只能挑一个最接近的凑合 —— 那等于把「猜错了」换成
+    「被迫选了个不准确的」。
+    """
 
     def __init__(self, parent, app: App, current="", options=None):
         super().__init__(parent)
@@ -1352,19 +1691,57 @@ class CategoryDialog(tk.Toplevel):
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="这一行算哪一类?").grid(row=0, column=0, sticky="w")
         self.var = tk.StringVar(value=cur or opts[0])
-        # 故意**不**设成 readonly:下拉只是建议。推断不出来的品类(光耦、
-        # 传感器模块……)必须能自己打进去,否则用户只能挑一个最接近的凑合 ——
-        # 那等于把「猜错了」换成「被迫选了个不准确的」
+        # 故意**不**设成 readonly:推断不出来的品类必须能自己打进去。
+        # 这个控件要**先建**:自检里「小窗口也能打字」数的是第一个 Combobox。
         cb = ttk.Combobox(body, textvariable=self.var, values=opts, width=24)
-        cb.grid(row=1, column=0, sticky="w", pady=(6, 14))
+        cb.grid(row=1, column=0, sticky="w", pady=(6, 6))
+        ttk.Label(body, text="或者一级一级往下选(选完大类才出二级):",
+                  style="Dim.TLabel").grid(row=2, column=0, sticky="w")
+        # hint 必须建在 step 前面:CategoryStepBox 一构造就会回调一次 _on_step
+        # (把初始的归属报出来),那时候写 hint 就会 AttributeError。
+        self.hint = tk.StringVar()
+        ttk.Label(body, textvariable=self.hint, style="Dim.TLabel",
+                  wraplength=330, justify="left").grid(row=4, column=0, sticky="w",
+                                                       pady=(6, 0))
+        self.step = CategoryStepBox(body, app.con, on_change=self._on_step)
+        self.step.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        # 这个品类树上有对应节点的话,按它的归属预铺好
+        cid0 = None
+        for n in self.step._by_id.values():
+            if n["path"] == cur:
+                cid0 = n["id"]
+                break
+        if cid0 is None:
+            leaf = cur.split(" / ")[-1]
+            for n in self.step._by_id.values():
+                if leaf and n["name"] == leaf:
+                    cid0 = n["id"]
+                    break
+        if cid0:
+            self.step.seed(cid0)
         btns = ttk.Frame(body)
-        btns.grid(row=2, column=0, sticky="e")
+        btns.grid(row=5, column=0, sticky="e", pady=(10, 0))
         ttk.Button(btns, text="取消", command=self.destroy, width=10).pack(side="right")
         ttk.Button(btns, text="确定", command=self.ok, width=10).pack(side="right", padx=6)
         self.bind("<Return>", lambda _e: self.ok())
         self.bind("<Escape>", lambda _e: self.destroy())
         self.grab_set()
         cb.focus_set()
+
+    def _on_step(self, node):
+        """在树上选到某个节点:把「这一行算哪一类」填成它那一支的大类名。
+
+        BOM 行上的品类记的是**大类**(component.category 存的也是大类名,
+        按品类分组 / 筛选的 SQL 全靠这一列),所以在树上选到多深,这一栏填的
+        都是最顶层那一个;同时把全路径写出来,让人知道自己刚才选的是哪一支。
+        """
+        if node is None:
+            self.hint.set("")
+            return
+        root = node["path"].split(" / ")[0]
+        self.var.set(root)
+        self.hint.set(f"选中的是:{node['path']}\n"
+                      f"(BOM 行的品类记大类,所以这一栏填「{root}」)")
 
     def ok(self):
         self.value = self.var.get().strip() or "其他"
@@ -1375,6 +1752,64 @@ def ask_category(parent, app: App, current="", options=None):
     d = CategoryDialog(parent, app, current, options)
     parent.winfo_toplevel().wait_window(d)
     return d.value
+
+
+class CategoryPickerDialog(tk.Toplevel):
+    """选品类:一级一级往下选,「确定」确定的是当前最深那个节点。
+
+    库存明细面板和元件编辑窗口用它。结果放在 result 里:
+      * (节点 id, 全路径)  —— 选了树上某个节点
+      * (None, "")         —— 点了「清成品类」(只有 allow_clear 时才有这个按钮)
+    """
+
+    def __init__(self, parent, app: App, cat_id=None, allow_clear=False):
+        super().__init__(parent)
+        self.app = app
+        self.con = app.con
+        self.result = None
+        self.title("选品类")
+        self.transient(parent)
+        self.resizable(False, False)
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="一级一级往下选。这一级选完,下一级才会出来。",
+                  style="Dim.TLabel").pack(anchor="w", pady=(0, 8))
+        self.path_var = tk.StringVar()
+        self.step = CategoryStepBox(body, self.con, on_change=self._on_step)
+        self.step.pack(anchor="w")
+        ttk.Label(body, textvariable=self.path_var, foreground="#1f6feb",
+                  wraplength=340, justify="left").pack(anchor="w", pady=(10, 0))
+        bar = ttk.Frame(body)
+        bar.pack(fill="x", pady=(12, 0))
+        ttk.Button(bar, text="确定", width=10, command=self.ok).pack(side="right")
+        ttk.Button(bar, text="取消", width=10,
+                   command=self.destroy).pack(side="right", padx=6)
+        if allow_clear:
+            ttk.Button(bar, text="清成品类",
+                       command=self.clear_choice).pack(side="left")
+        self.bind("<Return>", lambda _e: self.ok())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.grab_set()
+        if cat_id:
+            self.step.seed(cat_id)
+        self.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        self.geometry(f"+{px + 40}+{py + 40}")
+
+    def _on_step(self, node):
+        self.path_var.set(f"选中:{node['path']}" if node else "还没选 —— 至少选一个大类。")
+
+    def ok(self):
+        node = self.step.current_node()
+        if node is None:
+            messagebox.showinfo("提示", "先选一个大类。", parent=self)
+            return
+        self.result = (node["id"], node["path"])
+        self.destroy()
+
+    def clear_choice(self):
+        self.result = (None, "")
+        self.destroy()
 
 
 class BomReviewDialog(tk.Toplevel):
@@ -2071,11 +2506,14 @@ class BomPaneBase(ttk.Frame):
 
 
 class CategoryManagerDialog(tk.Toplevel):
-    """品类管理:加、改名、挪上级、删。
+    """整棵品类树:加、改名、挪上级、删。
 
-    删的时候**绝不删元件** —— 先把它们挪到上一级,再删节点。用户要的是
-    「整理货架」,不是「连货一起扔」,所以确认框里会写清楚:
-    底下有几个元件、会挪到哪儿去。
+    这里用来看**全貌**,日常的「加一个 / 改个名 / 删掉」在库存菜单里就地就能做
+    (卡片右键),不必开这个窗口。
+
+    删的时候**绝不删元件,也不连坐子类** —— 子类接到上一级、元件挪到上一级,
+    只有被点的那个节点消失。用户要的是「整理货架」,不是「连货一起扔」,
+    所以确认框里会把这两件事都写清楚。
     """
 
     COLS = [("name", "品类", 170, "w", True),
@@ -2186,10 +2624,12 @@ class CategoryManagerDialog(tk.Toplevel):
         msg = f"删掉「{node['path']}」?"
         kids = node.get("children") or []
         if kids:
-            msg += f"\n\n它下面还有 {len(kids)} 个子品类,会一起删掉。"
+            msg += (f"\n\n它下面的 {len(kids)} 个子品类会接到{dest},"
+                    f"**一个都不会删**。")
         if n:
-            # 这句必须写出来:用户点「删除」时最怕的就是把料一起删了
-            msg += (f"\n\n挂在它(含子类)下面的 {n} 个元件会挪到{dest},"
+            # 这两句必须写出来:用户点「删除」时最怕的就是
+            # 「连子类和料一起没了」,而这里一件都不删
+            msg += (f"\n\n挂在它(含子类)下面的 {n} 个元件会被挪到{dest},"
                     f"**不会被删除**。")
         if not messagebox.askyesno("确认删除", msg, parent=self):
             return
@@ -2197,7 +2637,8 @@ class CategoryManagerDialog(tk.Toplevel):
         if res is not None:
             self.hint.set(
                 f"删掉了。{res.get('moved_components') or 0} 个元件挪到了"
-                f"「{res.get('to')}」,一个都没丢。")
+                f"「{res.get('to')}」,{res.get('moved_children') or 0} 个子品类"
+                f"接到了上一级,一个都没丢。")
             self.reload()
 
 
@@ -2510,6 +2951,9 @@ class BomPickPane(BomPaneBase):
         t.column("#0", width=150, anchor="w", stretch=True)
         t.tag_configure("line", background="#eef4fb")
         t.tag_configure("covered", foreground="#1e7a34")
+        # 封装和这条需求一模一样的候选:能直接装上去,发错货的重灾区就在
+        # 「值一样、封装不一样」那两颗之间,所以单独给个颜色
+        t.tag_configure("fp", foreground="#0b6bcb")
         t.tag_configure("own", foreground="#1e7a34")
         t.tag_configure("empty", foreground="#999")
         return f, t
@@ -2621,6 +3065,8 @@ class BomPickPane(BomPaneBase):
                 self._idx[key] = c
                 on = key in self.alloc
                 tags = ("own",) if c.get("own") else ()
+                if c.get("fp_match"):
+                    tags += ("fp",)
                 self.tree.insert(str(bid), "end", iid=self.child_iid(bid, c["id"]),
                                  text="", values=(
                                      CHECK_ON if on else CHECK_OFF,
@@ -3158,8 +3604,10 @@ class LineDetail(ttk.Frame):
         self.line = None
         self.comp = None
         self._cats = []
-        self._cat_by_id = {}     # 品类 id -> 下拉里显示的那一行(全路径)
-        self._cat_map = {}       # 下拉里显示的那一行 -> 品类 id
+        self._cat_by_id = {}     # 品类 id -> 显示用的那一行(全路径)
+        self._cat_map = {}       # 显示用的那一行 -> 品类 id
+        self._picked_id = None   # 逐级选择器选中了树上哪个节点
+        self._picked_label = ""  # 上面那个节点显示成什么(用来判断用户改没改)
 
         req = ttk.LabelFrame(self, text="这条需求", padding=5)
         req.pack(fill="x")
@@ -3195,16 +3643,16 @@ class LineDetail(ttk.Frame):
             ttk.Label(box, textvariable=var, wraplength=132, justify="left").grid(
                 row=i, column=1, sticky="w", pady=1)
 
-        # 品类:能下拉挑,也能直接打字
+        # 品类:一级一级选出来的,不再是一个写着全路径的长下拉 ——
+        # 路径一长,框里只看得见结尾,根本不知道选的是哪一支。
+        # 认不出来的品类也不必担心:选择器里每一级都能「＋ 新建…」。
         r = len(rows)
         ttk.Label(box, text="品类", style="Dim.TLabel").grid(
             row=r, column=0, sticky="e", padx=(0, 4), pady=(4, 1))
         self.cat = tk.StringVar()
-        self.cb_cat = ttk.Combobox(box, textvariable=self.cat, width=13)
+        self.cb_cat = ttk.Entry(box, textvariable=self.cat, width=17, state="readonly")
         self.cb_cat.grid(row=r, column=1, sticky="w", pady=(4, 1))
-        self.cb_cat.bind("<<ComboboxSelected>>", lambda _e: self.save_category())
-        self.cb_cat.bind("<Return>", lambda _e: self.save_category())
-        ttk.Button(box, text="保存品类", command=self.save_category).grid(
+        ttk.Button(box, text="换…", width=6, command=self.pick_category).grid(
             row=r + 1, column=1, sticky="w", pady=(3, 0))
         box.columnconfigure(1, weight=1)
 
@@ -3246,8 +3694,8 @@ class LineDetail(ttk.Frame):
         for var in self.v2.values():
             var.set("—")
         self.cat.set("")
-        self.cb_cat.configure(values=[])
-        self.cb_cat.state(["!disabled"])
+        self._picked_id = None
+        self._picked_label = ""
         self.tip.set("先在左边点一行物料,这里就显示它的属性。")
 
     def show(self, line):
@@ -3278,14 +3726,34 @@ class LineDetail(ttk.Frame):
         self.v2["on_hand_total"].set(f"{total} {unit}" if total else f"0 {unit}")
         self.v2["locs"].set("  ".join(f"{s.get('code')}:{s.get('qty')}" for s in stock)
                             or "库里一颗都没有")
-        self.cb_cat.configure(values=self.category_options())
+        # 候选现查(品类随时会加,缓存住的话刚加的子类要重启才出现)
+        self.category_options()
         # 挂在子类下的元件要显示全路径,不能只显示大类名 ——
         # 否则这块面板看着像「它就在大类下」,和库存菜单里看到的不是一回事
-        self.cat.set(self._cat_by_id.get(self.comp.get("category_id"))
-                     or str(self.comp.get("category") or ""))
-        self.tip.set("品类可以直接改,改完按回车或点「保存品类」。")
+        cur_id = self.comp.get("category_id")
+        self._picked_id = cur_id if cur_id in self._cat_by_id else None
+        self._picked_label = self._cat_by_id.get(cur_id, "") if self._picked_id else ""
+        self.cat.set(self._picked_label or str(self.comp.get("category") or ""))
+        self.tip.set("品类点「换…」一级一级改。")
 
     # ------------------------------------------------------------ 存
+
+    def pick_category(self):
+        """逐级选品类。选完立刻生效,不用再点一次保存。"""
+        if not self.comp:
+            messagebox.showinfo("提示", "先在左边点一行物料。", parent=self)
+            return
+        dlg = CategoryPickerDialog(self, self.app, self.comp.get("category_id"))
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        cid, path = dlg.result
+        if cid is None:
+            return
+        self._picked_id = cid
+        self._picked_label = path
+        self.cat.set(path)
+        self.save_category()
 
     def save_category(self):
         if not self.comp:
@@ -3303,18 +3771,23 @@ class LineDetail(ttk.Frame):
             self.app.set_status("品类没变,不用保存")
             return
         body = {"category": want}
-        cat_id = self._cat_map.get(want)
+        cat_id = self._picked_id if (want and want == self._picked_label) else None
+        if cat_id is None:
+            cat_id = self._cat_map.get(want)
         if cat_id:
             # 选的是子类就挂到子类上,不是挂到同名的大类上
             body["category_id"] = cat_id
+            # category 这一列永远写「顶层大类名」,和 category_id 指向的一支一致 ——
+            # 两列不许互相矛盾,按品类分组的 SQL 全靠文本那一列
+            body["category"] = want.split(" / ")[0] if " / " in want else want
         res = call(self.con, server.update_component,
                    match=(str(self.comp["id"]),), body=body, parent=self)
         if res is None:
             return
         old = self.comp.get("category") or "未分类"
-        self.comp["category"] = want
+        self.comp["category"] = body["category"]
         if self.line is not None:
-            self.line["category"] = want
+            self.line["category"] = body["category"]
         self.app.set_status(
             f"「{self.comp.get('name') or ''}」的品类:{old} → {want}", 6)
         # 品类会出现在 BOM 明细、入库清单、出库分配树上,三处都得跟着走
@@ -5707,17 +6180,15 @@ class ComponentDialog(tk.Toplevel):
         # 品类下拉的候选:顶层名(含内置建议) + 树上每个节点的全路径。
         # 只给顶层名的话,用户自己加过的子类在这儿是看不见的 —— 加了个寂寞。
         self._cat_by_id = {}
-        labels = []
         for n in meta.get("category_paths") or []:
-            label = n["path"] if n.get("parent_id") else n["name"]
-            self._cat_by_id[n["id"]] = label
-            if label not in labels:
-                labels.append(label)
-        self._cat_values = list(meta.get("categories") or [])
-        for label in labels:
-            if label not in self._cat_values:
-                self._cat_values.append(label)
+            # 顶层显示光名字(不然一屏全是「电阻 / ...」),子类显示全路径 ——
+            # 同名子类挂在不同大类下时,只有路径分得清
+            self._cat_by_id[n["id"]] = (n["path"] if n.get("parent_id") else n["name"])
         self._cat_map = {v: k for k, v in self._cat_by_id.items()}
+        # 逐级选择器选中的是树上哪个节点。保存时优先用它 ——
+        # 光靠文本认不出「同名子类」,会把料挂到错的那一支上
+        self._picked_cat_id = None
+        self._picked_cat_label = ""
         locs = meta.get("locations") or []
         for loc in locs:
             self._loc_map[loc["path"]] = loc["id"]
@@ -5748,8 +6219,15 @@ class ComponentDialog(tk.Toplevel):
                 if cid_cur and cid_cur in self._cat_by_id:
                     cur_cat = self._cat_by_id[cid_cur]
                 var = tk.StringVar(value=cur_cat)
-                w = ttk.Combobox(body, textvariable=var, width=32,
-                                 values=self._cat_values)
+                self._picked_cat_id = cid_cur if cid_cur in self._cat_by_id else None
+                self._picked_cat_label = cur_cat if self._picked_cat_id else ""
+                # 只读展示 + 「换…」:一级一级选,不再给一条装着全路径的长下拉
+                w = ttk.Frame(body)
+                self.cb_cat = ttk.Entry(w, textvariable=var, width=26,
+                                        state="readonly")
+                self.cb_cat.pack(side="left")
+                ttk.Button(w, text="换…", width=5,
+                           command=self.pick_category).pack(side="left", padx=(4, 0))
             elif kind == "supplier":
                 var = tk.StringVar(value=str(existing.get(key) or ""))
                 w = ttk.Combobox(body, textvariable=var, width=32, values=sup)
@@ -5759,7 +6237,7 @@ class ComponentDialog(tk.Toplevel):
                 w = ttk.Entry(body, textvariable=var, width=34)
             self.vars[key] = var
             w.grid(row=i, column=1, sticky="w", pady=3)
-            if kind == "category":
+            if kind == "category" and self.cb_cat is None:
                 self.cb_cat = w
 
 
@@ -5787,9 +6265,9 @@ class ComponentDialog(tk.Toplevel):
             self.attr_add(_k, _v)
         if not self.attr_rows:
             self.attr_add()            # 新元件也先给一行,免得人要找「怎么加」
-        if self.cb_cat is not None:
-            # 品类一改,属性名的候选跟着换(电感的「饱和电流」不该出现在电阻下面)
-            self.cb_cat.bind("<<ComboboxSelected>>", lambda _e: self.attr_refresh(), add="+")
+        # 品类一改,属性名的候选跟着换(电感的「饱和电流」不该出现在电阻下面)。
+        # 现在品类是「只读框 + 换…」选出来的,所以刷新挂在 pick_category 里 ——
+        # 别再往 cb_cat 上绑 <<ComboboxSelected>>:Entry 不会发这个事件。
         ttk.Label(body, text="比如 耐压=50V、精度=±5%。名称能自己填,候选按品类给。",
                   style="Dim.TLabel").grid(row=r + 1, column=1, sticky="w")
 
@@ -5878,6 +6356,21 @@ class ComponentDialog(tk.Toplevel):
             out[key] = var_v.get().strip()
         return out
 
+    def pick_category(self):
+        """逐级选品类。选完把显示改成全路径,具体挂哪个节点在 save 里定。"""
+        dlg = CategoryPickerDialog(self, self.app, self._picked_cat_id)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        cid, path = dlg.result
+        if cid is None:
+            return
+        self._picked_cat_id = cid
+        self._picked_cat_label = path
+        self.vars["category"].set(path)
+        # 品类变了,属性名的候选跟着换(耐压/精度这些是按品类推的)
+        self.attr_refresh()
+
     def save(self):
         body = {k: v.get().strip() for k, v in self.vars.items()}
 
@@ -5905,9 +6398,15 @@ class ComponentDialog(tk.Toplevel):
         # 下拉里选的是树上哪个节点就挂到哪个节点。手打的词(_cat_map 里没有)
         # 仍旧只发名字,由后端按名字找/建顶层节点 —— 这条路必须留着:
         # 认不出来的品类(光耦、传感器模块)得能直接填。
-        cat_id = self._cat_map.get((body.get("category") or "").strip())
+        cat_text = (body.get("category") or "").strip()
+        cat_id = self._picked_cat_id if (cat_text and cat_text == self._picked_cat_label) \
+            else None
+        if cat_id is None:
+            cat_id = self._cat_map.get(cat_text)
         if cat_id:
             body["category_id"] = cat_id
+            # category 写顶层大类名,和 category_id 指向的一支保持一致
+            body["category"] = cat_text.split(" / ")[0] if " / " in cat_text else cat_text
 
         if self.cid:
             res = call(self.con, server.update_component, body=body, match=(self.cid,), parent=self)

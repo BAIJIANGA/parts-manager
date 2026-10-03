@@ -2000,9 +2000,9 @@ def main() -> int:
         check("写着封装", d30.v2["package"].get(), "0603")
         check("写着这一条需求的单块用量", d30.v["per_board"].get(), "6")
 
-        # 品类:可编辑下拉
-        check("品类那个下拉能直接打字(认不出的品类必须能自己填)",
-              "readonly" not in d30.cb_cat.state(), True)
+        # 品类:只读展示 + 「换…」,一级一级选(不再是一个装着全路径的长下拉)
+        check("品类那一栏是只读的,靠「换…」按钮去逐级选",
+              "readonly" in d30.cb_cat.state(), True)
         check("下拉里带着库里已经在用的品类", "电容" in d30.category_options(), True)
         check("也带着内置清单(库里还没有的那些)", len(d30.category_options()) > 3, True)
         check("当前显示的就是这颗料的品类", d30.cat.get(), "电容")
@@ -2427,12 +2427,41 @@ def main() -> int:
 
         d35 = gui.ComponentDialog(app, app, c35["id"])
         d35.update()
-        check("编辑窗口的品类下拉里能看到子类的全路径",
-              "菜单测试类 / 下拉子类" in list(d35.cb_cat.cget("values")), True)
+        check("编辑窗口记住了它挂在树上哪个节点(逐级选择器靠它预铺)",
+              d35._picked_cat_id, sub35)
         check("打开时显示的就是全路径,不是大类名",
               d35.vars["category"].get(), "菜单测试类 / 下拉子类")
-        check("顶层仍旧只显示光名字(不然一屏全是「电阻 / ...」)",
-              "电阻" in list(d35.cb_cat.cget("values")), True)
+
+        # 逐级选:一级一个框,框里**只有这一级的名字**
+        pk35 = gui.CategoryPickerDialog(d35, app, sub35)
+        pk35.update()
+        check("逐级选择窗口按现有归属铺好了两级(大类 + 二级)",
+              len(pk35.step._rows), 2)
+        check("第一级里只有顶层名字,没有「大类 / 子类」这种长路径",
+              [v for v in pk35.step._rows[0][1].cget("values") if " / " in v], [])
+        check("第二级里只有这一级的名字",
+              "下拉子类" in list(pk35.step._rows[1][1].cget("values")), True)
+        check("当前选中的就是它挂着的那一支",
+              pk35.step.current_node()["id"], sub35)
+        pk35.ok()
+        check("确定交回节点 id 和全路径",
+              pk35.result, (sub35, "菜单测试类 / 下拉子类"))
+        check("确定之后窗口自己关掉", bool(pk35.winfo_exists()), False)
+
+        # 用户要的核心:选完大类才出二级,没有二级就不弹
+        pk35b = gui.CategoryPickerDialog(d35, app)
+        pk35b.update()
+        check("还没选的时候只有一级框", len(pk35b.step._rows), 1)
+        _cb0 = pk35b.step._rows[0][1]
+        _v0 = list(_cb0.cget("values"))
+        check("第一级列的就是顶层大类", "菜单测试类" in _v0, True)
+        _cb0.current(_v0.index("菜单测试类"))
+        pk35b.step._on_pick(0)
+        pk35b.update()
+        check("选完大类才出二级", len(pk35b.step._rows), 2)
+        check("二级里是它下面的子类",
+              "下拉子类" in list(pk35b.step._rows[1][1].cget("values")), True)
+        pk35b.destroy()
 
         # 关键回归:什么都不动直接保存,子类归属不能被冲回大类
         d35.save()
@@ -2477,6 +2506,115 @@ def main() -> int:
                det35.cat.get())[1], "菜单测试类 / 下拉子类")
         det35.clear()
         app.update()
+
+
+        p("\n【36】库存菜单里就地改这一级 + 封装按钮按尺寸归并")
+
+        tab36 = app.tab_comp
+        app.nb.select(tab36)
+        app.update()
+        a36 = API(server.create_category, body={"name": "就地大类"})["id"]
+        b36 = API(server.create_category, body={"name": "中间层", "parent_id": a36})["id"]
+        c36 = API(server.create_category, body={"name": "叶子层", "parent_id": b36})["id"]
+        m36 = API(server.create_component, body={
+            "name": "就地测试料", "category_id": c36, "value": "4k7",
+            "package": "0603"})["id"]
+
+        # ---- 加子类:就在这一级上加,不打开品类管理窗口
+        _ask36 = gui.ask_text
+        gui.ask_text = lambda *a, **k: "钽电容"
+        try:
+            tab36._load_cat_tree()
+            tab36.add_child_cat(tab36._cat_flat[b36])
+            app.update()
+        finally:
+            gui.ask_text = _ask36
+        _flat36 = API(server.list_categories)["flat"]
+        check("就地加子类生效了", "钽电容" in [n["name"] for n in _flat36], True)
+        check("新加的挂在原来那一级下面(不是又建了个顶层)",
+              [n["parent_id"] for n in _flat36 if n["name"] == "钽电容"], [b36])
+
+        # ---- 改名:只改这一级,元件的归属不动
+        gui.ask_text = lambda *a, **k: "钽电容-改名"
+        try:
+            tab36._load_cat_tree()
+            tab36.rename_cat(tab36._cat_flat[b36])
+            app.update()
+        finally:
+            gui.ask_text = _ask36
+        check("就地改名生效了",
+              "钽电容-改名" in [n["name"] for n in API(server.list_categories)["flat"]],
+              True)
+        check("改名不动元件挂在哪儿",
+              API(server.get_component, match=(m36,))["category_id"], c36)
+
+        # ---- 删除:确认框必须写明「子类接到上一级、元件不会被删」
+        _box36 = FakeBox()
+        _mb36 = gui.messagebox
+        gui.messagebox = _box36
+        try:
+            tab36._load_cat_tree()
+            tab36.delete_cat(tab36._cat_flat[b36])
+            app.update()
+        finally:
+            gui.messagebox = _mb36
+        _msgs36 = " ".join(m for _t, m in _box36.asks)
+        check("删除前会问一句", len(_box36.asks) >= 1, True)
+        check("确认框里写明子类会接到上一级", "接到" in _msgs36, True)
+        check("确认框里写明元件不会被删", "不会被删除" in _msgs36, True)
+        check("删完叶子接到了大类上",
+              [n["parent_id"] for n in API(server.list_categories)["flat"]
+               if n["id"] == c36], [a36])
+        check("料一动没动,还挂在原来那个叶子节点上(叶子只是接到了大类下面)",
+              API(server.get_component, match=(m36,))["category_id"], c36)
+        check("但它的大类文本换成了新的顶层名(否则写着已经不存在的大类)",
+              API(server.get_component, match=(m36,))["category"], "就地大类")
+
+        # ---- 卡片右键:就地增删改的入口
+        _card36 = next(iter(tab36.board.cards.values()), None)
+        check("首页卡片绑了右键菜单(就地改这一级)",
+              bool(_card36 is not None and _card36.bind("<Button-3>")), True)
+        check("中间页的卡片也绑了右键", tab36.pick_board.on_menu is not None, True)
+
+        # ---- 逐级选择器里当场新建(挑到一半发现没有这一档)
+        step36 = gui.CategoryStepBox(tab36, app.con)
+        app.update()
+        _cb36 = step36._rows[0][1]
+        _v36 = list(_cb36.cget("values"))
+        _cb36.current(_v36.index("就地大类"))
+        step36._on_pick(0)
+        app.update()
+        check("选完大类才出二级", len(step36._rows), 2)
+        gui.ask_text = lambda *a, **k: "当场新建的子类"
+        try:
+            step36.new_here(1)
+            app.update()
+        finally:
+            gui.ask_text = _ask36
+        _flat36b = API(server.list_categories)["flat"]
+        check("在二级那一行能当场新建",
+              "当场新建的子类" in [n["name"] for n in _flat36b], True)
+        check("新节点挂在刚选中的大类下面",
+              [n["parent_id"] for n in _flat36b if n["name"] == "当场新建的子类"],
+              [a36])
+        check("新建完自动选中它,接着就能往下选",
+              step36.current_node()["name"], "当场新建的子类")
+        step36.destroy()
+
+        # ---- 封装按钮按尺寸归并:C0805 和 0805 只出一个按钮
+        check("同尺寸的不同写法合成一个按钮",
+              [g[1] for g in gui.pkg_groups(["C0805", "0805", "R0603"])],
+              ["0805", "0603"])
+        check("按钮上写的是尺寸本身,不是一长串",
+              [g[0] for g in gui.pkg_groups(["C0805", "0805"])], ["0805"])
+        check("认不出尺寸的不会被吃掉,按钮上原样写着用户那个词",
+              [(g[0], g[1]) for g in gui.pkg_groups(["DIP-8"])],
+              [("DIP-8", "DIP8")])
+        tab36._render_pkg_chips(["C0805", "0805", "0603"])
+        app.update()
+        check("封装按钮只出 0805 和 0603 两个",
+              sorted(k for k in tab36.pkg_chips if k), ["0603", "0805"])
+        check("「全部」那个按钮还在", "" in tab36.pkg_chips, True)
 
         app.refresh_all()
         app.update()
