@@ -926,6 +926,26 @@ class ComponentsTab(ttk.Frame):
         ttk.Label(bar, text="  (值可以写 1k / 10kΩ / 0.1uF)", style="Dim.TLabel").pack(
             side="left")
 
+        # issue #40:按「库存够不够」筛。范围**永远是当前所在层级的整棵子树** ——
+        # 不用自己算:列表页把 category_id 交给后端,它自己会展开整棵子树,
+        # 所以在「陶瓷电容」按就出陶瓷电容以下全部,在「陶瓷电容/0603」按就只出 0603 的。
+        # 另起一排而不是塞进上面那条:那条已经挤满了(值/单位/封装/清除/两段提示),
+        # 再塞会把它们挤成 1px,排版自检也会报。
+        self.stock_filter = ""       # "" / "out"(库存=0)/ "low"(低于安全库存)
+        sbar = ttk.Frame(self.page_cat)
+        sbar.pack(fill="x", pady=(0, 6))
+        ttk.Label(sbar, text="库存筛选").pack(side="left")
+        ttk.Button(sbar, text="库存=0", width=8,
+                   command=lambda: self.set_stock_filter("out")).pack(
+            side="left", padx=(6, 2))
+        ttk.Button(sbar, text="低于安全库存", width=13,
+                   command=lambda: self.set_stock_filter("low")).pack(side="left", padx=2)
+        ttk.Label(sbar, text="(没设安全库存的不算)", style="Dim.TLabel").pack(
+            side="left", padx=(6, 0))
+        self.f_stock = tk.StringVar()
+        ttk.Label(sbar, textvariable=self.f_stock, foreground="#b9770e").pack(
+            side="left", padx=8)
+
         pane = ttk.Panedwindow(self.page_cat, orient="vertical")
         pane.pack(fill="both", expand=True)
 
@@ -1574,6 +1594,27 @@ class ComponentsTab(ttk.Frame):
             opts.append(cur)
         combo.configure(values=opts)
 
+    def set_stock_filter(self, mode):
+        """按库存档位筛**当前所在层级的整棵子树**(issue #40)。再点同一个按钮 = 取消。
+
+        范围不用自己算:列表页把 `category_id` 交给后端,后端自己会展开整棵子树。
+        点「库存=0」时顺手把「显示零库存」打开 —— 外层条件是 AND,`stocked=1` 与
+        `state=out` 互斥,不打开那个开关就**永远是空表**(口径见 build\\test_api.py【43】)。
+        """
+        mode = "" if self.stock_filter == mode else mode
+        self.stock_filter = mode
+        if mode == "out" and not self.zero_stock.get():
+            self.zero_stock.set(True)
+            self.f_stock.set("已顺手打开「显示零库存」—— 否则这张表永远是空的")
+        else:
+            self.f_stock.set({"": "", "out": "只看库存=0 的",
+                              "low": "只看低于安全库存的"}.get(mode, ""))
+        # 列表页(有「当前层级」)走 load_category;首页只有卡片,那边 load_category
+        # 会直接返回(view 不是 cat),所以再刷一次总览,让卡片上的数字也跟着筛。
+        self.load_category()
+        if self.view != "cat":
+            self.reload()
+
     def clear_filters(self, redraw=True):
         self.f_min.set("")
         self.f_max.set("")
@@ -1636,8 +1677,12 @@ class ComponentsTab(ttk.Frame):
             # 刚建出来的品类下面的料会被误算成「没有品类」(卡片和列表对不上)
             self._load_cat_tree()
         query = {"limit": "0", "sort": "value"}
-        if not self.zero_stock.get():
+        # issue #40:`stocked=1` 与 `state=out` 是 AND 关系,同时传必然是空表 ——
+        # 要「库存=0」的时候就不能再传 stocked(那时上面那个开关也已经被自动打开)
+        if not self.zero_stock.get() and self.stock_filter != "out":
             query["stocked"] = "1"
+        if self.stock_filter:
+            query["state"] = self.stock_filter
         if uncat:
             pass
         elif node["id"] is None:
@@ -1769,11 +1814,15 @@ class ComponentsTab(ttk.Frame):
         # 一并清掉 —— 用户报的「出入库流水没显示」其实是这么来的(流水写进去了)。
         keep = self.selected_id()
         # stocked=1:库存为 0 的元件在 SQL 层就被滤掉,二级页面自然只剩有货的
+        # 总览 / 二级页**永远**只看有货的:导入 BOM 会留下一堆库存 0 的料,
+        # 放开就会把真正到货的那些淹掉。要「看得见零库存」去叶子列表页
+        # (那里默认开着,见 load_category)
+        # issue #40:库存筛选生效时改用 state(它本身就是"够不够"的口径);
+        # 那时候不能再叠 stocked —— state=out 与 stocked=1 互斥,叠了就是空表。
+        _q = ({"sort": "category", "state": self.stock_filter}
+              if self.stock_filter else {"stocked": "1", "sort": "category"})
         data = call(self.con, server.list_components,
-                    # 总览 / 二级页**永远**只看有货的:导入 BOM 会留下一堆库存 0 的料,
-                    # 放开就会把真正到货的那些淹掉。要「看得见零库存」去叶子列表页
-                    # (那里默认开着,见 load_category)
-                    query={"stocked": "1", "sort": "category"}, quiet=True)
+                    query=_q, quiet=True)
         if data is None:
             return
         self._all = data["items"]
