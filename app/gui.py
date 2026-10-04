@@ -1039,6 +1039,19 @@ class ComponentsTab(ttk.Frame):
         # (自动滚动之后没有新的 motion 事件,要靠它把提示线重新贴到落点上)
         self._hdr_after = None
         self._hdr_last_x = None
+        # issue #36:Excel 式单元格选中。**只画 4 条边框,中间一律空着** ——
+        # 铺满的覆盖层会吃掉 <Button-1>/<Double-1>/<Button-3>,双击进编辑和右键菜单当场就废。
+        # 下面这几个 bind 也**只画框、绝不返回 "break"**,行上原来那一套照旧走。
+        self._sel_cells = set()          # {(行 iid, "#列号")}
+        self._sel_anchor = None          # 框选的起点,(行 iid, "#列号")
+        self._sel_frames = [tk.Frame(self.tree, background="#1f6feb")
+                            for _i in range(4)]      # 上/下/左/右
+        self.tree.bind("<ButtonPress-1>", self._sel_click, add="+")
+        self.tree.bind("<Shift-ButtonPress-1>", self._sel_click, add="+")
+        self.tree.bind("<Control-ButtonPress-1>", self._sel_click, add="+")
+        self.tree.bind("<B1-Motion>", self._sel_drag, add="+")
+        # 改窗口大小、换列顺序、reload 之后框会跑偏,统一重画一次
+        self.tree.bind("<Configure>", lambda _e: self._sel_paint(), add="+")
         self.tree.bind("<ButtonPress-1>", self._hdr_drag_begin, add="+")
         self.tree.bind("<B1-Motion>", self._hdr_drag_motion, add="+")
         self.tree.bind("<ButtonRelease-1>", self._hdr_drag_end, add="+")
@@ -2223,6 +2236,119 @@ class ComponentsTab(ttk.Frame):
         if len(shown) != len(specs) or len(keys) != len(specs):
             return None
         return specs
+
+    # ---------------- issue #36:Excel 式单元格选中 ----------------
+    # 这一版的边界(写清楚,免得被当成 bug):
+    #   * 能选任意一格;按住 Shift/Ctrl 点,或者按住左键拖,就从起点扩成矩形(跨行跨列)。
+    #   * **只画边框**:中间不铺任何控件 —— 铺了就会吃掉双击/右键,那两样不能退化。
+    #   * 单格**底色**还没做(那是 #36 的另一半:色块必须转发事件,不能直接盖上去)。
+    def _sel_cols(self):
+        """屏幕上现有的列号:#1..#N(identify_column 给的就是这种)。"""
+        return ["#%d" % i for i in range(1, len(self._screen_cols() or []) + 1)]
+
+    def _sel_rows(self):
+        """表格里的行顺序(摊平的),用来算"框选跨了哪几行"。"""
+        out = []
+
+        def _walk(parent=""):
+            for iid in self.tree.get_children(parent):
+                out.append(str(iid))
+                _walk(str(iid))
+
+        _walk()
+        return out
+
+    def _sel_cell_at(self, event):
+        iid = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        if not iid or not col or col == "#0":
+            return None
+        return (str(iid), str(col))
+
+    def _sel_clear(self):
+        self._sel_cells = set()
+        self._sel_anchor = None
+        self._sel_paint()
+
+    def _sel_extend(self, cur):
+        """从锚点扩到当前格,凑成矩形 —— 这就是「多行多列框选」。"""
+        if self._sel_anchor is None:
+            self._sel_anchor, self._sel_cells = cur, {cur}
+            return
+        rows, cols = self._sel_rows(), self._sel_cols()
+        ar, ac = self._sel_anchor
+        cr, cc = cur
+        if ar not in rows or cr not in rows or ac not in cols or cc not in cols:
+            # 表格刚重建过,锚点已经不在这一屏了:当成本次是新起点
+            self._sel_anchor, self._sel_cells = cur, {cur}
+            return
+        i0, i1 = sorted((rows.index(ar), rows.index(cr)))
+        j0, j1 = sorted((cols.index(ac), cols.index(cc)))
+        self._sel_cells = {(rows[i], cols[j])
+                           for i in range(i0, i1 + 1)
+                           for j in range(j0, j1 + 1)}
+
+    def _sel_paint(self):
+        """把 4 条边框摆到选中矩形的四边。中间**不铺任何东西**。
+
+        这是 issue #36 的要害:铺满的覆盖层会把 <Button-1>/<Double-1>/<Button-3> 全吃掉,
+        双击进编辑、右键菜单会当场失效 —— 所以中间那块必须留给 Treeview 自己接。
+        """
+        for f in self._sel_frames:
+            f.place_forget()
+        if not self._sel_cells:
+            return
+        rows, cols = self._sel_rows(), self._sel_cols()
+        picked = [(r, c) for (r, c) in self._sel_cells if r in rows and c in cols]
+        if not picked:
+            return
+        ri = [rows.index(r) for r, _c in picked]
+        ci = [cols.index(c) for _r, c in picked]
+        try:
+            bx = self.tree.bbox(rows[min(ri)], cols[min(ci)])
+            bx2 = self.tree.bbox(rows[max(ri)], cols[max(ci)])
+        except tk.TclError:
+            return
+        # 任何一格滚出可视区(bbox 返回空串)就整体不画 —— 免得画出半截框、或者画错位置
+        if not bx or not bx2:
+            return
+        x0, y0 = bx[0], bx[1]
+        x1, y1 = bx2[0] + bx2[2], bx2[1] + bx2[3]
+        w, h = max(2, x1 - x0), max(2, y1 - y0)
+        top, bottom, left, right = self._sel_frames
+        top.place(x=x0, y=y0, width=w, height=2)
+        bottom.place(x=x0, y=y1 - 2, width=w, height=2)
+        left.place(x=x0, y=y0, width=2, height=h)
+        right.place(x=x1 - 2, y=y0, width=2, height=h)
+        for f in self._sel_frames:
+            f.lift()
+
+    def _sel_click(self, event):
+        """单击选一格;按住 Shift/Ctrl 就是从上一次的位置扩成矩形。
+
+        **不返回 "break"**:行上的选中、双击进编辑、右键菜单都要照旧走。
+        """
+        cur = self._sel_cell_at(event)
+        if cur is None:
+            self._sel_clear()
+            return None
+        if event.state & 0x0005:          # Shift(0x1)/Control(0x4):扩选
+            self._sel_extend(cur)
+        else:
+            self._sel_anchor, self._sel_cells = cur, {cur}
+        self._sel_paint()
+        return None
+
+    def _sel_drag(self, event):
+        """按住左键拖 = 从锚点框选(跨行跨列)。同样不吞事件。"""
+        if self._sel_anchor is None:
+            return None
+        cur = self._sel_cell_at(event)
+        if cur is None:
+            return None
+        self._sel_extend(cur)
+        self._sel_paint()
+        return None
 
     def _hdr_bounds(self):
         """屏幕上每一列的左右边界(像素),给横向拖动算落点用。
