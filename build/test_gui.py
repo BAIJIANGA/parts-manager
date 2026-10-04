@@ -4726,6 +4726,53 @@ def main() -> int:
         app.update()
         p(f"  [OK ] 其间抓到 {len(_seen48)} 次 list_components 查询")
 
+        # ------------- 【49】#35 拖动换列:边缘自动滚动 + 跟手反馈 -------------
+        p("\n【49】#35 拖动换列:边缘自动滚动和鼠标反馈(重点测「什么时候必须停」)")
+        _tab49 = app.tab_comp
+        app.nb.select(_tab49)
+        app.update()
+        _t49 = _tab49.tree
+        check("没在拖的时候没有自动滚动定时器在跑", _tab49._hdr_after, None)
+        # 装成"正在拖",鼠标摆在表格正中间:不该起滚
+        _tab49._hdr_src, _tab49._hdr_last_x = 0, _t49.winfo_width() // 2
+        _tab49._hdr_arm_scroll()
+        check("鼠标在中间时不起自动滚动", _tab49._hdr_after, None)
+        # 顶到右边缘:必须起滚(这是"想换到看不见的那列"的唯一办法)
+        _tab49._hdr_last_x = _t49.winfo_width() - 4
+        _tab49._hdr_arm_scroll()
+        check("顶到右边缘会启动自动滚动", _tab49._hdr_after is not None, True)
+        # 再调一次不能叠出第二个定时器(叠了就会越滚越快)
+        _first49 = _tab49._hdr_after
+        _tab49._hdr_arm_scroll()
+        check("已经在滚的时候不会叠出第二个定时器", _tab49._hdr_after, _first49)
+        # 松手之后定时器必须停、坐标必须清 —— 漏了整张表会一直自己滚
+        _tab49._hdr_drag_end()
+        check("松手后定时器被取消、横坐标也清了",
+              (_tab49._hdr_after, _tab49._hdr_last_x), (None, None))
+        # "已经松手了还在响定时器"这种也要停
+        _tab49._hdr_last_x = _t49.winfo_width() - 4
+        _tab49._hdr_src = None
+        _tab49._hdr_scroll_tick()
+        check("已经松手时定时器自己停掉(不会空转)", _tab49._hdr_after, None)
+
+        # 按在**列标题**上才算我们的:鼠标形状要变,松手要还原
+        _keys49, _spans49 = _tab49._hdr_bounds()
+        check("拿得到列标题的位置(拿不到说明屏幕列和列设置对不上)", len(_spans49) > 0, True)
+        if _spans49:
+            _x0, _x1 = _spans49[0]
+            _ev49 = type("E", (), {"x": (_x0 + _x1) // 2, "y": 6})()
+            check("按在列标题上会接管这次按下",
+                  _tab49._hdr_drag_begin(_ev49), "break")
+            check("接管之后鼠标变成左右箭头(跟手反馈)",
+                  str(_t49.cget("cursor")), "sb_h_double_arrow")
+            # 行上按下那一套一点都不能碰:按在表格中间(不是标题)必须原样放行
+            _ev49b = type("E", (), {"x": 30, "y": 120})()
+            check("按在行上不管(原样放行,选中/双击/右键照旧)",
+                  _tab49._hdr_drag_begin(_ev49b), None)
+            _tab49._hdr_drag_end()
+            check("松手后鼠标形状还原", str(_t49.cget("cursor")), "")
+        p(f"  [OK ] 列标题 {len(_spans49)} 段,按在标题上/行上的分流都验过")
+
         app.update()
         p("  [OK ] 全量刷新")
         app.destroy()
