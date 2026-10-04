@@ -4788,6 +4788,68 @@ def main() -> int:
                   _hits49[3:], [None, None])
         p(f"  [OK ] 列标题 {len(_spans49)} 段,按在标题上/行上的分流都验过")
 
+        # ------------- 【50】#36 Excel 式单元格选中 -------------
+        p("\n【50】#36 单元格选中:点一格 / Shift 扩成矩形 / 拖动框选 / 清空不留野控件")
+        _tab50 = app.tab_comp
+        app.nb.select(_tab50)
+        app.update()
+        _t50 = _tab50.tree
+        _rows50 = _tab50._sel_rows()
+        _specs50 = _tab50._screen_cols() or []
+        check("表格里有行可以选(先造出前提)", len(_rows50) >= 2, True)
+        check("屏幕上至少三列(要跨列框选)", len(_specs50) >= 3, True)
+        if len(_rows50) >= 2 and len(_specs50) >= 3:
+            def _ev50(x, y, state=0):
+                return type("E", (), {"x": x, "y": y, "state": state})()
+
+            def _cell50(i, j):
+                """用 bbox 反推某一格的屏幕坐标中点 —— 不猜像素。"""
+                _b = _t50.bbox(_rows50[i], "#%d" % (j + 1))
+                return (_b[0] + _b[2] // 2, _b[1] + _b[3] // 2) if _b else None
+
+            _p50 = _cell50(0, 0)
+            _p50b = _cell50(1, 2)
+            check("拿得到第 1 格的屏幕坐标(拿不到说明那两行滚出去了)",
+                  _p50 is not None and _p50b is not None, True)
+            if _p50 and _p50b:
+                check("单击**不吞事件**(返回 None,行上选中/双击/右键照旧)",
+                      _tab50._sel_click(_ev50(*_p50)), None)
+                check("点一格 = 只选中这一格", len(_tab50._sel_cells), 1)
+                check("选中的就是点到的那一格",
+                      sorted(_tab50._sel_cells), [(_rows50[0], "#1")])
+                check("框画出来了(4 条边框都摆上了)",
+                      [bool(f.place_info()) for f in _tab50._sel_frames],
+                      [True] * 4)
+                # Shift 扩选:从 (0,0) 到 (1,2) ⇒ 2 行 × 3 列 = 6 格
+                _tab50._sel_click(_ev50(_p50b[0], _p50b[1], state=1))
+                check("Shift 扩选出来的格数 = 2 行 × 3 列",
+                      len(_tab50._sel_cells), 6)
+                check("扩选覆盖的正是那块矩形",
+                      sorted(_tab50._sel_cells),
+                      sorted({(_rows50[i], "#%d" % (j + 1))
+                              for i in (0, 1) for j in (0, 1, 2)}))
+                # 不按 Shift 再点回去 ⇒ 回到单选,而且锚点跟着换
+                _tab50._sel_click(_ev50(*_p50))
+                check("不按 Shift 再点 = 回到单选一格",
+                      len(_tab50._sel_cells), 1)
+                # 拖动走的是同一条扩选路径
+                _tab50._sel_drag(_ev50(_p50b[0], _p50b[1]))
+                check("按住拖也能框出同样的矩形(跨行跨列)",
+                      len(_tab50._sel_cells), 6)
+                # 清空:状态清掉,边框必须全撤走(不能留野控件在表上)
+                _tab50._sel_clear()
+                check("清空之后 4 条边框全撤走(不留野控件)",
+                      [bool(f.place_info()) for f in _tab50._sel_frames],
+                      [False] * 4)
+                check("清空之后选中状态也空了",
+                      (list(_tab50._sel_cells), _tab50._sel_anchor), ([], None))
+                # 还没起过锚点就拖:什么都不做(不能崩)
+                _tab50._sel_anchor = None
+                check("没有锚点时拖动什么都不做(返回 None)",
+                      _tab50._sel_drag(_ev50(_p50b[0], _p50b[1])), None)
+            _tab50._sel_clear()
+        p(f"  [OK ] 选中:行 {len(_rows50)} / 列 {len(_specs50)}")
+
         app.update()
         p("  [OK ] 全量刷新")
         app.destroy()
