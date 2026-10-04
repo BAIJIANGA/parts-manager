@@ -80,6 +80,54 @@ def col_of(pane, key):
     return [c[0] for c in pane.COLS].index(key)
 
 
+def all_rows(tree, parent=""):
+    """把一棵 Treeview 里所有行摊平(组行的子行也算在内)。
+
+    流水按项目折叠之后(#30),`tree.get_children()` 拿到的是**组行**,
+    真正的流水行挂在它们下面而且默认收着。断言里直接数 get_children() 的话,
+    数的就不是流水 —— 而那种断言往往还是「通过」的,只是它验的已经不是
+    原来那件事了,那比直接失败更糟。
+    """
+    out = []
+    for iid in tree.get_children(parent):
+        out.append(iid)
+        out += all_rows(tree, iid)
+    return out
+
+
+def treeviews(root):
+    """收集一棵控件树里所有的 Treeview —— 用来一次性体检「所有类表格」。"""
+    out = []
+
+    def walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, gui.ttk.Treeview):
+                out.append(c)
+            walk(c)
+    walk(root)
+    return out
+
+
+def off_center(tree):
+    """这张表里**没居中**的列(单元格或表头),返回 [(列, 实际值), ...]。
+
+    列宽和 stretch 不在这里查 —— #27 只动对齐,专门另有断言看住列宽没被顺手改掉。
+    """
+    cols = [str(c) for c in tree["columns"]]
+    # #0 树列不列在 columns 里,show 里带 tree 时它才显示
+    if "tree" in str(tree.cget("show")):
+        cols = ["#0"] + cols
+    bad = []
+    for c in cols:
+        cell = str(tree.column(c, "anchor"))
+        if cell != "center":
+            bad.append((c, cell))
+        head = str(tree.heading(c, "anchor"))
+        if head != "center":
+            bad.append((f"{c} 表头", head))
+    return bad
+
+
 def card_labels(card):
     """把一张大类卡片上所有 Label 的文字取出来(卡片是 tk.Frame)。"""
     out = []
@@ -88,6 +136,47 @@ def card_labels(card):
             out.append(w.cget("text"))
         elif isinstance(w, tk.Frame):
             out += [c.cget("text") for c in w.winfo_children() if isinstance(c, tk.Label)]
+    return out
+
+
+def color_str(raw):
+    """把 Tk 取回来的颜色变成 '#rrggbb' 字符串。
+
+    Tk 返回的是个「颜色对象」,repr 形如 <color object: '#fff6dd'>;拿它跟字符串
+    直接比会因为类型不同而**假失败** —— 而这种失败最容易被误读成「功能没生效」,
+    所以统一的在这里抠出 #rrggbb 那一段。
+    """
+    txt = str(raw)
+    if "#" in txt:
+        return "#" + txt.split("#", 1)[1][:6].lower()
+    return txt
+
+
+def effective_bg(tree, iid):
+    """这一行**实际**会用的背景色。
+
+    一行可以挂好几个 tag,同一个选项谁生效要看 tag 顺序 —— 只盯着某一个 tag
+    配了什么,验不到「用户配色压过内置规则色」这件事。这里按 Tk 的口径取
+    第一个配了背景色的 tag 的值;库里那两条规则色只配背景色,所以这就是
+    「实际刷出来的那个底」。
+
+    背景色是空串 = 这个 tag 没设置这一项,跳过。
+    """
+    for tag in tree.item(iid, "tags"):
+        raw = tree.tag_configure(str(tag), "background")
+        if str(raw):
+            return color_str(raw)
+    return ""
+
+
+def menu_labels(menu):
+    """一张菜单里所有命令项的 (文字, 状态),分隔线不算。"""
+    out = []
+    end = menu.index("end")
+    for i in range(0 if end is None else end + 1):
+        if str(menu.type(i)) == "command":
+            out.append((str(menu.entrycget(i, "label")),
+                        str(menu.entrycget(i, "state"))))
     return out
 
 
@@ -375,18 +464,21 @@ def main() -> int:
               hasattr(st, "submit"), False)
         check("这一页也没有元件列表(所以不会再被导入 BOM 的料塞满)",
               hasattr(st, "tree") and "headings" in str(st.tree.cget("show")), True)
-        check("记录表是平表,没有展开三角",
-              "tree" not in str(st.tree.cget("show")), True)
-        # 盘点/移库既不是入库也不是出库,只该出现在「流水」页
+        # #30 之后这张表改成按项目折叠了:多一个 #0 组列和展开三角。
+        # 「带 #0 树列」和「有展开三角」本来就是一回事,所以这里反过来验。
+        check("记录表按项目折叠(#30):有 #0 组列和展开三角",
+              "tree" in str(st.tree.cget("show")), True)
+        # 盘点/移库既不是入库也不是出库,只该出现在「流水」页。
+        # 组行的「动作」格是空的,所以在 all_rows 里也算「不属于盘点/移库」。
         kinds_shown = {str(st.tree.item(i, "values")[1]).replace("(已撤销)", "")
-                       .replace("·撤销", "") for i in st.tree.get_children()}
+                       .replace("·撤销", "") for i in all_rows(st.tree)}
         check("这里不会出现盘点 / 移库",
               kinds_shown <= {"入库", "出库", ""}, True)
 
         base_in = len(gui.call(app.con, server.list_movements,
                                query={"kind": "IN", "limit": "5000"}, quiet=True)["items"])
         check("入库流水显示的就是全部入库流水",
-              len(st.tree.get_children()), base_in)
+              len(st.groups.row_ids()), base_in)
         check("摘要写出了条数和合计", "入库流水" in st.summary.get(), True)
         check("摘要里说明了这一页只查账", "只查账" in st.summary.get(), True)
         check("摘要给出了真正的操作在哪做",
@@ -403,14 +495,14 @@ def main() -> int:
                                query={"kind": "IN", "project": "none",
                                       "limit": "5000"}, quiet=True)["items"])
         check("选「不指定项目」只剩没挂项目的流水",
-              len(st.tree.get_children()), none_in)
+              len(st.groups.row_ids()), none_in)
         # 【4】里那几次入库没挂项目,所以本来就该出现在「不指定项目」下
         check("「不指定项目」里确实有前面那几笔", none_in > 0, True)
         st.proj.set(st.ALL)
         st.reload()
         app.update()
         check("切回「全部项目」又都回来了",
-              len(st.tree.get_children()), base_in)
+              len(st.groups.row_ids()), base_in)
 
         # ---- 出库流水是独立的一套
         st.set_action("OUT")
@@ -420,7 +512,7 @@ def main() -> int:
                                 query={"kind": "OUT", "limit": "5000"},
                                 quiet=True)["items"])
         check("出库流水显示的是全部出库流水",
-              len(st.tree.get_children()), base_out)
+              len(st.groups.row_ids()), base_out)
         check("入库那几单不会出现在出库流水里", base_out < base_in, True)
         st.set_action("IN")
         app.update()
@@ -531,7 +623,8 @@ def main() -> int:
 
         app.nb.select(app.tab_move)
         app.update()
-        p(f"  [OK ] 流水页 {len(app.tab_move.tree.get_children())} 行")
+        p(f"  [OK ] 流水页 {len(app.tab_move.groups.row_ids())} 行 /"
+          f" {app.tab_move.groups.group_count()} 个项目分组")
         app.nb.select(app.tab_loc)
         app.update()
         p(f"  [OK ] 仓位页 {len(app.tab_loc.tree.get_children())} 行")
@@ -1113,7 +1206,7 @@ def main() -> int:
             app.nb.select(tab_mv)
             tab_mv.reload()
             app.update()
-            first = tab_mv.tree.get_children()[0]
+            first = tab_mv.groups.row_ids()[0]
             check("流水页列出了刚入库的那条",
                   tab_mv.tree.item(first, "values")[1], "入库")
 
@@ -1135,7 +1228,7 @@ def main() -> int:
             tab_mv.reload()
             app.update()
             shown = {tab_mv.tree.item(i, "values")[1]: tab_mv.tree.item(i, "tags")
-                     for i in tab_mv.tree.get_children()}
+                     for i in tab_mv.groups.row_ids()}
             check("流水页把已撤销的那笔标出来",
                   any("已撤销" in k for k in shown), True)
             check("已撤销的行淡显而不是隐藏(历史要看得见)",
@@ -1278,7 +1371,7 @@ def main() -> int:
             st.reload()
             app.update()
             check("选中它看得到这个项目的入库流水,不是空表",
-                  len(st.tree.get_children()), 1)
+                  len(st.groups.row_ids()), 1)
 
             st.set_action("OUT")
             app.update()
@@ -2665,6 +2758,12 @@ def main() -> int:
                   _npages(tab37), 1)
             check("有子类又有本级的品类,中间页给出了「本级」入口",
                   "self" in tab37.pick_board.cards, True)
+            # #29:中间页那张「本级」卡片也绑着同一个右键回调。它就是**当前这一级**,
+            # 不许被当成「找不到节点」而弹一句「这一级已经不在品类树里了」
+            _sm37 = tab37._build_cat_menu("self")
+            check("「本级」那张卡片的右键也有菜单(不是当成找不到节点)",
+                  bool(_sm37) and any(l.startswith("＋ 在这下面加子品类")
+                                      for l, _s in menu_labels(_sm37)), True)
             _kid = [k for k in tab37.pick_board.cards
                     if k.isdigit()
                     and (tab37._cat_flat.get(int(k)) or {}).get("name") == "测试子类"]
@@ -2788,6 +2887,89 @@ def main() -> int:
         check("能自己加一列属性名", "@容差" in _dlg39._shown, True)
         _dlg39.destroy()
 
+        # ---- #26 按住一行上下拖就能调顺序(↑↓ 按钮必须留着,上面那两行就是它)
+        p("\n【39.1】列管理:拖动调换列顺序")
+        _t26 = app.tab_comp
+
+        class _Ev26:
+            """拖动那几个方法只认 event.y,给个够用的假事件就行。
+
+            真去 event_generate 的话,得先等窗口被窗口管理器映射出来才拿得到
+            行坐标(拿不到 bbox 时落点会退化成「插到最后」),自检会变成时好时坏。
+            """
+            def __init__(self, y):
+                self.y = y
+
+        def _row_y(dlg, i, after=False):
+            """第 i 行里一个「算在下半 / 上半」的 y —— 上半个行插到它前面,
+            下半个行插到它后面,和用户拖动时看到的那条指示线一致。"""
+            bb = dlg.tree.bbox(str(i))
+            if bb:
+                return bb[1] + (bb[3] - 3 if after else 3)
+            # 极端情况下(窗口还没映射出来)按行高硬算,落点是一样的
+            return 25 + (i + (1 if after else 0)) * 20 + (6 if after else -6)
+
+        def _drag(dlg, src, dst, after=False):
+            dlg._drag_begin(_Ev26(_row_y(dlg, src)))
+            dlg._drag_motion(_Ev26(_row_y(dlg, dst, after=after)))
+            dlg._drag_end()
+
+        def _dlg26_new(items, shown):
+            """开一个列管理窗口,并把清单换成指定的那三行。
+
+            用真实那些候选列的话,期望值会被当前那套列设置牵着走,
+            断言就变成在看别的东西了。
+            """
+            d = gui.ColumnPickDialog(_t26, ["name", "on_hand"], _t26._attr_pool(),
+                                     _t26._base_labels(), _t26._default_cols([]))
+            app.update()
+            d.items = list(items)
+            d._shown = list(shown)
+            d._refresh()
+            app.update()
+            return d
+
+        _dlg26 = _dlg26_new(["A", "B", "C"], ["A", "C"])
+        check("↑ ↓ 两个按钮还在(#26 不许弄坏它)",
+              [t for t in buttons_of(_dlg26) if t.startswith(("↑", "↓"))],
+              ["↑ 上移", "↓ 下移"])
+        check("三个拖动事件都接上了",
+              [bool(_dlg26.tree.bind(e)) for e in ("<ButtonPress-1>", "<B1-Motion>",
+                                                   "<ButtonRelease-1>")],
+              [True, True, True])
+
+        _shown26 = sorted(_dlg26._shown)
+        _drag(_dlg26, 2, 0)          # 把最后一行拖到最上面
+        check("往上拖:被拖的那行插到了目标位置", _dlg26.items, ["C", "A", "B"])
+        check("拖动只改顺序,原来勾着的一行都没被改掉",
+              sorted(_dlg26._shown), _shown26)
+        _dlg26._ok()
+        check("拖完确定,结果(也就是表格的列序)就是拖后的顺序",
+              _dlg26.result, ["C", "A"])
+
+        # 往下拖,顺便看插入位置提示
+        _dlg26b = _dlg26_new(["A", "B", "C"], ["A", "C"])
+        _dlg26b._drag_begin(_Ev26(_row_y(_dlg26b, 0)))
+        _dlg26b._drag_motion(_Ev26(_row_y(_dlg26b, 1, after=True)))
+        check("拖到哪就记下了会插到第几格(这一处是插到第二行后面)",
+              _dlg26b._drag_slot, 2)
+        check("拖动过程中有可见的插入位置提示(那条指示线画出来了)",
+              bool(_dlg26b.line.place_info()), True)
+        _dlg26b._drag_end()
+        check("松手之后提示收起来", bool(_dlg26b.line.place_info()), False)
+        check("往下拖:落到目标行的后面", _dlg26b.items, ["B", "A", "C"])
+        _dlg26b.destroy()
+
+        # 没勾的那行拖进勾着的行中间:它本来就不出现在表格里,所以可见的那几列
+        # 顺序一个都不该动 —— 这就是「拖了但确定后没变」的合理情形
+        _dlg26c = _dlg26_new(["A", "B", "C"], ["A", "C"])   # B 是没勾的
+        _drag(_dlg26c, 1, 0)                                # 把 B 拖到最上面
+        check("把没勾的行往上拖,它自己在候选清单里确实挪了位置",
+              _dlg26c.items, ["B", "A", "C"])
+        _dlg26c._ok()
+        check("但它没被勾上,所以确定后那几列的顺序一点没变",
+              _dlg26c.result, ["A", "C"])
+
         # #22 的原始场景:库存为 0 的新料确实存在(以前在 SQL 层就被滤掉)
         _dlg22 = gui.ComponentDialog(t39, app, None)
         _dlg22.vars["name"].set("自检-零库存新料")
@@ -2846,7 +3028,544 @@ def main() -> int:
                   len(t38.t_stock.get_children()), _stock38)
         else:
             p("  (这一页没有行,跳过)")
-        
+
+        # ---------------------------------------------------------- #27 / #30
+        p("\n【40】所有类表格的单元格和表头都居中(#27)")
+        # 主窗口那几张表 + 几张手搭的表全查一遍:对齐以前是每个调用点自己传的,
+        # 于是同一张表里「值」左对齐、「数量」右对齐混着。这里按整棵控件树查,
+        # 漏掉哪一处都会露出来(不只是 make_tree 建的那几张)。
+        _dlg40 = gui.ColumnPickDialog(app.tab_comp, ["name"], app.tab_comp._attr_pool(),
+                                      app.tab_comp._base_labels(),
+                                      app.tab_comp._default_cols([]))
+        app.update()
+        _dialogs40 = [("列管理", _dlg40)]
+        _cat40 = None
+        try:
+            _cat40 = gui.CategoryManagerDialog(app, app)
+            app.update()
+            _dialogs40.append(("品类管理", _cat40))
+        except Exception as exc:  # noqa: BLE001
+            p(f"  (品类管理窗口跳过:{type(exc).__name__}: {exc})")
+        try:
+            app.nb.select(app.tab_comp)
+            app.update()
+            _bad40 = []
+            for _where40, _root40 in [("主窗口", app)] + _dialogs40:
+                for _t40 in treeviews(_root40):
+                    for _col40, _anch40 in off_center(_t40):
+                        _bad40.append(f"{_where40}:{_col40}={_anch40}")
+            check("每一列(含 #0 树列)的单元格和表头都居中", _bad40, [])
+        finally:
+            if _cat40 is not None:
+                _cat40.destroy()
+        # 手搭的那几张表再点名查一次:它们不过 make_tree,最容易漏
+        check("列管理窗口那张手搭的表(原来「列名」是左对齐的)也居中了",
+              off_center(_dlg40.tree), [])
+        _dlg40.destroy()
+        app.update()
+        app.nb.select(app.tab_loc)
+        app.update()
+        check("仓位页那张手搭的树(#0 原来是左对齐)也居中了",
+              off_center(app.tab_loc.tree), [])
+        # 只改对齐:列宽和「是否随窗口伸缩」必须原样。
+        # 不伸缩的那几列宽度就是列定义里写的数;伸缩列(备注)会被 Tk 拿去填满
+        # 剩下的宽度,所以它只要求「不小于」定义值 —— 拿它跟定义值比是比错了东西。
+        check("不伸缩的列,宽度没被顺手改掉(#27 只动对齐)",
+              [int(app.tab_move.tree.column(c[0], "width"))
+               for c in gui.MovementsTab.COLS if not c[3:]],
+              [c[2] for c in gui.MovementsTab.COLS if not c[3:]])
+        check("伸缩列还是从定义宽度开始长大(备注)",
+              int(app.tab_move.tree.column("note", "width")) >= 200, True)
+        check("stretch 也没被顺手改掉(备注伸缩、数量不伸缩)",
+              [bool(int(app.tab_move.tree.column(c, "stretch"))) for c in ("note", "qty")],
+              [True, False])
+
+        p("\n【41】流水按项目折叠(#30)")
+        _t41 = app.tab_move
+        # 【32】那一节把库里的项目全删了(流水的 project_id 被外键置空),于是到这里
+        # 只剩一个「(不开项目)」组。只有一个组的话,「按项目分组」到底管不管用
+        # 根本看不出来,「别的组没被带着一起展开」那种断言也会变成空的 ——
+        # 先造两个项目、各自记一笔。
+        _pid41a = API(server.create_project, body={"name": "折叠测试甲", "qty": 1})["id"]
+        _pid41b = API(server.create_project, body={"name": "折叠测试乙", "qty": 1})["id"]
+        API(server.stock_move, body={"kind": "IN", "component_id": made[0], "qty": 2,
+                                     "project_id": _pid41a})
+        API(server.stock_move, body={"kind": "IN", "component_id": made[1], "qty": 1,
+                                     "project_id": _pid41b})
+        app.nb.select(_t41)
+        _t41.kind.set("全部")
+        _t41.reload()
+        app.update()
+        _g41 = _t41.groups
+        _names41 = [_n for _k, _g, _n, _i in _g41.groups]
+        check("流水表按项目分了组(不是一张平铺的长表)",
+              _g41.group_count() >= 3, True)
+        check("一个项目一个组,组名就是项目名",
+              [n for n in ("折叠测试甲", "折叠测试乙") if n in _names41],
+              ["折叠测试甲", "折叠测试乙"])
+        check("没挂项目的流水单独归成一组(日常补货/领用)",
+              gui.NONE_GROUP in _names41, True)
+        check("组行上写着项目名 + 该组笔数",
+              all(str(_t41.tree.item(_g, "text")).endswith(" 笔)")
+                  and _n in str(_t41.tree.item(_g, "text"))
+                  for _k, _g, _n, _i in _g41.groups), True)
+        check("默认全收着(用户原话:一直展开在那边太乱)",
+              all(not _t41.tree.item(_g, "open") for _k, _g, _n, _i in _g41.groups), True)
+        check("每一笔流水都挂在某个组下面,组行本身不是流水",
+              all(_t41.tree.parent(i) for i in _g41.row_ids()), True)
+        check("流水行都是纯数字 iid(撤销要拿它去撤销)",
+              all(str(i).isdigit() for i in _g41.row_ids()), True)
+        # 收着的时候组里的流水确实没显示出来(identify_row 是「屏幕上看得见什么」)
+        _kept_rows41 = set(_g41.row_ids())
+        _visible41 = {i for i in all_rows(_t41.tree)
+                      if i in _kept_rows41 and _t41.tree.bbox(i)}
+        check("收着的组里那些流水行不在屏幕上", _visible41, set())
+
+        _k41, _gid41, _n41, _ids41 = _g41.groups[0]
+        _real_identify41 = _t41.tree.identify_row
+        try:
+            # 不靠真实几何:直接让 identify_row 说「你点的就是这一行」
+            _t41.tree.identify_row = lambda _y: _gid41
+            _ret41 = _g41._on_click(_Ev26(0))
+        finally:
+            _t41.tree.identify_row = _real_identify41
+        check("点一下组行就展开,而且这次点击被吃掉了(免得 Tk 再切一次变成点了没点)",
+              _ret41, "break")
+        check("展开之后组里的流水就显示出来了", _t41.tree.item(_gid41, "open"), 1)
+        check("箭头换成「已展开」的样子",
+              str(_t41.tree.item(_gid41, "text")).startswith("▼"), True)
+        # 折叠状态是记在页签上的,所以刷新/撤销不会把用户收好的组又弹开
+        _t41.reload()
+        app.update()
+        check("刷新之后这一组还开着(折叠状态在当前会话里记住)",
+              _t41.tree.item(_gid41, "open"), 1)
+        check("别的组没被带着一起展开(有不止一个组,这条才不是空话)",
+              [bool(_t41.tree.item(_g, "open"))
+               for _k, _g, _n, _i in _g41.groups if _g != _gid41],
+              [False] * (len(_g41.groups) - 1))
+        check("这一条断言确实覆盖到了别的组", len(_g41.groups) >= 2, True)
+
+        # 键盘空格 / 直接点组名前面那个小三角是 ttk 自己切的,我们收不到事件 ——
+        # 直接改树上真实的 -open(等于 ttk 替用户切了)再刷新,这个状态也得留住,
+        # 否则表现就是「我明明收起来了,一刷新又弹开」
+        _other41 = [_g for _k, _g, _n, _i in _g41.groups if _g != _gid41][0]
+        _t41.tree.item(_other41, open=1)
+        _t41.reload()
+        app.update()
+        check("从 ttk 那条路展开的组,刷新之后同样是开着的",
+              _t41.tree.item(_other41, "open"), 1)
+        _t41.tree.item(_other41, open=0)
+        _t41.reload()
+        app.update()
+        check("从 ttk 那条路收起来的组,刷新之后同样是收着的",
+              _t41.tree.item(_other41, "open"), 0)
+
+        _g41.toggle(_gid41)
+        check("再点一下收起来", _t41.tree.item(_gid41, "open"), 0)
+
+        # 撤销只针对具体某一笔流水:组行不能被当成流水去撤销(#30 的硬要求)
+        _box41 = FakeBox()
+        _voided41 = app_con.execute(
+            "SELECT COUNT(*) FROM movement WHERE voided=1").fetchone()[0]
+        gui.messagebox = _box41
+        try:
+            _t41.tree.selection_set(_gid41)
+            _t41.undo()
+            app.update()
+            check("选中组行时撤销被挡住,并且说清了该怎么办",
+                  bool(_box41.infos) and "分组" in _box41.infos[0][1], True)
+            check("一笔流水都没被动到",
+                  app_con.execute("SELECT COUNT(*) FROM movement WHERE voided=1"
+                                  ).fetchone()[0], _voided41)
+            check("也没弹「确定要撤销吗」那种确认框", _box41.asks, [])
+        finally:
+            gui.messagebox = real_box
+        _mid41 = _g41.row_ids()[0]
+        _t41.tree.selection_set(str(_mid41))
+        _box41b = FakeBox()
+        _box41b.answer = False
+        gui.messagebox = _box41b
+        try:
+            _t41.undo()
+            app.update()
+            check("选中真的那一笔时,撤销照旧走到「先问一遍」",
+                  len(_box41b.asks), 1)
+        finally:
+            gui.messagebox = real_box
+
+        # 动作类型下拉这个筛选还得能用:筛完还是分着组的
+        _t41.kind.set("入库")
+        _t41.reload()
+        app.update()
+        # 「撤销」补的是反向流水,「入库」这一档里会混着「入库·撤销」——
+        # 和上面那个 kinds_shown 一样,后缀要摘掉再比
+        _kinds41 = {str(_t41.tree.item(i, "values")[
+            gui.col_index(gui.MovementsTab.COLS, "kind")]).replace("(已撤销)", "")
+            .replace("·撤销", "")
+            for i in _g41.row_ids()}
+        check("动作筛选还能用(筛完仍然是按项目分组的)",
+              _kinds41, {"入库"})
+        check("筛选之后组还在", _g41.group_count() > 0, True)
+        _t41.kind.set("全部")
+        _t41.reload()
+        app.update()
+
+        # 出入库页的入库流水 / 出库流水是同一类问题,一并处理掉了
+        app.nb.select(app.tab_stock)
+        app.update()
+        _st41 = app.tab_stock
+        _st41.set_action("IN")
+        app.update()
+        check("出入库页的入库流水也按项目折叠了(默认也收着)",
+              _st41.groups.group_count() >= 2
+              and all(not _st41.tree.item(_g, "open")
+                      for _k, _g, _n, _i in _st41.groups.groups), True)
+        check("出入库页的组行上也有项目名和笔数",
+              all(" 笔)" in str(_st41.tree.item(_g, "text"))
+                  for _k, _g, _n, _i in _st41.groups.groups), True)
+        check("出入库页也把这两个项目分成了一组一组",
+              [n for n in ("折叠测试甲", "折叠测试乙")
+               if n in [_n for _k, _g, _n, _i in _st41.groups.groups]],
+              ["折叠测试甲", "折叠测试乙"])
+        check("出入库页也能列出全部流水行(收着也数得到)",
+              len(_st41.groups.row_ids()) > 0, True)
+        _gid41b = _st41.groups.groups[0][1]
+        _st41.tree.selection_set(_gid41b)
+        _box41c = FakeBox()
+        gui.messagebox = _box41c
+        try:
+            _st41.undo()
+            app.update()
+            check("出入库页选中组行时撤销同样被挡住",
+                  bool(_box41c.infos) and "分组" in _box41c.infos[0][1], True)
+        finally:
+            gui.messagebox = real_box
+        _st41.set_action("IN")
+        app.update()
+
+        # ---------------------------------------------------------- #29 / #28
+        p("\n【42】#29 首页卡片右键:库里没有这一级也得有菜单,删掉的不会自己长回来")
+
+        _t42 = app.tab_comp
+        app.nb.select(_t42)
+        app.update()
+        # 这一节会自己造「删掉过」「配过色」的状态,而且**都会写进数据库旁边的
+        # ui_columns.json** —— 开始之前先清干净,免得上一节(或上一次运行)留下的
+        # 设置把期望值带偏。那正是「断言假通过 / 假失败」最常见的来源。
+        _cfg42 = _t42._col_cfg_path()
+        if _cfg42 and os.path.exists(_cfg42):
+            os.remove(_cfg42)
+        _t42._hidden_cats = set()
+        _t42._row_colors = {}
+        _t42._want_cols = None
+        _t42.zero_stock.set(True)
+        app.refresh_all()
+        app.update()
+
+        # 找一个「写死在名单里、库里却没有对应顶层行」的标准大类 —— 这正是用户
+        # 那个库的样子(他右键的「传感器」就是这么一张卡片,他从没建过这一行)
+        _tops42 = {n["name"] for n in _t42._cat_flat.values() if n["parent_id"] is None}
+        _probe42 = next((c for c in gui.CATEGORY_ORDER if c not in _tops42), None)
+        if _probe42 is None:
+            # 测试库里 16 个都建了行:自己删掉一个,把这种状态造出来。
+            # 挑不到就跳过的话这一节等于没测 —— 而它要验的正是这种状态。
+            _probe42 = list(gui.CATEGORY_ORDER)[0]
+            _kill42 = next(n for n in _t42._cat_flat.values()
+                           if n["parent_id"] is None and n["name"] == _probe42)
+            API(server.delete_category, match=(_kill42["id"],))
+            _t42._load_cat_tree()
+        check("这个标准大类:卡片名单里有,库里却没有对应的品类行",
+              (_probe42 in _t42.cards,
+               _probe42 in {n["name"] for n in _t42._cat_flat.values()
+                            if n["parent_id"] is None}), (True, False))
+
+        # ---- 右键:以前 _menu_node 返回 None,_cat_menu 静默 reload,
+        #      用户看到的就是「对着卡片点右键毫无反应」
+        _vnode42 = _t42._menu_node(_probe42)
+        check("库里没有这一级时,右键拿到的是「虚拟节点」而不是 None(不再静默)",
+              (_vnode42 is not None, (_vnode42 or {}).get("id")), (True, None))
+        _menu42 = _t42._build_cat_menu(_probe42)
+        check("右键这种卡片能拿到菜单", bool(_menu42), True)
+        _items42 = menu_labels(_menu42)
+        _cmds42 = [l for l, _s in _items42]
+        check("菜单里有「在这下面加子品类…」",
+              any(l.startswith("＋ 在这下面加子品类") for l in _cmds42), True)
+        check("菜单里有「把这一级建出来」(按需建,不让用户自己绕一圈)",
+              ("＋ 把「%s」这一级建出来…" % _probe42) in _cmds42, True)
+        _greys42 = [(l, s) for l, s in _items42 if l.startswith(("改名", "删除"))]
+        check("改名 / 删除置灰(对不存在的品类不能假装删成功)",
+              [s for _l, s in _greys42], ["disabled", "disabled"])
+        check("而且置灰那两项上写清了为什么",
+              all("库里还没有这一级" in l for l, _s in _greys42), True)
+
+        # 真的弹一次。tk_popup 会真把菜单挂到屏幕上等人点,自检里点不了,所以只把
+        # 它换掉,确认 _cat_menu 真的走到「弹」这一步(而不是从某个 return 回来)
+        _pop42, _popped42 = tk.Menu.tk_popup, []
+
+        class _Ev42:
+            x_root, y_root = 0, 0
+
+        tk.Menu.tk_popup = lambda self, x, y: _popped42.append((x, y))
+        try:
+            _t42._cat_menu(_probe42, _Ev42())
+        finally:
+            tk.Menu.tk_popup = _pop42
+        check("对着这种卡片右键,菜单真的弹出来了", len(_popped42), 1)
+
+        # ---- 「＋ 在这下面加子品类」:按需先把这一级建出来,再建子类
+        _ask42 = gui.ask_text
+        gui.ask_text = lambda *a, **k: "按需子类"
+        try:
+            _t42.add_child_cat(_vnode42)      # 喂进去的正是刚才那个虚拟节点
+            app.update()
+        finally:
+            gui.ask_text = _ask42
+        _flat42 = API(server.list_categories)["flat"]
+        _root42 = [n for n in _flat42
+                   if n["name"] == _probe42 and n["parent_id"] is None]
+        check("加子类时按需把这一级先建出来了(库里原来没有这一行)",
+              len(_root42), 1)
+        check("新子类挂在这一级下面(不是又冒出一个同名顶层)",
+              [n["parent_id"] for n in _flat42 if n["name"] == "按需子类"],
+              [_root42[0]["id"]] if _root42 else [])
+        check("建完状态栏有交代,而且写明挂在哪一级下面(不是悄没声地干完)",
+              f"{_probe42} / 按需子类" in app.status.get(), True)
+
+        # ---- 删掉一个标准大类:卡片不许自己长回来
+        _box42 = FakeBox()
+        _mb42 = gui.messagebox
+        gui.messagebox = _box42
+        try:
+            _t42._load_cat_tree()
+            _t42.delete_cat(_t42._cat_flat[_root42[0]["id"]])
+            app.update()
+        finally:
+            gui.messagebox = _mb42
+        check("删之前问了一句", len(_box42.asks) >= 1, True)
+        check("删完卡片立刻不在名单里", _probe42 in _t42.cards, False)
+        check("被删掉的标准大类名被记住了", _probe42 in _t42._hidden_cats, True)
+        app.refresh_all()
+        app.update()
+        check("再刷新(重新渲染首页)卡片也没有自己长回来",
+              _probe42 in _t42.cards, False)
+        check("首页计数里写明了有几个标准大类被删掉(不然用户只看到少了几张)",
+              "标准大类" in _t42.count.get(), True)
+
+        # ---- 持久化:重开一个库存页 = 重开软件
+        with open(_t42._col_cfg_path(), encoding="utf-8") as _f42:
+            _raw42 = _f42.read()
+        check("「删掉过的大类」写进了数据库旁边的 ui_columns.json",
+              ("hidden_cats" in _raw42 and _probe42 in _raw42), True)
+        check("同一份文件里原来的键没被这次写入挤掉", "cols" in _raw42, True)
+        _t42b = gui.ComponentsTab(app.nb, app)
+        _t42b.reload()
+        app.update()
+        check("重开之后那个标准大类还是不在首页", _probe42 in _t42b.cards, False)
+        check("而且新开的这个页面也记得它被删过",
+              _probe42 in _t42b._hidden_cats, True)
+
+        # ---- 主动恢复:「不再自己长回来」不等于「永远回不来」
+        _box42b = FakeBox()
+        gui.messagebox = _box42b
+        try:
+            _t42b.restore_hidden_cats()
+            app.update()
+        finally:
+            gui.messagebox = _mb42
+        check("恢复时先问一句,并说清要恢复哪几个",
+              bool(_box42b.asks) and _probe42 in _box42b.asks[0][1], True)
+        check("恢复之后卡片回来了", _probe42 in _t42b.cards, True)
+        check("恢复之后名单里不再有它", _probe42 in _t42b._hidden_cats, False)
+        _t42b.destroy()
+        app.update()
+
+        # ---- 名字又回到品类表里时,不许再藏:别人(比如导入 BOM 时的品类核对)
+        #      把这一级建出来了,卡片就必须回来 ——「删掉的不再长回来」说的是
+        #      **没有对应行的空卡片**,不是把库里真有的数据藏起来
+        API(server.create_category, body={"name": _probe42})
+        _t42._hidden_cats.add(_probe42)
+        _t42._save_cols()
+        _t42.reload()
+        app.update()
+        check("库里又有这一行了,卡片自动回来(不是把真实数据藏住)",
+              _probe42 in _t42.cards, True)
+        check("而且自动从「删掉过」的名单里拿掉了",
+              _probe42 in _t42._hidden_cats, False)
+
+        # ---- 「除非用户主动恢复」的另一条路:用「＋ 新增大类」把同一个名字建出来
+        _t42._hidden_cats.add("自检-恢复测试类")
+        _t42._save_cols()
+        _ask42c = gui.ask_text
+        gui.ask_text = lambda *a, **k: "自检-恢复测试类"
+        try:
+            _t42.add_root_cat()
+            app.update()
+        finally:
+            gui.ask_text = _ask42c
+        check("用「＋ 新增大类」重建同名的 = 主动恢复(卡片立刻出现,不再算隐藏)",
+              ("自检-恢复测试类" in _t42.cards,
+               "自检-恢复测试类" in _t42._hidden_cats), (True, False))
+
+        p("\n【43】#28 库存表按行配色:能设、能记住、能清除,而且压过内置规则色")
+
+        # 造两行「内置规则色会生效」的料:库存 5 / 4,安全线 50 -> 都是 low(黄底)
+        _cat43 = API(server.create_category, body={"name": "行配色测试类"})["id"]
+        _c43 = API(server.create_component, body={
+            "name": "自检-黄底", "category_id": _cat43, "value": "1k",
+            "package": "0603", "min_stock": 50})["id"]
+        API(server.stock_move, body={"kind": "IN", "component_id": _c43, "qty": 5,
+                                     "location": "未分类"})
+        _c43b = API(server.create_component, body={
+            "name": "自检-再一行", "category_id": _cat43, "value": "2k",
+            "package": "0603", "min_stock": 50})["id"]
+        API(server.stock_move, body={"kind": "IN", "component_id": _c43b, "qty": 4,
+                                     "location": "未分类"})
+        _t43 = app.tab_comp
+        _t43.zero_stock.set(True)
+        _t43.open_category("行配色测试类")
+        app.update()
+        _i43 = str(_c43)
+        check("这一页有那两行", len(_t43.tree.get_children()), 2)
+        check("内置规则色给这一行挂了 low(偏低黄底)",
+              (_t43.tree.exists(_i43), "low" in _t43.tree.item(_i43, "tags")),
+              (True, True))
+        check("内置 low 的确是黄底(下面拿它当对照)",
+              color_str(_t43.tree.tag_configure("low", "background")), "#fff6dd")
+
+        _lbl43 = [l for l, _s in menu_labels(_t43.menu)]
+        check("右键菜单里有「文字颜色…」/「背景色…」/「清除自定义行配色」",
+              [l for l in ("文字颜色…", "背景色…", "清除自定义行配色") if l in _lbl43],
+              ["文字颜色…", "背景色…", "清除自定义行配色"])
+        check("而且和「入库 / 删除」它们并列在同一张菜单里",
+              ("入库" in _lbl43 and "删除" in _lbl43), True)
+
+        # ---- 文字色。取色对话框用标准库的 colorchooser,自检里换成假的
+        _real43 = gui.colorchooser.askcolor
+        gui.colorchooser.askcolor = lambda *a, **k: ((0, 0, 255), "#0000ff")
+        try:
+            _t43.tree.selection_set(_i43)
+            _t43.pick_row_color("fg")
+        finally:
+            gui.colorchooser.askcolor = _real43
+        _tags43 = _t43.tree.item(_i43, "tags")
+        check("只设文字色:这一行挂上了自己的配色 tag",
+              any(str(t).startswith("u") for t in _tags43), True)
+        check("文字色真的配在那一个 tag 上",
+              color_str(_t43.tree.tag_configure("u" + _i43, "foreground")), "#0000ff")
+        check("只设文字色时**不碰背景**:内置的 low 还挂在这一行上",
+              "low" in _tags43, True)
+        check("那个自定义 tag 没配背景色(空串 = 不设置这一项)",
+              color_str(_t43.tree.tag_configure("u" + _i43, "background")), "")
+
+        # ---- 背景色:必须压过内置规则色
+        gui.colorchooser.askcolor = lambda *a, **k: ((255, 255, 0), "#ffff00")
+        try:
+            _t43.pick_row_color("bg")
+        finally:
+            gui.colorchooser.askcolor = _real43
+        check("设了背景色之后内置的 low 让位(两个 tag 抢同一个选项只会时红时黄)",
+              "low" in _t43.tree.item(_i43, "tags"), False)
+        check("这一行实际生效的背景色 = 用户配的那个(压过了内置黄底)",
+              effective_bg(_t43.tree, _i43), "#ffff00")
+        check("没配过的行还是内置的黄底(规则色没被一起改掉)",
+              effective_bg(_t43.tree, str(_c43b)), "#fff6dd")
+
+        # ---- 多选一起设:和 Excel 里选一片一起刷是一个意思
+        gui.colorchooser.askcolor = lambda *a, **k: ((255, 0, 0), "#ff0000")
+        try:
+            _t43.tree.selection_set((_i43, str(_c43b)))
+            _t43.pick_row_color("fg")
+        finally:
+            gui.colorchooser.askcolor = _real43
+        check("选了两行就两行一起设",
+              [color_str(_t43.tree.tag_configure("u" + str(_x), "foreground"))
+               for _x in (_c43, _c43b)], ["#ff0000", "#ff0000"])
+
+        # ---- 取色对话框点取消:什么都不改(不能取消了还刷上色)
+        _before43 = {k: dict(v) for k, v in _t43._row_colors.items()}
+        gui.colorchooser.askcolor = lambda *a, **k: (None, None)
+        try:
+            _t43.pick_row_color("bg")
+        finally:
+            gui.colorchooser.askcolor = _real43
+        check("点取消,配色一点没动", _t43._row_colors, _before43)
+
+        # ---- 一行都没选:给提示,不静默
+        _t43.tree.selection_remove(*_t43.tree.selection())
+        _t43.pick_row_color("fg")
+        check("一行都没选时给一句提示(不是点了没反应)",
+              "选中" in app.status.get(), True)
+
+        # ---- 持久化:重开页面 = 重开软件,颜色还在
+        with open(_t43._col_cfg_path(), encoding="utf-8") as _f43:
+            _raw43 = _f43.read()
+        check("行配色写进了数据库旁边的 ui_columns.json",
+              ("row_colors" in _raw43 and "#ffff00" in _raw43), True)
+        _t43b = gui.ComponentsTab(app.nb, app)
+        _t43b.reload()
+        _t43b.open_category("行配色测试类")
+        app.update()
+        check("重开之后这一行的背景色还是用户配的",
+              effective_bg(_t43b.tree, _i43), "#ffff00")
+        check("键用的是元件 id,所以换页面 / 换筛选还是同一行",
+              (_t43b._row_colors.get(_i43) or {}).get("bg"), "#ffff00")
+        _t43b.destroy()
+        app.update()
+
+        # ---- 清除:回到默认,内置规则色跟着回来
+        _t43.tree.selection_set(_i43)
+        _t43.clear_row_colors()
+        app.update()
+        check("清除之后这一行不再挂自定义 tag",
+              [str(t) for t in _t43.tree.item(_i43, "tags")
+               if str(t).startswith("u")], [])
+        check("清除之后内置的 low 回来了(规则色照旧)",
+              effective_bg(_t43.tree, _i43), "#fff6dd")
+        check("保存的数据里也删掉了",
+              _i43 in _t43._row_colors, False)
+
+        # ---- 元件行右键菜单里的「删除」:点了要真删掉,而且有交代
+        _tmp43 = API(server.create_component, body={
+            "name": "自检-右键删除", "category_id": _cat43, "value": "3k",
+            "package": "0603"})["id"]
+        API(server.stock_move, body={"kind": "IN", "component_id": _tmp43, "qty": 2,
+                                     "location": "未分类"})
+        _t43.reload()
+        app.update()
+        _i43c = str(_tmp43)
+        check("新料出现在这一页(下面才点得到它)", _t43.tree.exists(_i43c), True)
+        _box43 = FakeBox()
+        _mb43 = gui.messagebox
+        gui.messagebox = _box43
+        try:
+            _t43.tree.selection_set(_i43c)
+            # 走的是菜单上那一条,不是直接调方法 —— 入口没接上也要能查出来
+            _t43.menu.invoke(_t43.menu.index("删除"))
+            app.update()
+        finally:
+            gui.messagebox = _mb43
+        check("右键菜单里点「删除」会先问一句", len(_box43.asks) >= 1, True)
+        check("元件真的没了",
+              int(app_con.execute("SELECT COUNT(*) FROM component WHERE id=?",
+                                  (_tmp43,)).fetchone()[0]), 0)
+        check("而且状态栏说了删掉的是哪一颗",
+              "自检-右键删除" in app.status.get(), True)
+
+        # ---- 收尾:这一节造的状态不能留给下一次运行。
+        # ui_columns.json 就在数据库旁边,下一次运行**会真的读它** —— 留着
+        # 「隐藏了一个标准大类」「某一行是黄底」的话,下一轮自检里首页卡片和
+        # 行 tag 的期望值就全变了,那种失败最难查。
+        _t43._row_colors.clear()
+        _t43._hidden_cats.clear()
+        _t43._want_cols = None
+        _t43.zero_stock.set(True)
+        _t43._save_cols()
+        with open(_t43._col_cfg_path(), encoding="utf-8") as _f43b:
+            _raw43b = _f43b.read()
+        check("收尾:隐藏名单和行配色都没留在设置文件里(下一轮自检不受影响)",
+              (_probe42 not in _raw43b and "#ffff00" not in _raw43b
+               and "#ff0000" not in _raw43b), True)
+
         app.update()
         p("  [OK ] 全量刷新")
         app.destroy()

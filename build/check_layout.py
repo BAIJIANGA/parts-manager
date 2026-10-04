@@ -156,7 +156,9 @@ def main() -> int:
     shutil.copy2(os.path.join(ROOT, "data", "parts.db"), DB)
 
     # 给每条 BOM 需求的那颗料补一点库存,让「按 BOM 出库」那张树有真实的
-    # 候选行。空表量不出列宽有没有溢出,而它是全套里唯一带 #0 树列的表。
+    # 候选行。空表量不出列宽有没有溢出,而带 #0 树列的那几张(按 BOM 出库、
+    # 品类、仓位、按项目折叠的流水)列宽账本来就比平表紧。(#30 之后流水那两张
+    # 也带 #0 了,它们是默认折叠的 —— 收着不影响列宽合计,这里照样量。)
     _c = db.connect(DB)
     db.init_db(_c)
     _loc = _c.execute("SELECT id FROM location ORDER BY id LIMIT 1").fetchone()[0]

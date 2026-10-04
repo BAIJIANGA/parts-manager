@@ -20,7 +20,9 @@ import sqlite3
 import sys
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+# colorchooser 是标准库自带的取色器(系统调色板),不引第三方库 ——
+# 「Excel 那种改颜色」要的就是一个能点着选的色盘
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
@@ -136,25 +138,52 @@ def manual_note(body):
     return body
 
 
+def col_index(columns, key):
+    """按列名找列号。
+
+    撤销时要读某一笔流水的单元格来写确认文案。写死 values[3] 的话,以后给
+    表加一列(比如 #30 把「项目」列换成组行)就全部串位 —— 串位之后不少断言
+    **还是通过的**,只是它验的已经不是原来那件事了,那比直接失败更糟。
+    """
+    return [c[0] for c in columns].index(key)
+
+
 def make_tree(parent, columns, height=14, show="headings"):
-    """columns: [(key, 标题, 宽度, 对齐), ...]  返回 (frame, tree)
+    """columns: [(key, 标题, 宽度[, 是否伸缩]), ...]  返回 (frame, tree)
 
     默认 show="headings" —— 不显示 #0 树列,也就没有展开三角。这个界面里
-    绝大多数列表都是平的:分类用卡片进二级页,列表本身不需要折叠。
+    大多数列表都是平的:分类用卡片进二级页,列表本身不需要折叠。
 
-    只有「按 BOM 出库」那张表例外,它传 show="tree headings":一条 BOM 需求
-    下面要挂几颗能凑它的库存料,必须能折叠,否则 19 行需求 × 每行几颗候选
-    会摊成一张看不出层次的几十行大表。
+    「按 BOM 出库」和「流水」这几张表例外,它们传 show="tree headings":
+    一条 BOM 需求下面要挂几颗能凑它的库存料,一个项目下面要挂它那些流水,
+    必须能折叠,否则会摊成一张看不出层次的几十行大表(见 #30)。
+
+    **对齐(#27):表头和单元格一律居中。** 列定义里历史上第 4 项是「这一列的
+    对齐方式」,调用点写了 w / center / e 各不相同的值,于是同一张表里左中右
+    混排。用户明确要求「所有的都要居中」,所以这一项从 #27 起被忽略 —— 老调用
+    点还带着它(是字符串),新写的列定义第 4 项留空即可。
+
+    第 4 项腾出来之后顺便当伸缩开关用:给 bool 就是「这一列是否随窗口伸缩」,
+    不写就按老规矩(文字类的 name / note 才伸缩)。列宽和 stretch 的行为完全
+    没变 —— 这次只动对齐。
     """
     frame = ttk.Frame(parent)
     keys = [c[0] for c in columns]
     tree = ttk.Treeview(frame, columns=keys, height=height, show=show)
     for col in columns:
-        key, title, width, anchor = col[:4]
-        # 第 5 个元素可以指定这一列是否跟着窗口伸缩;不写就按老规矩(文字类才伸缩)
-        stretch = col[4] if len(col) > 4 else (key in ("name", "note"))
-        tree.heading(key, text=title)
-        tree.column(key, width=width, anchor=anchor, stretch=stretch)
+        # 第 3 项之后只取宽度:对齐不再按列给,一律居中
+        key, title, width = col[:3]
+        if len(col) > 4:
+            # 老写法:(键, 标题, 宽度, 对齐, 是否伸缩)
+            stretch = col[4]
+        elif len(col) == 4 and isinstance(col[3], bool):
+            # 新写法:(键, 标题, 宽度, 是否伸缩)
+            stretch = col[3]
+        else:
+            stretch = key in ("name", "note")
+        # 表头也要显式居中:ttk 的表头默认跟随主题,不写死的话换个主题就偏了
+        tree.heading(key, text=title, anchor="center")
+        tree.column(key, width=width, anchor="center", stretch=stretch)
     vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
     hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
     tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -707,12 +736,23 @@ class ComponentsTab(ttk.Frame):
         self._build_home()
         self._build_cat()
         self._build_pick()
-        self._load_cols()          # 上次勾的列设置,得在建第一屏之前读到
-        self.go_home()
         # 列设置:None = 默认(基础列 + 自动挑两个属性);列表 = 用户自己安排好的
         # 顺序,元素形如 "value" 或 "@耐压"
         self._want_cols = None
         self._slot_attr = {}       # a1..a12 -> 属性名
+        # 用户给行配的颜色:元件 id 的字符串 -> {"fg": 颜色|None, "bg": 颜色|None}。
+        # 用元件 id 当键(不是行号、不是表格 iid):换页面、换筛选之后还是同一行。
+        self._row_colors = {}
+        # 用户删掉的标准大类名。首页那 16 个大类的名字是写死的常量,库里没有
+        # 对应行时卡片也照画,所以删掉之后必须**记住**,否则它每次都自己长回来
+        # (用户说的「删不掉」)。用户想找回来时有明确入口(见 restore_hidden_cats)。
+        self._hidden_cats = set()
+
+        # 这三样得在 _load_cols() **之前**备好:它是把文件里的设置写进这几个
+        # 状态位的。原来这几行排在 _load_cols() 之后,读回来的设置转头就被
+        # None 覆盖 —— 「列设置能记住」其实只在同一次会话里成立,重开软件全丢。
+        self._load_cols()          # 上次勾的列设置,得在建第一屏之前读到
+        self.go_home()
 
     # ---- 给自检用的快捷入口
     @property
@@ -884,6 +924,13 @@ class ComponentsTab(ttk.Frame):
         self.menu.add_command(label="挪到品类…", command=self.move_to_category)
         self.menu.add_command(label="编辑…", command=self.edit)
         self.menu.add_command(label="删除", command=self.delete)
+        # 行配色(issue #28):选中一行或多行 → 文字颜色 / 背景色 / 清除。
+        # 注意这是**整行**上色,不是单元格上色 —— ttk.Treeview 做不到单元格级,
+        # 详见 _row_tags 的注释。
+        self.menu.add_separator()
+        self.menu.add_command(label="文字颜色…", command=lambda: self.pick_row_color("fg"))
+        self.menu.add_command(label="背景色…", command=lambda: self.pick_row_color("bg"))
+        self.menu.add_command(label="清除自定义行配色", command=self.clear_row_colors)
         self.tree.bind("<Button-3>", self._popup)
 
         bottom = ttk.Frame(pane)
@@ -985,6 +1032,9 @@ class ComponentsTab(ttk.Frame):
             return
         node = self._cat_flat.get(int(key))
         if node is None:
+            # 这一级被删了(卡片是上一屏画的)。不能静默重画了事 ——
+            # 静默就是这个 issue 的病根,至少给一句话
+            self.app.set_status("这个品类已经不在品类树里了,已经刷新", 6)
             self.reload()
             return
         if (self.crumb and self.crumb[-1]["kind"] == "cat"
@@ -1110,10 +1160,24 @@ class ComponentsTab(ttk.Frame):
         """右键那张卡片对应树上哪个节点。
 
         首页的卡片 key 是大类**名字**,中间页的 key 是节点 id —— 两个页面
-        共用同一个回调,所以按当前视图分辨。分不出来的返回 None(调用方
-        直接什么都不做,不能让一次右键崩掉整个界面)。
+        共用同一个回调,所以按当前视图分辨。
+
+        首页那 16 个大类的名字是写死的名单,用户库里**可能压根没有对应的品类行**
+        (他从没建过,卡片只是照名单画出来的)。这种卡片右键时这里其实找不到节点,
+        但那不等于「这一级不存在」—— 卡片就摆在眼前。所以首页找不到时**现造一个
+        虚拟节点**(id 为 None)交回调用方,由它在用户真要加子类时按需把这一级
+        建出来(见 add_child_cat / ensure_cat)。以前这里返回 None、调用方静默
+        reload(),用户看到的就是「对着卡片点右键毫无反应」(issue #29)。
         """
         if self.view == "pick":
+            if str(key) == "self":
+                # 中间页那张「本级」卡片绑的是同一个右键回调。它对应的就是**当前
+                # 这一级**(不是"找不到节点"),所以按当前路径末端的品类节点算 ——
+                # 不然会给用户来一句莫名其妙的「这一级已经不在品类树里了」。
+                here = self._last_cat()
+                if here is None:
+                    return None
+                return self._cat_flat.get(here.get("id")) or here
             try:
                 return self._cat_flat.get(int(key))
             except (TypeError, ValueError):
@@ -1121,27 +1185,66 @@ class ComponentsTab(ttk.Frame):
         for n in self._cat_flat.values():
             if n["parent_id"] is None and n["name"] == key:
                 return n
+        name = str(key or "").strip()
+        if name and self.view == "home":
+            return {"id": None, "name": name, "parent_id": None, "path": name,
+                    "children": [], "own": 0, "total": 0,
+                    "own_stocked": 0, "total_stocked": 0, "virtual": True}
         return None
 
     def _cat_menu(self, key, event):
         """卡片右键菜单:只动这一级。"""
-        self._load_cat_tree()          # 数量、子类这些得是新的
-        node = self._menu_node(key)
-        if node is None:
-            self.reload()
+        menu = self._build_cat_menu(key)
+        if menu is None:
             return
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="＋ 在这下面加子品类…",
-                         command=lambda: self.add_child_cat(node))
-        menu.add_command(label="改名…", command=lambda: self.rename_cat(node))
-        menu.add_command(label="删除…", command=lambda: self.delete_cat(node))
-        if node["parent_id"] is None:
-            menu.add_separator()
-            menu.add_command(label="＋ 再加一个顶级品类…", command=self.add_root_cat)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _build_cat_menu(self, key):
+        """把这张卡片该有的右键菜单建出来(不弹出来)。
+
+        单独拆出来是为了让自检能直接看菜单里有哪些项 —— tk_popup 会真把菜单
+        挂到屏幕上等人点,自检里没法点它,只能看它长什么样。
+        """
+        self._load_cat_tree()          # 数量、子类这些得是新的
+        node = self._menu_node(key)
+        if node is None:
+            # 真找不到(多半是别处刚把这一级删了)。**不许静默返回** ——
+            # 静默返回正是 issue #29 里「点了没反应」的根源,至少给一句话。
+            self.app.set_status(f"「{key}」这一级已经不在品类树里了,已经刷新", 6)
+            self.reload()
+            return None
+        menu = tk.Menu(self, tearoff=0)
+        if node.get("id") is None:
+            # 库里还没有这一级。此时只有两件事是**真能做**的:把它建出来、
+            # 在它下面加子类。改名 / 删除对着一个不存在的行点,点了也只能
+            # 假装成功,所以明摆着写清「库里还没有这一级」并置灰,而不是
+            # 让用户点完发现卡片还在。
+            menu.add_command(label="＋ 在这下面加子品类…",
+                             command=lambda: self.add_child_cat(node))
+            menu.add_command(label=f"＋ 把「{node['name']}」这一级建出来…",
+                             command=lambda: self.ensure_cat(node["name"]))
+            menu.add_separator()
+            menu.add_command(label="改名…(库里还没有这一级)", state="disabled")
+            menu.add_command(label="删除…(库里还没有这一级)", state="disabled")
+        else:
+            menu.add_command(label="＋ 在这下面加子品类…",
+                             command=lambda: self.add_child_cat(node))
+            menu.add_command(label="改名…", command=lambda: self.rename_cat(node))
+            menu.add_command(label="删除…", command=lambda: self.delete_cat(node))
+            if node["parent_id"] is None:
+                menu.add_separator()
+                menu.add_command(label="＋ 再加一个顶级品类…", command=self.add_root_cat)
+        # 删掉过的标准大类:卡片不再自己长回来,但得有个明确的找回入口。
+        # 只要还有隐藏的就在菜单里显示,用户不用去猜怎么恢复。
+        if self._hidden_cats:
+            menu.add_separator()
+            menu.add_command(
+                label=f"↩ 恢复删掉过的标准大类…(还有 {len(self._hidden_cats)} 个)",
+                command=self.restore_hidden_cats)
+        return menu
 
     def add_here(self):
         """在当前这一页下面加子品类。首页没有「当前页」,那就是加顶级。"""
@@ -1159,20 +1262,89 @@ class ComponentsTab(ttk.Frame):
         res = call(self.con, server.create_category, parent=self, body={"name": name})
         if res is None:
             return
+        # 用户把一个删掉过的标准大类名**重新建出来**,意思就是要它回来 ——
+        # 这时候还把它藏在隐藏名单里的话,卡片不出来,他会以为新建失败了
+        self._unhide_cat(name)
         self.app.set_status(f"加好了大类「{name}」", 5)
         self.reload()
 
+    def ensure_cat(self, name):
+        """把首页这张卡片对应的大类在库里建出来;已经有了就返回它。
+
+        为什么需要它:首页那 16 个标准大类是**写死的名单**,用户库里可能压根
+        没有对应的品类行。对着这种卡片点「在这下面加子品类」,得先有个父节点
+        才挂得住 —— 这里就按需把这一级建出来,而不是回一句「这个品类不存在」
+        让用户自己去首页「＋ 新增大类」再走一遍(他要加的是子类,不是大类)。
+        """
+        name = str(name or "").strip()
+        if not name:
+            return None
+        self._load_cat_tree()
+        for n in self._cat_flat.values():
+            if n["parent_id"] is None and n["name"] == name:
+                self._unhide_cat(name)
+                return n
+        res = call(self.con, server.create_category, parent=self,
+                   body={"name": name})
+        if res is None:
+            return None
+        self._unhide_cat(name)
+        self._load_cat_tree()
+        node = self._cat_flat.get(int(res["id"]))
+        self.app.set_status(f"先在库里建出了「{name}」这一级", 5)
+        return node
+
+    def _unhide_cat(self, name):
+        """把某个名字从「删掉过」的名单里拿掉(用户又把它建出来了)。"""
+        if name in self._hidden_cats:
+            self._hidden_cats.discard(name)
+            self._save_cols()
+
+    def restore_hidden_cats(self):
+        """把删掉过的标准大类放回首页卡片名单。
+
+        「删掉的不再自己长回来」不等于「永远回不来」:用户整理完货架想找回来时
+        得有个明确入口,否则只能猜。这里放回的只是**名单**(库里有对应品类行
+        的照旧显示它的库存;没有的还是那张「暂无库存」的空卡片 —— 要在它下面
+        放料,右键卡片「按需建出来」,见 ensure_cat)。
+        """
+        if not self._hidden_cats:
+            self.app.set_status("没有被删掉的标准大类", 4)
+            return
+        names = sorted(self._hidden_cats)
+        if not messagebox.askyesno(
+                "恢复标准大类",
+                "把下面这些标准大类放回库存首页吗?\n\n"
+                + "、".join(names) + "\n\n"
+                "库里没有对应品类的仍旧是空卡片(写着「暂无库存」),"
+                "对着卡片点右键就能按需把这一级建出来。", parent=self):
+            return
+        self._hidden_cats.clear()
+        self._save_cols()
+        self.app.set_status(f"恢复了 {len(names)} 个标准大类", 5)
+        self.reload()
+
     def add_child_cat(self, node):
-        """在某个品类下面新建子品类。加完菜单立刻多一张卡片。"""
+        """在某个品类下面新建子品类。加完菜单立刻多一张卡片。
+
+        node 可能是**库里还没有对应行**的虚拟节点(首页写死的标准大类卡片,
+        见 _menu_node)。那就先问名字,再按需把这一级建出来,最后挂子类 ——
+        顺序不能反:先建父级再问名字的话,用户一按取消就白多出一行。
+        """
         name = ask_text(self, "新增子品类",
                         f"挂在「{node['path']}」下面的新品类叫什么?", "")
         if not name:
             return
+        live = node
+        if node.get("id") is None:
+            live = self.ensure_cat(node["name"])
+            if live is None:
+                return
         res = call(self.con, server.create_category, parent=self,
-                   body={"name": name, "parent_id": node["id"]})
+                   body={"name": name, "parent_id": live["id"]})
         if res is None:
             return
-        self.app.set_status(f"加好了「{node['path']} / {name}」", 5)
+        self.app.set_status(f"加好了「{live['path']} / {name}」", 5)
         self.reload()
 
     def add_sub_here(self):
@@ -1190,6 +1362,8 @@ class ComponentsTab(ttk.Frame):
         self._load_cat_tree()
         live = self._cat_flat.get(node["id"])
         if live is None:
+            # 不许静默返回:点了「新建子类」却什么都没发生,用户只能反复点
+            self.app.set_status(f"「{node.get('name')}」已经不在品类树里了,已经刷新", 6)
             self.reload()
             return
         picked = self.selected_ids()
@@ -1255,6 +1429,11 @@ class ComponentsTab(ttk.Frame):
         确认框里必须把这两句话写出来:用户点「删除」时最怕的就是
         「连子类和料一起没了」,而这里一件都不删。
         """
+        if node.get("id") is None:
+            # 库里没有这一级,「删掉」只能是假的 —— 如实说,不要假装删成功
+            self.app.set_status(
+                f"「{node.get('name')}」在库里还没有这一级,没有可删的东西", 6)
+            return
         kids = node.get("children") or []
         n = int(node.get("total") or 0)
         dest = "上一级" if node.get("parent_id") else "「未分类」"
@@ -1270,7 +1449,14 @@ class ComponentsTab(ttk.Frame):
         res = call(self.con, server.delete_category, parent=self,
                    match=(str(node["id"]),))
         if res is None:
+            # 后端拒了(或被取消)—— 说一句,别让用户以为删掉了
+            self.app.set_status(f"「{node['path']}」没删掉,数据一点没动", 6)
             return
+        # 顶层大类删掉之后必须**记住**:首页那 16 个标准大类的名字是写死的,
+        # 不记的话下一次 reload 又把它画回卡片上 —— 用户看到的就是「删不掉」。
+        if node.get("parent_id") is None and node["name"] in CATEGORY_ORDER:
+            self._hidden_cats.add(node["name"])
+        self._save_cols()
         self.app.set_status(
             f"删掉了。{res.get('moved_components') or 0} 个元件挪到"
             f"「{res.get('to')}」,{res.get('moved_children') or 0} 个子品类"
@@ -1487,13 +1673,22 @@ class ComponentsTab(ttk.Frame):
         real = [c for c in ((meta.get("filters") or {}).get("categories") or []) if c]
         # 品类表里用户自己加的顶层品类也要出现在首页 —— 不然他加完「传感器」
         # 却在首页找不到入口,会以为没加上
+        tops = set()
         try:
             self._load_cat_tree()
-            real = list(real) + [n["name"] for n in self._cat_flat.values()
-                                 if n["parent_id"] is None]
+            tops = {n["name"] for n in self._cat_flat.values() if n["parent_id"] is None}
+            real = list(real) + sorted(tops)
         except Exception:
             pass
-        names = list(CATEGORY_ORDER)
+        # 已经被删掉、名字又回到品类表里的(自己重新建的、或导入 BOM 时在品类
+        # 核对里建出来的),自动放回首页。「删掉的不再长回来」说的是**不许凭空
+        # 冒出一张没有对应行的空卡片**;库里真有这一行了还把它藏起来,那是把
+        # 数据藏起来,比多一张卡片糟得多。
+        revived = {n for n in self._hidden_cats if n in tops}
+        if revived:
+            self._hidden_cats -= revived
+            self._save_cols()
+        names = [c for c in CATEGORY_ORDER if c not in self._hidden_cats]
         names += sorted({c for c in real if c and c not in CATEGORY_ORDER})
         if any(not c.strip() for c in real):
             names.append(UNCATEGORIZED)
@@ -1501,7 +1696,13 @@ class ComponentsTab(ttk.Frame):
 
         self._render_cards()
         n = len(self._all)
-        self.count.set(f"{n} 种在库元件" if n else "还没有元件入库")
+        msg = f"{n} 种在库元件" if n else "还没有元件入库"
+        if self._hidden_cats:
+            # 首页少了卡片必须说一句:用户只知道「少了几张」,不知道是自己删的、
+            # 更不知道怎么找回来(入口在卡片右键菜单里)
+            msg += (f"   已删掉 {len(self._hidden_cats)} 个标准大类"
+                    "(右键卡片可恢复)")
+        self.count.set(msg)
 
         if self.view in ("cat", "pick"):
             if self.current_category in self._card_names:
@@ -1552,6 +1753,33 @@ class ComponentsTab(ttk.Frame):
                           "点开查看 →" if has else "暂无库存", not has))
         self.board.render(specs, empty_text="还没有元件入库。")
 
+    def _row_tags(self, cid, state=None):
+        """这一行该挂哪些 tag —— 用户配的颜色优先(issue #28)。
+
+        **先说清一条硬限制**:ttk.Treeview 只能给**整行**(tag)或**整列**(column)
+        上色,给「某一个单元格」单独上色它做不到。所以这里做的是**按行**刷色
+        (可以选中多行一起设),不要以为能像 Excel 那样选中一格刷一格 ——
+        真要那样,只能自己用 Canvas 画一张表,那是把整个界面重写一遍,不值当。
+        背景色和文字色分开存:只设了文字色的行,背景照旧走原来的规则色。
+
+        内置那两条规则色(out 缺货红底 / low 偏低黄底)也是靠 tag 配背景的。
+        同一行有多个 tag 都配了同一个选项时,谁生效要看 Tk 的 tag 顺序 ——
+        不写死就会变成「有时红有时黄」。所以这里**不赌优先级**:用户明确设过
+        背景色的就以用户为准(那就不再挂那条只配背景色的状态 tag),没设过
+        背景色的才留着状态 tag。一条规则只有一个来源,不打架。
+        """
+        custom = self._row_colors.get(str(cid)) or {}
+        fg, bg = custom.get("fg"), custom.get("bg")
+        tags = []
+        if fg or bg:
+            tag = f"u{cid}"           # 一行一个 tag,各配各的颜色
+            # 空串 = 这一项不设置(Tk 认这个写法),所以只设文字色时背景不受影响
+            self.tree.tag_configure(tag, foreground=fg or "", background=bg or "")
+            tags.append(tag)
+        if state and not bg:
+            tags.append(state)
+        return tuple(tags)
+
     def _insert_component(self, it):
         # 顺序必须和 _build_cat 里的列定义一致 —— 这里是位置参数,不是按名字填的
         self.tree.insert("", "end", iid=str(it["id"]), values=(
@@ -1564,7 +1792,9 @@ class ComponentsTab(ttk.Frame):
               for s in self.ATTR_SLOTS],
             it.get("on_hand") or 0, it.get("min_stock") or 0,
             STATE_LABEL.get(it.get("stock_state"), ""), it.get("note") or ""),
-            tags=(it.get("stock_state") or "",))
+            # 用户配的行颜色按**元件 id**取,所以在哪一页、筛成什么样,
+            # 同一颗料都是同一个颜色
+            tags=self._row_tags(it.get("id"), it.get("stock_state")))
 
     def _cat_rank(self, name):
         """大类的显示顺序:常见元件类排前面,认不出来的按名称排在后面。"""
@@ -1666,8 +1896,13 @@ class ComponentsTab(ttk.Frame):
         return names[:20]
 
     def _col_cfg_path(self):
-        """列设置存哪。放在**数据库文件旁边** —— 那个目录一定可写(程序就在那儿跑),
-        整个文件夹搬走时设置也跟着走,不会丢在别处的用户目录里。"""
+        """列设置(以及行配色、删掉过的标准大类)存哪。
+
+        放在**数据库文件旁边** —— 那个目录一定可写(程序就在那儿跑),
+        整个文件夹搬走时设置也跟着走,不会丢在别处的用户目录里。
+        几个设置共用这一个文件、共用同一套读写:另起一套存储迟早会出现
+        「盖子开了底没盖」那种半保存状态。
+        """
         try:
             row = self.con.execute("PRAGMA database_list").fetchone()
             path = row[2] if row else ""
@@ -1683,8 +1918,15 @@ class ComponentsTab(ttk.Frame):
             return
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(db.dump_params({"cols": self._want_cols,
-                                        "zero_stock": bool(self.zero_stock.get())}))
+                f.write(db.dump_params({
+                    "cols": self._want_cols,
+                    "zero_stock": bool(self.zero_stock.get()),
+                    # 行配色:键是元件 id 的字符串(JSON 的键只能是字符串),
+                    # 值形如 {"fg": "#rrggbb", "bg": null}
+                    "row_colors": self._row_colors,
+                    # 删掉过的标准大类名 —— 名单是写死的,不记就自己长回来
+                    "hidden_cats": sorted(self._hidden_cats),
+                }))
         except OSError:
             pass              # 存不下就只影响"下次记住",不该弹错误打断人
 
@@ -1695,8 +1937,26 @@ class ComponentsTab(ttk.Frame):
         try:
             with open(path, encoding="utf-8") as f:
                 cfg = db.parse_params(f.read())
-        except OSError:
+        except (OSError, ValueError):
             return
+        if not isinstance(cfg, dict):     # 文件被人改坏了也当没有,别打断启动
+            return
+        # ---- 行配色。坏了 / 类型不对就当没有,不能因为一个配置文件启动不了
+        raw_colors = cfg.get("row_colors")
+        if isinstance(raw_colors, dict):
+            colors = {}
+            for key, val in raw_colors.items():
+                if not isinstance(val, dict):
+                    continue
+                fg = val.get("fg") or None
+                bg = val.get("bg") or None
+                if fg or bg:
+                    colors[str(key)] = {"fg": fg, "bg": bg}
+            self._row_colors = colors
+        # ---- 删掉过的标准大类。只认字符串,空名字丢掉
+        raw_hidden = cfg.get("hidden_cats")
+        if isinstance(raw_hidden, list):
+            self._hidden_cats = {str(x) for x in raw_hidden if str(x).strip()}
         if "zero_stock" in cfg:
             self.zero_stock.set(bool(cfg.get("zero_stock")))
         want = cfg.get("cols")
@@ -1846,6 +2106,8 @@ class ComponentsTab(ttk.Frame):
     def delete(self):
         cid = self.selected_id()
         if not cid:
+            # 不许静默返回:右键菜单里点了「删除」却没反应,用户只会再点几次
+            self.app.set_status("请先选中要删的元件(也可以按住 Ctrl / Shift 多选)", 5)
             return
         item = self._rows.get(cid) or {}
         name = item.get("name") or f"#{cid}"
@@ -1860,10 +2122,67 @@ class ComponentsTab(ttk.Frame):
                 res = call(self.con, server.delete_component, query={"force": "1"},
                            match=(cid,), parent=self, quiet=True)
                 if res is None:
+                    self.app.set_status(f"「{name}」没删掉,数据一点没动", 6)
                     return
             else:
+                self.app.set_status(f"「{name}」没删,数据一点没动", 5)
                 return
+        self.app.set_status(f"删掉了元件「{name}」", 5)
         self.app.refresh_all()
+
+    # ------------------------------------------------------ 行配色(#28)
+
+    def pick_row_color(self, which):
+        """给选中的行设文字色 / 背景色(which = "fg" / "bg")。
+
+        用标准库的 colorchooser(系统调色板),零依赖。取色对话框返回
+        ((r,g,b), "#rrggbb");用户点取消时返回 (None, None),那就什么都不改。
+        """
+        ids = self.selected_ids()
+        if not ids:
+            self.app.set_status("先选中要上色的行(按住 Ctrl / Shift 可以选多行)", 5)
+            return
+        title = "选文字颜色" if which == "fg" else "选背景色"
+        _rgb, picked = colorchooser.askcolor(parent=self, title=title)
+        if not picked:
+            return                       # 用户取消了,不改任何东西
+        picked = str(picked)
+        for cid in ids:
+            slot = self._row_colors.setdefault(str(cid), {"fg": None, "bg": None})
+            slot[which] = picked
+        self._save_cols()
+        self._recolor_rows(ids)
+        what = "文字颜色" if which == "fg" else "背景色"
+        self.app.set_status(f"{len(ids)} 行的{what}设成了 {picked}", 5)
+
+    def clear_row_colors(self):
+        """把选中行的自定义配色清掉,回到默认(含内置的规则色)。"""
+        ids = self.selected_ids()
+        if not ids:
+            self.app.set_status("先选中要清除配色的行", 5)
+            return
+        n = sum(1 for cid in ids if self._row_colors.pop(str(cid), None))
+        self._save_cols()
+        self._recolor_rows(ids)
+        if n:
+            self.app.set_status(f"{n} 行的自定义配色清掉了,回到默认", 5)
+        else:
+            self.app.set_status("选中的行本来就没有自定义配色", 4)
+
+    def _recolor_rows(self, ids):
+        """就地换掉这几行的 tag。
+
+        故意**不整表重建**:重建会顺手把选中、右边「仓位分布 / 最近流水」一起
+        清掉,刷个颜色还把用户挑好的行弄丢是最招人烦的。
+        内置规则色跟着改回来,靠的还是 _row_tags 那一套(用户没设背景就还给
+        规则色)。
+        """
+        for cid in ids:
+            iid = str(cid)
+            if not self.tree.exists(iid):
+                continue
+            it = self._rows.get(cid) or {}
+            self.tree.item(iid, tags=self._row_tags(cid, it.get("stock_state")))
 
 
 # --------------------------------------------------------------------- 出入库
@@ -1878,8 +2197,15 @@ class ColumnPickDialog(tk.Toplevel):
     """列管理:显示哪些列、按什么顺序。
 
     用户的原话:「重要的东西显示在前面,不要的就用户自己隐藏掉」「显示的顺序也要
-    可调,我想把耐压放在前面我就放在前面」。所以这里是一张**能勾、能上下挪**的清单,
+    可调,我想把耐压放在前面我就放在前面」。所以这里是一张**能勾、能挪**的清单,
     而不是一排写死的复选框。
+
+    挪有两种办法,都得留着:
+      * ↑ ↓ 按钮 —— 一格一格挪,一次只动一位,手不离开键盘也能用;
+      * 按住一行上下拖 —— 直接拖到目标位置(见 _drag_* 那几个方法)。
+
+    #26 加拖动时特意**没有动** ↑↓:一次挪好几位的场景拖动快得多,而「就差一位」
+    的时候按钮比精确拖动省事(也不容易拖过头),两个入口各有各的用处。
     """
 
     def __init__(self, parent, current, pool, base, default):
@@ -1892,30 +2218,47 @@ class ColumnPickDialog(tk.Toplevel):
         self._base = dict(base)
         self._default = list(default)
         self._shown = [str(s) for s in current]
+        # 拖动的状态。_drag_i 是「按下的那一行」在 self.items 里的下标,
+        # _drag_slot 是「松手会插到第几格」(0..len(items))。松手前不动
+        # self.items —— 拖动过程中表里行的 iid 就是下标,先把表改了的话
+        # 下标全乱,后面每一次 motion 都得重新找自己拖的是哪一行。
+        self._drag_i = None
+        self._drag_slot = None
 
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
         ttk.Label(body,
-                  text="双击一行 = 显示 / 隐藏;选一行用 ↑ ↓ 调顺序(越靠上,表格里越靠左):",
+                  text="双击一行 = 显示 / 隐藏;按住一行上下拖 = 调顺序;"
+                       "也可以用 ↑ ↓ 一格一格挪(越靠上,表格里越靠左):",
                   style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
 
         wrap = ttk.Frame(body)
         wrap.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(wrap, columns=("mark", "name", "where"),
                                  show="headings", height=14, selectmode="browse")
-        for key, title, wdt, anc in (("mark", "显示", 46, "center"),
-                                     ("name", "列名", 170, "w"),
-                                     ("where", "来源", 70, "center")):
-            self.tree.heading(key, text=title)
-            self.tree.column(key, width=wdt, anchor=anc, stretch=(key == "name"))
+        # 对齐一律居中(#27)。这里原来是「显示」居中、「列名」左对齐、「来源」居中,
+        # 一张表里就混着两种;列定义里那个对齐位不再需要了。
+        for key, title, wdt in (("mark", "显示", 46),
+                                ("name", "列名", 170),
+                                ("where", "来源", 70)):
+            self.tree.heading(key, text=title, anchor="center")
+            self.tree.column(key, width=wdt, anchor="center", stretch=(key == "name"))
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
+        # 拖动时那条插入位置指示线。做成一条独立的小控件压在表格上,而不是给
+        # 目标行换底色:换底色说不清是插在它上面还是下面,而拖到列表末尾时
+        # 根本没有「目标行」可以高亮 —— 那种「拖到最后一位」恰恰是最常见的操作。
+        # 它平时 place_forget(),只在拖动中露脸。
+        self.line = tk.Frame(wrap, height=2, bg="#2f6fd0", bd=0, highlightthickness=0)
         self.tree.bind("<Double-1>", self._toggle)
         self.tree.bind("<space>", self._toggle)
+        self.tree.bind("<ButtonPress-1>", self._drag_begin)
+        self.tree.bind("<B1-Motion>", self._drag_motion)
+        self.tree.bind("<ButtonRelease-1>", self._drag_end)
 
         # 清单 = 已显示的(按用户顺序)在前,其余基础列 / 属性列排后面
         rest = self._default + ["@" + n for n in pool]
@@ -1993,6 +2336,7 @@ class ColumnPickDialog(tk.Toplevel):
             self._shown.remove(spec)
         else:
             self._shown.append(spec)
+        self._synced_shown()
         self._refresh()
 
     def _move(self, d):
@@ -2003,9 +2347,100 @@ class ColumnPickDialog(tk.Toplevel):
         if not 0 <= j < len(self.items):
             return
         self.items[i], self.items[j] = self.items[j], self.items[i]
+        self._synced_shown()
         self._refresh()
         self.tree.selection_set(str(j))
         self.tree.see(str(j))
+
+    # ---------------------------------------------------------- 拖动调序(#26)
+
+    def _drag_begin(self, event):
+        """按下一行 = 准备拖它。此刻只记「拖的是哪一行」,不动清单。"""
+        iid = self.tree.identify_row(event.y)
+        self._drag_slot = None
+        self._drag_i = int(iid) if str(iid).isdigit() else None
+        if self._drag_i is not None:
+            # 按下的行先选中:拖着的时候一眼看得出拖的是哪一行
+            self.tree.selection_set(iid)
+
+    def _drag_motion(self, event):
+        if self._drag_i is None:
+            return
+        # 拖到框子上沿 / 下沿就自动滚一屏 —— 属性列可以加到十几个,14 行的框
+        # 装不下,不滚的话远处的行根本拖不到。
+        h = self.tree.winfo_height()
+        if event.y < 14:
+            self.tree.yview_scroll(-1, "units")
+        elif event.y > h - 14:
+            self.tree.yview_scroll(1, "units")
+        slot, y = self._slot_at(event.y)
+        if slot != self._drag_slot:
+            self._drag_slot = slot
+            self._show_line(y)
+
+    def _drag_end(self, _event=None):
+        src, slot = self._drag_i, self._drag_slot
+        self._drag_i = self._drag_slot = None
+        self.line.place_forget()
+        if src is None or slot is None:
+            return          # 只是点了一下,没拖
+        # slot 是「插到老清单的第几格之前」。把自己抽走之后,它后面的下标都会
+        # 往前挪一格,所以目标在身后时要减一 —— 不减的话往下拖会少走一位。
+        if slot > src:
+            slot -= 1
+        if slot == src:
+            return          # 原地放下(包括拖回自己头上),什么都不用做
+        spec = self.items.pop(src)
+        self.items.insert(slot, spec)
+        # 勾选状态跟「哪些被勾上」走,不跟位置走:拖动只改顺序,原来勾着的
+        # 拖完还得勾着(#26 的硬要求)。顺便把 _shown 也按新顺序摆好 ——
+        # 它的顺序不影响确定后的结果(结果按 items 的顺序取,见 _ok),
+        # 但两份清单顺序一致,以后读代码的人不用再去分辨哪份说了算。
+        self._synced_shown()
+        self._refresh()
+        self.tree.selection_set(str(slot))
+        self.tree.see(str(slot))
+
+    def _slot_at(self, y):
+        """y 处松手会插到第几格(0..len(items)),以及指示线该画在多高。
+
+        按「行的上半 / 下半」决定插在它前面还是后面,和大多数列表一样:
+        光标落在上半就是插到这一行前面,落在下半就是插到它后面。这样一条
+        指示线就能把落点说清楚,不会出现「拖到某一行上,到底插前还是插后」。
+        """
+        iid = self.tree.identify_row(y)
+        if str(iid).isdigit():
+            k = int(iid)
+            bb = self.tree.bbox(iid)
+            if bb:
+                top, height = bb[1], bb[3]
+                if y >= top + height // 2:
+                    return k + 1, top + height
+                return k, top
+            return k, None
+        # 落在行与行之间的空白(或表格下沿的空白)上:靠上就是最前,靠下就是最后
+        kids = self.tree.get_children()
+        if not kids:
+            return 0, None
+        top_bb = self.tree.bbox(kids[0])
+        end_bb = self.tree.bbox(kids[-1])
+        if top_bb and y < top_bb[1]:
+            return 0, top_bb[1]
+        if end_bb:
+            return len(self.items), end_bb[1] + end_bb[3]
+        return len(self.items), None
+
+    def _show_line(self, y):
+        if y is None:
+            self.line.place_forget()
+            return
+        width = self.tree.winfo_width()
+        self.line.place(x=0, y=max(0, y - 1), width=width, height=2)
+        self.line.lift()
+
+    def _synced_shown(self):
+        """把 _shown 按 items 的顺序重摆一遍(只动顺序,不动勾没勾)。"""
+        self._shown = [s for s in self.items if s in self._shown]
 
     def _all(self, state):
         self._shown = list(self.items) if state else []
@@ -2035,6 +2470,10 @@ class ColumnPickDialog(tk.Toplevel):
         self.tree.see(str(self.items.index(spec)))
 
     def _ok(self):
+        # 结果按 self.items 的顺序取 —— 它就是清单上从上到下的那个可见顺序,
+        # 所以拖动改的是 items,确定之后表格那一列序就跟着变。_shown 只回答
+        # 「勾没勾」(以及一键全选/恢复默认时的集合),不要拿它的顺序当列序:
+        # 它是「先勾谁谁在前」的追加顺序,和用户眼睛看到的顺序不是一回事。
         picked = [s for s in self.items if s in self._shown]
         self.result = picked or None      # 一列都不勾 = 恢复默认
         self.done = True
@@ -3077,7 +3516,8 @@ class CategoryManagerDialog(tk.Toplevel):
         ttk.Label(body, text="品类是「按品类找料」和库存菜单的基础。加几级就有几级菜单。",
                   style="Dim.TLabel").pack(anchor="w", pady=(0, 6))
         frame, self.tree = make_tree(body, self.COLS, height=12, show="tree headings")
-        self.tree.column("#0", width=180, anchor="w", stretch=True)
+        # #0 树列不在 columns 里,make_tree 管不到它,得单独改成居中(#27)
+        self.tree.column("#0", width=180, anchor="center", stretch=True)
         frame.pack(fill="both", expand=True)
 
         bar = ttk.Frame(body)
@@ -3486,11 +3926,12 @@ class BomPickPane(BomPaneBase):
 
     def build_tree(self):
         f, t = make_tree(self, self.COLS, height=13, show="tree headings")
-        t.heading("#0", text="BOM 需求 ↓ 能凑它的库存料")
+        t.heading("#0", text="BOM 需求 ↓ 能凑它的库存料", anchor="center")
         # 列宽账(和左边项目列表在同一个 Panedwindow 里,请求宽度涨了左边就被挤):
         # 非拉伸 440 + 参数 104 + 树列 + 「像在哪儿」要 <= 加列之前的 804,
         # 否则连左边那张只剩 2px 余量的项目表都会一起超。150 + 110 正好补齐。
-        t.column("#0", width=150, anchor="w", stretch=True)
+        # #0 树列不在 COLS 里,make_tree 管不到它,单独改成居中(#27)
+        t.column("#0", width=150, anchor="center", stretch=True)
         t.tag_configure("line", background="#eef4fb")
         t.tag_configure("covered", foreground="#1e7a34")
         # 封装和这条需求一模一样的候选:能直接装上去,发错货的重灾区就在
@@ -3974,6 +4415,164 @@ class MovePane(ttk.Frame):
         undo_movement(self, self.app, int(sel[0]), label)
 
 
+# --------------------------------------------------------------- 流水按项目折叠
+
+#: 没挂项目的流水(日常补货 / 领用)归到这一组。用户的话是「单独归成一组」。
+NONE_GROUP = "(不开项目)"
+
+
+class MovementGroups:
+    """把「按项目折叠的流水表」这套行为收在一处(#30)。
+
+    「流水」页(全部动作)和「出入库」页的入库流水 / 出库流水,原本都是同一张
+    把所有流水按时间倒序平铺的长表:不同项目的料混在一起,项目一多就没法看。
+    用户原话是「不然看着太乱了,一直展开在那边」—— 所以按项目分组,而且
+    **默认收着**,想看哪个项目再点开。
+
+    为什么抽成一个类、而不是三个页签各写一份:折叠 / 展开、组行的样子、
+    「撤销」必须跳过组行 —— 这几件事在三处必须一模一样,不然用户在「流水」页
+    学会的动作,到「入库流水」页就不灵了。
+
+    折叠状态存在这个对象里(也就是页签对象里),刷新、撤销、切页签都不会把
+    用户收好的组又弹开;关掉程序才忘掉 —— 用户要的就是「别每次刷新都弹回全展开」。
+    """
+
+    #: 组行 iid 的前缀。流水行的 iid 就是流水 id(纯数字),两者不会撞。
+    PREFIX = "g"
+
+    def __init__(self, tree, columns):
+        self.tree = tree
+        self.columns = list(columns)
+        #: 展开着的组键。空集 = 全收着,这就是默认状态
+        self.expanded = set()
+        #: [(组键, 组行 iid, 组名, [该组的流水 id...]), ...],按组第一次出现的先后
+        self.groups = []
+        self._blank = ("",) * len(self.columns)
+        # 组行要有别于流水行的样子 —— 没有底色的话它读起来就是一行内容空了大半的
+        # 流水,「点它能展开」这件事根本看不出来
+        tree.tag_configure("pgroup", background="#e6eef9", foreground="#1f3a5f")
+        # 鼠标点击那条路在 _on_click 里记账;键盘(空格 / 回车)和直接点小三角
+        # 由 ttk 自己处理,我们接不到 —— 那种情况靠重建前的 _harvest() 兜住。
+        tree.bind("<Button-1>", self._on_click, add="+")
+
+    # ---------------------------------------------------------------- 查
+    @staticmethod
+    def key_of(mv):
+        """把一笔流水归到哪一组。没挂项目的那些全归 0 号组。"""
+        # 项目 id 从 1 开始(自增主键),所以 0 当「不开项目」这个哨兵不会跟谁撞
+        return mv.get("project_id") or 0
+
+    @staticmethod
+    def name_of(mv):
+        return mv.get("project_name") or NONE_GROUP
+
+    def is_group(self, iid):
+        return str(iid).startswith(self.PREFIX)
+
+    def group_count(self):
+        return len(self.groups)
+
+    def row_ids(self):
+        """表里**真正的流水行**(不含组行)的 iid,按显示顺序。
+
+        撤销、断言都走这个:组行不是任何一笔账,拿它去撤销只会补出一笔
+        莫名其妙的流水。组行收着的时候它的子行其实没显示出来,但它们在表里
+        就是存在的,所以这里一律算上。
+        """
+        out = []
+        for _key, _gid, _name, ids in self.groups:
+            out += ids
+        return out
+
+    # ---------------------------------------------------------------- 画
+    def _harvest(self):
+        """重建之前,先把树上真实的展开状态收回来。
+
+        用户不一定走我们那个点击处理:键盘的空格 / 回车、或者直接点组名前面
+        那个小三角,都是 ttk 自己处理的。与其去追每一种交互(漏一个的表现就是
+        「我明明收起来了,一刷新又弹开」),不如在重建前以树上真实的 -open 为准。
+        """
+        for key, gid, _name, _ids in self.groups:
+            if not self.tree.exists(gid):
+                continue
+            if self.tree.item(gid, "open"):
+                self.expanded.add(key)
+            else:
+                self.expanded.discard(key)
+
+    def render(self, items, values_of, tags_of):
+        """items 是 list_movements 那一份;values_of / tags_of 由页签自己给。
+
+        三个页签的列不一样(「流水」页还有动作全称和「移到」,入库流水没有),
+        分组逻辑却是同一套,所以单元格的内容让调用方算,这里只管层次。
+        """
+        self._harvest()
+        clear_tree(self.tree)
+        self.groups = []
+        order, bucket = [], {}
+        for mv in items:
+            key = self.key_of(mv)
+            if key not in bucket:
+                bucket[key] = []
+                order.append(key)
+            bucket[key].append(mv)
+        for key in order:
+            rows = bucket[key]
+            gid = f"{self.PREFIX}{key}"
+            # 流水 id 统一存成字符串:它就是树里的 iid,tree.insert 收进去、
+            # tree.get_children 吐出来都是字符串,别在这里一会儿 int 一会儿 str
+            self.groups.append((key, gid, self.name_of(rows[0]),
+                                [str(mv["id"]) for mv in rows]))
+            self._put_group(gid, key, self.name_of(rows[0]), len(rows))
+            for mv in rows:
+                self.tree.insert(gid, "end", iid=str(mv["id"]),
+                                 values=values_of(mv), tags=tags_of(mv))
+
+    def _put_group(self, gid, key, name, n):
+        open_ = key in self.expanded
+        self.tree.insert("", "end", iid=gid, open=open_, tags=("pgroup",),
+                         text=f"{'▼' if open_ else '▶'} {name}({n} 笔)",
+                         values=self._blank)
+
+    def _relabel(self, key):
+        """展开 / 收起之后更新组行上的箭头。笔数不用重算,它没变。"""
+        for k, gid, name, ids in self.groups:
+            if k == key:
+                open_ = k in self.expanded
+                self.tree.item(gid, open=open_,
+                               text=f"{'▼' if open_ else '▶'} {name}({len(ids)} 笔)")
+                return
+
+    # ---------------------------------------------------------------- 折叠
+    def toggle(self, iid):
+        key = self._key_of_iid(iid)
+        if key is None:
+            return False
+        if key in self.expanded:
+            self.expanded.discard(key)
+        else:
+            self.expanded.add(key)
+        self._relabel(key)
+        return True
+
+    def _key_of_iid(self, iid):
+        for key, gid, _name, _ids in self.groups:
+            if gid == str(iid):
+                return key
+        return None
+
+    def _on_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid or not self.is_group(iid):
+            return None
+        self.toggle(iid)
+        # 吃掉这次点击。不挡的话 ttk 自己的 Press 绑定还会再切一次(点了等于
+        # 没点),而且组行会被选中 —— 「撤销」只该针对具体某一笔流水,不该有
+        # 「正好选中了组行」这种状态。键盘上下键仍然能把选中挪到组行上,
+        # 那种情况由 undo() 里那道判断兜住。
+        return "break"
+
+
 class StockTab(ttk.Frame):
     """出入库 —— 只查账,不开单。
 
@@ -3989,6 +4588,19 @@ class StockTab(ttk.Frame):
 
     ACTIONS = (("IN", "入库流水"), ("OUT", "出库流水"))
     ALL, NONE_PROJ = "全部项目", "不指定项目"
+
+    # 列定义:(键, 标题, 宽度[, 是否随窗口伸缩])。对齐不在这里写 —— 一律居中(#27)。
+    # 有两个地方按列名取列号(填行、撤销时读文案),所以列顺序改了这里一起改就够。
+    COLS = [
+        ("created_at", "时间", 145),
+        ("kind", "动作", 96),
+        ("component_name", "元件", 190, True),
+        ("lcsc_pn", "商品编号", 88),
+        ("qty", "数量", 52),
+        ("location_code", "仓位", 86),
+        ("operator", "操作人", 76),
+        ("note", "备注", 190, True),
+    ]
 
     def __init__(self, parent, app: App):
         super().__init__(parent, padding=8)
@@ -4024,20 +4636,17 @@ class StockTab(ttk.Frame):
         ttk.Label(self, textvariable=self.summary, style="Dim.TLabel",
                   justify="left").pack(anchor="w", pady=(0, 4))
 
-        f, self.tree = make_tree(self, [
-            ("created_at", "时间", 145, "center"),
-            ("kind", "动作", 96, "center"),
-            ("component_name", "元件", 190, "w", True),
-            ("lcsc_pn", "商品编号", 88, "center"),
-            ("qty", "数量", 52, "e"),
-            ("location_code", "仓位", 86, "w"),
-            ("project_name", "项目", 130, "w", True),
-            ("operator", "操作人", 76, "center"),
-            ("note", "备注", 190, "w", True)], height=20)
+        f, self.tree = make_tree(self, self.COLS, height=20, show="tree headings")
+        # #0 树列放项目名 —— 这一页现在按项目分组(#30),项目名属于「组」这一层,
+        # 不再是每一行的内容,所以原来那列 130px 的「项目」就撤掉了:组行上已经
+        # 写着是哪个项目,每行再重复一遍既占宽度又吵。
+        self.tree.heading("#0", text="项目", anchor="center")
+        self.tree.column("#0", width=150, anchor="center", stretch=False)
         f.pack(fill="both", expand=True)
         # 撤销过的淡掉但不隐藏 —— 历史要看得见,只是别再当它是有效的
         self.tree.tag_configure("voided", foreground="#95a5a6")
         self.tree.tag_configure("reversal", foreground="#2471a3")
+        self.groups = MovementGroups(self.tree, self.COLS)
 
         self.set_action("IN")
 
@@ -4072,33 +4681,40 @@ class StockTab(ttk.Frame):
                 query["project_id"] = str(hit[0]["id"])
         data = call(self.con, server.list_movements, query=query, quiet=True) or {}
         items = data.get("items") or []
-        clear_tree(self.tree)
-        for mv in items:
+
+        def values_of(mv):
             # 「动作」列不是多余的:撤销一笔出库补的是入库、撤销一笔入库补的是出库,
             # 所以这一页里混着正常流水和反向流水,得一眼分得清。
             kind_txt = KIND_LABEL.get(mv.get("kind"), mv.get("kind"))
             if mv.get("voided"):
                 kind_txt += "(已撤销)"
-                tags = ("voided",)
             elif mv.get("void_of"):
                 kind_txt += "·撤销"
-                tags = ("reversal",)
-            else:
-                tags = ()
-            self.tree.insert("", "end", iid=str(mv["id"]), values=(
-                (mv.get("created_at") or "")[:19], kind_txt,
-                mv.get("component_name") or "",
-                mv.get("lcsc_pn") or "", mv.get("qty") or 0,
-                mv.get("location_code") or "", mv.get("project_name") or "—",
-                mv.get("operator") or "", mv.get("note") or ""), tags=tags)
+            return ((mv.get("created_at") or "")[:19], kind_txt,
+                    mv.get("component_name") or "", mv.get("lcsc_pn") or "",
+                    mv.get("qty") or 0, mv.get("location_code") or "",
+                    mv.get("operator") or "", mv.get("note") or "")
+
+        def tags_of(mv):
+            if mv.get("voided"):
+                return ("voided",)
+            if mv.get("void_of"):
+                return ("reversal",)
+            return ()
+
+        self.groups.render(items, values_of, tags_of)
         voided = sum(1 for mv in items if mv.get("voided"))
         total = sum(int(mv.get("qty") or 0) for mv in items if not mv.get("voided"))
         label = dict(self.ACTIONS)[self.action]
         hidden = (f"另有 {idle} 个项目还没有{'入库' if self.action == 'IN' else '出库'}"
                   f"记录,没列进下拉。" if idle else "")
+        # 摘要里报一句分了多少组:分组之后一进来只看得到几条组行,不说明的话
+        # 会有人以为「我的流水怎么只剩这么几条了」
         self.summary.set(
             f"{label} {len(items)} 条" + (f"(其中已撤销 {voided} 条)" if voided else "")
-            + f",有效合计 {total} 个。" + hidden
+            + f",按项目分 {self.groups.group_count()} 组,有效合计 {total} 个。"
+            + "点项目那一行可以展开 / 收起(默认收着)。"
+            + hidden
             + "　这一页只查账 —— 真正的入库/出库在「项目 BOM」页里做,"
               + "盘点/移库在「流水」页.")
 
@@ -4111,11 +4727,24 @@ class StockTab(ttk.Frame):
         if not sel:
             messagebox.showinfo("提示", "先点一行要撤销的记录。", parent=self)
             return
-        vals = self.tree.item(sel[0], "values")
-        label = (f"{vals[1]}  {vals[2]}  {vals[4]} 个  {vals[5]}\n{vals[0]}")
-        if vals[8]:
-            label += f"\n{vals[8]}"
-        undo_movement(self, self.app, int(sel[0]), label)
+        iid = str(sel[0])
+        if self.groups.is_group(iid):
+            # 组行是「哪个项目」那一层,不是任何一笔账。拿它去撤销只会补出一笔
+            # 莫名其妙的流水,所以挡住并说清下一步怎么做。
+            messagebox.showinfo("提示", "这是一行项目分组,不是某一笔流水。\n"
+                                        "点开它,选中下面具体的那一笔再撤销。",
+                                parent=self)
+            return
+        vals = self.tree.item(iid, "values")
+        label = (f"{vals[col_index(self.COLS, 'kind')]}  "
+                 f"{vals[col_index(self.COLS, 'component_name')]}  "
+                 f"{vals[col_index(self.COLS, 'qty')]} 个  "
+                 f"{vals[col_index(self.COLS, 'location_code')]}\n"
+                 f"{vals[col_index(self.COLS, 'created_at')]}")
+        note = vals[col_index(self.COLS, "note")]
+        if note:
+            label += f"\n{note}"
+        undo_movement(self, self.app, int(iid), label)
 
 
 # --------------------------------------------------------------------- 项目 BOM
@@ -4915,6 +5544,27 @@ def undo_movement(parent, app: App, mid: int, label=None) -> bool:
 
 
 class MovementsTab(ttk.Frame):
+    """流水 —— 所有动作的账本,按项目折叠(#30)。
+
+    原本这里把所有流水按时间倒序平铺成一张长表:不同项目的料混在一起,
+    项目一多就完全看不出谁是谁的。现在每个项目一个可折叠的组行,
+    组行上写着项目名和笔数,**默认全收着** —— 用户原话「不然看着太乱了,
+    一直展开在那边」。
+    """
+
+    # 列定义:(键, 标题, 宽度[, 是否随窗口伸缩])。对齐一律居中(#27)。
+    COLS = [
+        ("created_at", "时间", 145),
+        ("kind", "动作", 100),
+        ("component_name", "元件", 175),
+        ("lcsc_pn", "商品编号", 88),
+        ("qty", "数量", 55),
+        ("location_code", "仓位", 90),
+        ("to_location_code", "移到", 90),
+        ("operator", "操作人", 80),
+        ("note", "备注", 200, True),
+    ]
+
     def __init__(self, parent, app: App):
         super().__init__(parent, padding=8)
         self.app = app
@@ -4934,23 +5584,22 @@ class MovementsTab(ttk.Frame):
         ttk.Combobox(bar, textvariable=self.limit, width=6, state="readonly",
                      values=["100", "300", "1000", "5000"]).pack(side="left", padx=(0, 10))
         ttk.Button(bar, text="刷新", command=self.reload).pack(side="left")
+        # 折叠是这次新加的,界面上得有一句话告诉用户「组行是可以点的」——
+        # 光靠一个 ▶ 小三角,不一定有人会去点它
+        ttk.Label(bar, text="点项目那一行可以展开 / 收起(默认收着)",
+                  style="Dim.TLabel").pack(side="left", padx=10)
         ttk.Button(bar, text="↶ 撤销选中的记录", command=self.undo).pack(side="right")
 
-        f, self.tree = make_tree(self, [
-            ("created_at", "时间", 145, "center"),
-            ("kind", "动作", 100, "center"),
-            ("component_name", "元件", 175, "w"),
-            ("lcsc_pn", "商品编号", 88, "center"),
-            ("qty", "数量", 55, "e"),
-            ("location_code", "仓位", 90, "w"),
-            ("to_location_code", "移到", 90, "w"),
-            ("project_name", "项目", 120, "w"),
-            ("operator", "操作人", 80, "center"),
-            ("note", "备注", 200, "w")], height=22)
+        f, self.tree = make_tree(self, self.COLS, height=22, show="tree headings")
+        # #0 树列放项目名。原来那列 120px 的「项目」撤掉了:分组之后项目名就是
+        # 组行的名字,每一行再重复一遍既占宽度又吵(和「出入库」页一个道理)。
+        self.tree.heading("#0", text="项目", anchor="center")
+        self.tree.column("#0", width=150, anchor="center", stretch=False)
         f.pack(fill="both", expand=True)
         # 撤销过的记录淡掉但不隐藏 —— 历史要看得见,只是别再当它是有效的
         self.tree.tag_configure("voided", foreground="#95a5a6")
         self.tree.tag_configure("reversal", foreground="#2471a3")
+        self.groups = MovementGroups(self.tree, self.COLS)
 
     def reload(self):
         query = {"limit": self.limit.get()}
@@ -4960,35 +5609,51 @@ class MovementsTab(ttk.Frame):
         data = call(self.con, server.list_movements, query=query, quiet=True)
         if data is None:
             return
-        clear_tree(self.tree)
-        for mv in data["items"]:
+
+        def values_of(mv):
             kind_txt = KIND_LABEL.get(mv.get("kind"), mv.get("kind"))
             if mv.get("voided"):
                 kind_txt += "(已撤销)"
-                tags = ("voided",)
             elif mv.get("void_of"):
                 kind_txt += "·撤销"
-                tags = ("reversal",)
-            else:
-                tags = ()
-            self.tree.insert("", "end", iid=str(mv["id"]), values=(
-                (mv.get("created_at") or "")[:19], kind_txt,
-                mv.get("component_name") or "", mv.get("lcsc_pn") or "",
-                mv.get("qty") or 0, mv.get("location_code") or "",
-                mv.get("to_location_code") or "", mv.get("project_name") or "",
-                mv.get("operator") or "", mv.get("note") or ""), tags=tags)
+            return ((mv.get("created_at") or "")[:19], kind_txt,
+                    mv.get("component_name") or "", mv.get("lcsc_pn") or "",
+                    mv.get("qty") or 0, mv.get("location_code") or "",
+                    mv.get("to_location_code") or "", mv.get("operator") or "",
+                    mv.get("note") or "")
+
+        def tags_of(mv):
+            if mv.get("voided"):
+                return ("voided",)
+            if mv.get("void_of"):
+                return ("reversal",)
+            return ()
+
+        self.groups.render(data["items"], values_of, tags_of)
 
     def undo(self):
         sel = self.tree.selection()
         if not sel:
             messagebox.showinfo("提示", "先点一行要撤销的记录。", parent=self)
             return
-        mid = int(sel[0])
-        vals = self.tree.item(sel[0], "values")
-        label = f"{vals[1]}  {vals[2]}  {vals[4]} 个  {vals[5]}\n{vals[0]}"
-        if vals[9]:
-            label += f"\n{vals[9]}"
-        undo_movement(self, self.app, mid, label)
+        iid = str(sel[0])
+        if self.groups.is_group(iid):
+            # 组行不是任何一笔账 —— 撤销是这套东西里唯一会改动已记下历史的操作,
+            # 更不能让它落在一个「一行文字」上
+            messagebox.showinfo("提示", "这是一行项目分组,不是某一笔流水。\n"
+                                        "点开它,选中下面具体的那一笔再撤销。",
+                                parent=self)
+            return
+        vals = self.tree.item(iid, "values")
+        label = (f"{vals[col_index(self.COLS, 'kind')]}  "
+                 f"{vals[col_index(self.COLS, 'component_name')]}  "
+                 f"{vals[col_index(self.COLS, 'qty')]} 个  "
+                 f"{vals[col_index(self.COLS, 'location_code')]}\n"
+                 f"{vals[col_index(self.COLS, 'created_at')]}")
+        note = vals[col_index(self.COLS, "note")]
+        if note:
+            label += f"\n{note}"
+        undo_movement(self, self.app, int(iid), label)
 
 
 # --------------------------------------------------------------------- 仓位
@@ -5027,17 +5692,18 @@ class LocationsTab(ttk.Frame):
 
         left = ttk.LabelFrame(pane, text="仓位结构", padding=6)
         frame = ttk.Frame(left)
-        cols = (("kinds", "存放元件", 80, "e"), ("qty", "数量", 70, "e"),
-                ("structural", "类型", 60, "center"), ("note", "备注", 150, "w"))
+        cols = (("kinds", "存放元件", 80), ("qty", "数量", 70),
+                ("structural", "类型", 60), ("note", "备注", 150))
         # 这一处必须用 show="tree headings"(要 #0 树列来显示层级),
         # 而 make_tree 是按平表写的,所以这里自己搭。
         tree = ttk.Treeview(frame, columns=[c[0] for c in cols], height=22,
                             show="tree headings")
-        tree.heading("#0", text="仓位")
-        tree.column("#0", width=200, anchor="w", stretch=False)
-        for key, title, width, anchor in cols:
-            tree.heading(key, text=title)
-            tree.column(key, width=width, anchor=anchor, stretch=(key == "note"))
+        tree.heading("#0", text="仓位", anchor="center")
+        tree.column("#0", width=200, anchor="center", stretch=False)
+        for key, title, width in cols:
+            # 对齐一律居中,见 make_tree 上面那段说明(#27)
+            tree.heading(key, text=title, anchor="center")
+            tree.column(key, width=width, anchor="center", stretch=(key == "note"))
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
         tree.grid(row=0, column=0, sticky="nsew")
