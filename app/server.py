@@ -86,8 +86,10 @@ def start_idle_watchdog(seconds: int) -> None:
 # 哪些品类」的唯一来源,两处各维护一份的话,上游认出来的词在界面上会选不到。
 # 后面几个是手工录入才会用到的(推断不出来,只能人填)。
 CATEGORY_SUGGESTIONS = list(bom.CATEGORIES) + ["传感器", "模块", "结构件"]
-# 没品类的地方统一显示成这个。删掉一个顶层品类时,底下的元件也落到它这儿 ——
-# 界面、报表、这里必须是同一个词,不然用户会在两个名字之间来回找。
+# 没品类的地方,界面统一显示成这个。**后端不再自动建这一行品类了** ——
+# 删掉一个顶层品类时,底下元件的 category_id 置 NULL、category 文本置空,
+# 由界面拿这个词去显示(issue #32:品类是用户自己的,后端不许往他的树里塞行)。
+# 保留这个常量是因为「界面/报表用同一个词」这件事仍然成立,而且外部可能还在引用。
 UNCATEGORIZED = "未分类"
 
 ROUTES: list[tuple[str, re.Pattern, Callable]] = []
@@ -943,13 +945,20 @@ def update_category(ctx: Ctx, m):
                  "path": db.category_path(ctx.con, cid)}
 
 
-@route("DELETE", r"/api/categories/(\d+)")
 def _retag_category_subtree(ctx: Ctx, cat_id: int, root_name: str) -> int:
     """把某个品类子树下所有元件的「大类文本」改成 root_name。返回改了几条。
 
     只在「这一支换了顶层」时才需要 —— 比如删掉一个顶层大类,它的下级自己当了
     顶层。不跟着改的话,那些元件的文本还写着那个已经不存在的大类名,而全程序里
     「按品类分组 / 筛选 / 显示」读的都是这个文本列,对不上就等于哪儿都找不到。
+
+    **不要给它挂 @route。** 这里被踩过一次(issue #32):它头上曾经贴着一行和
+    delete_category 一模一样的 `@route("DELETE", r"/api/categories/(\\d+)")`,
+    而 HTTP 派发是**取第一条匹配**的,于是网页/HTTP 版删品类调的是这个内部函数
+    —— 它要三个参数,派发只给两个,永远是 500「missing 1 required positional
+    argument: 'root_name'」。桌面版没露出来,是因为它把 server.delete_category
+    的函数对象直接传给 call,压根不走路由表。内部函数和路由函数长得像时尤其要
+    小心:多贴一行装饰器不会报错,只会静默地把那条路由顶掉。
     """
     ids = _category_subtree(ctx, cat_id)
     if not ids:
@@ -998,8 +1007,10 @@ def delete_category(ctx: Ctx, m):
 
     两种边界:
       * 删的是顶层大类 -> 下级各自成为顶层(自己的名字就是大类名),直接挂在它
-        下面的元件落到「未分类」。这是唯一一个「大类」级的兜底,和界面上
-        显示「未分类」的地方是同一个词。
+        下面的元件**从品类里彻底摘出来**:category_id 置 NULL、category 文本置空,
+        返回体的 to 是空串。以前这里把它们兜进「未分类」,而「未分类」是后端
+        自动建出来的固定词 —— 删一次长一次,顶层大类就永远删不干净(issue #32:
+        「品类属于用户的事情,我需要是绝对的自定义自由化」)。
       * 下级和上一级已有的节点撞名 -> 并进去(下级的下级、元件一起挪)。
         不并的话 UNIQUE(parent_id, name) 会直接报错,而用户只能自己去改名。
     """
@@ -1013,12 +1024,22 @@ def delete_category(ctx: Ctx, m):
         "SELECT COUNT(*) AS n FROM component WHERE category_id=?", (cid,)).fetchone()["n"])
 
     if parent_id is None:
-        comp_dest_id = db.ensure_category(ctx.con, UNCATEGORIZED)
-        comp_dest_text = comp_dest_path = UNCATEGORIZED
+        # 顶层没有上一级可去 -> 不给它编一个品类,而是把它从品类树里摘下来。
+        # 「未分类」这一行绝不能再自动确保存在:它一旦被建出来,用户删了下次
+        # 又回来(而且它会挂在顶层菜单里,看着像系统硬塞的品类)。
+        # 数据层留下的形态就是「没有品类」:category_id=NULL + category='',
+        # reconcile_categories 对空文本是 continue,所以它不会被自己长回去;
+        # 界面那边按「文本为空」显示成「未分类」,那只是显示用的兜底词。
+        comp_dest_id = None
+        comp_dest_text = ""
+        comp_dest_path = ""
     else:
         comp_dest_id = parent_id
         dest_root = db.category_root(ctx.con, parent_id)
-        comp_dest_text = dest_root["name"] if dest_root else UNCATEGORIZED
+        # 兜底也用空串而不是「未分类」:parent 行理论上不会消失,但万一,
+        # 写成「未分类」会通过 reconcile 的「库里在用的品类文本」那条路
+        # 把这个固定词重新变成一个真品类行,等于又把它种回来。
+        comp_dest_text = dest_root["name"] if dest_root else ""
         comp_dest_path = db.category_path(ctx.con, parent_id)
 
     # 1. 直接挂在这一级上的元件 -> 上一级
@@ -1039,6 +1060,8 @@ def delete_category(ctx: Ctx, m):
     ctx.con.commit()
     # 兜底收尾:上面合并同名的分支如果让某条元件的文本和它所在支的顶层名字
     # 对不上,这里补齐。reconcile 本来就每次启动都跑,幂等。
+    # 这里**不能**播种(用默认的 seed=False):刚删掉的那个节点就在上一行消失,
+    # 一播种就会被标准名单 INSERT 回来 —— 用户会看到「删了立刻又出现」。
     db.reconcile_categories(ctx.con)
     return 200, {"ok": True, "moved_components": n_comp, "to": comp_dest_path,
                  "moved_children": len(kids), "deleted_nodes": 1}
@@ -1046,9 +1069,12 @@ def delete_category(ctx: Ctx, m):
 
 @route("GET", r"/api/meta")
 def meta(ctx: Ctx, m):
+    # 品类候选清单。**空文本必须排掉**:删掉一个顶层大类之后,它底下的元件就是
+    # 「没有品类」(category_id NULL + 文本空,见 delete_category),直接 DISTINCT
+    # 出来会多一个空字符串 —— 界面上就是下拉框里一条什么都不写的选项。
     cats = [r["category"] for r in ctx.con.execute(
         "SELECT DISTINCT category FROM component WHERE category IS NOT NULL "
-        "AND merged_into IS NULL ORDER BY category")]
+        "AND TRIM(category) <> '' AND merged_into IS NULL ORDER BY category")]
     pkgs = [r["package"] for r in ctx.con.execute(
         "SELECT DISTINCT package FROM component WHERE package IS NOT NULL AND package<>'' "
         "AND merged_into IS NULL ORDER BY package LIMIT 200")]
@@ -1462,15 +1488,49 @@ def _apply_move(con, kind: str, cid: int, qty: int, loc: int, *, to_loc=None,
     return ids
 
 
-def _credit_placed(con, bom_id, qty: int) -> None:
-    """出库成功后,把对应 BOM 行的「已发料」加上去。
+def _credit_bom(con, bom_id, qty: int, kind: str) -> None:
+    """把这一笔出入库记到它对应的 BOM 需求上。
 
-    界面上的「BOM 还需要数」就是这个数算出来的,所以它必须跟着动 ——
-    否则用户出了 8 个,界面还说「还差 10 个」。
+    两个方向各记一本账,而且**必须对称**:
+
+      出库(OUT) → placed_qty   这条需求已经发给板子多少
+      入库(IN)  → received_qty 这条需求已经收进项目多少
+
+    原来只有出库那一边记,入库传 0。后果是「全收完的那条需求」在出库页上
+    照样列着 —— 用户看着像「上一个 BOM 还能再收一遍/再出一次」(#31)。
+    这里加的是收料进度,不是发料进度:入库**不动** placed_qty。动的话货一进库
+    界面就说「齐了」,反而发不出去了(这一条原来踩过,注释留在 stock_batch 里)。
+
+    只认 IN / OUT:盘点、移库、采购到货那些动作不改变「这条需求被消化了多少」。
     """
-    if bom_id and qty:
+    if not bom_id or not qty:
+        return
+    if kind == "IN":
+        con.execute("UPDATE project_bom SET received_qty = received_qty + ? WHERE id=?",
+                    (qty, bom_id))
+    elif kind == "OUT":
         con.execute("UPDATE project_bom SET placed_qty = placed_qty + ? WHERE id=?",
                     (qty, bom_id))
+
+
+def _debit_bom(con, bom_id, qty: int, kind: str) -> None:
+    """撤销一笔出入库时,把它当初记进 BOM 需求里的那个数冲回来。
+
+    **按方向分别冲**:入库撤销退 received_qty,出库撤销退 placed_qty。
+    原来这里只处理出库(placed_qty),撤销入库的话「已入库」会永远虚高,
+    接着出库页就会少显示一行 —— 账面上看着像那条需求还没做完。
+
+    下限卡在 0:老版本写的流水可能根本没记过这笔账(那时入库传的是 0),
+    撤销时减成负数会让界面显示「已入库 -3」,比不冲还难查。
+    """
+    if not bom_id or not qty:
+        return
+    if kind == "IN":
+        con.execute("UPDATE project_bom SET received_qty = MAX(0, received_qty - ?)"
+                    " WHERE id=?", (qty, bom_id))
+    elif kind == "OUT":
+        con.execute("UPDATE project_bom SET placed_qty = MAX(0, placed_qty - ?)"
+                    " WHERE id=?", (qty, bom_id))
 
 
 @route("POST", r"/api/stock/batch")
@@ -1515,11 +1575,11 @@ def stock_batch(ctx: Ctx, m):
                 ref=it.get("ref") or ref, operator=it.get("operator") or operator,
                 note=it.get("note") or ctx.b("note"),
                 spill=(kind == "OUT"))
-            # 只有出库才算「这条 BOM 需求被发料了」。入库记 bom_id 是为了留下
-            # 来路(这批货是为哪个项目买的),但**绝不能**去加已发料 ——
-            # 加了的话,货一进库界面就会说「齐了」,反而发不出去了。
-            if kind == "OUT":
-                _credit_placed(ctx.con, it.get("bom_id"), qty)
+            # 两个方向都要记账,但记的是**各自的**那本:出库记「已发料」,
+            # 入库记「已入库」。入库绝不能去加已发料 —— 加了的话,货一进库
+            # 界面就会说「齐了」,反而发不出去了。反过来,入库不记的话,
+            # 全收完的需求会一直挂在出库页上(#31)。
+            _credit_bom(ctx.con, it.get("bom_id"), qty, kind)
             done.append({"component_id": cid, "name": comp["name"], "qty": qty,
                          "movement_ids": ids})
         except ApiError as exc:
@@ -1565,7 +1625,8 @@ def stock_move(ctx: Ctx, m):
                       ref=ctx.b("ref"), operator=ctx.b("operator"),
                       note=ctx.b("note"))
     mid = ids[-1]
-    _credit_placed(ctx.con, ctx.bi("bom_id"), qty if kind == "OUT" else 0)
+    # 单笔开单同样按方向记账:带 bom_id 的入库也是在推进那条需求的收料进度
+    _credit_bom(ctx.con, ctx.bi("bom_id"), qty, kind)
     ctx.con.commit()
 
     on_hand = db.stock_total(ctx.con, cid)
@@ -1592,6 +1653,9 @@ def void_movement(ctx: Ctx, m):
       OUT      → 加回原仓位
       ADJUST   → 回到盘点前的数量(靠流水里的 qty_before)
       TRANSFER → 从目标仓位挪回原仓位
+
+    除了库存,这条流水要是记在某条 BOM 需求上(收料 / 发料),那本账也按方向
+    冲回去 —— 库存动了、需求上的进度没动,两边就对不上了。
     """
     mid = int(m.group(1))
     mv = ctx.con.execute("SELECT * FROM movement WHERE id=?", (mid,)).fetchone()
@@ -1645,12 +1709,11 @@ def void_movement(ctx: Ctx, m):
         qty_before=back.get("qty_before"), void_of=mid)
     ctx.con.execute("UPDATE movement SET voided=1 WHERE id=?", (mid,))
 
-    # 撤销一笔「按 BOM 领料」时,那条 BOM 需求的已发料也要退回去。
-    # 不退的话界面会说「还差 0 个」,而东西其实已经还回架上了 —— 账就成了假的。
-    if kind == "OUT" and mv["bom_id"]:
-        ctx.con.execute(
-            "UPDATE project_bom SET placed_qty = MAX(0, placed_qty - ?) WHERE id=?",
-            (qty, mv["bom_id"]))
+    # 撤销一笔「按 BOM 领料 / 按 BOM 收料」时,那条 BOM 需求上记的那个数也要退回去。
+    # 不退的话界面会说「还差 0 个」/「已经全收了」,而东西其实已经还回架上了(或
+    # 者根本没收进来)—— 账就成了假的。方向必须分别冲:入库退已入库,出库退已发料。
+    if mv["bom_id"] and kind in ("IN", "OUT"):
+        _debit_bom(ctx.con, mv["bom_id"], qty, kind)
 
     # 撤销「采购到货」时,采购单的已收数量也得退回去 —— 否则那张单永远收不完,
     # 而且「在途」会一直少算这一笔
@@ -1932,11 +1995,13 @@ def merge_components(ctx: Ctx, m):
                 con.execute(
                     """UPDATE project_bom
                        SET required_qty = required_qty + ?, placed_qty = placed_qty + ?,
+                           received_qty = received_qty + ?,
                            designators = TRIM(COALESCE(designators,'') || ' ' ||
                                               COALESCE(?, '')),
                            optional = MAX(optional, ?), consumable = MAX(consumable, ?)
                        WHERE id=?""",
-                    (line["required_qty"], line["placed_qty"], line["designators"],
+                    (line["required_qty"], line["placed_qty"], line["received_qty"],
+                     line["designators"],
                      line["optional"], line["consumable"], twin["id"]))
                 con.execute("DELETE FROM project_bom WHERE id=?", (line["id"],))
             else:
@@ -2130,11 +2195,27 @@ def delete_project(ctx: Ctx, m):
 
 @route("GET", r"/api/projects/(\d+)/bom")
 def project_bom(ctx: Ctx, m):
+    """项目的物料报告。
+
+    **?pending=1 只留「还没做完」的行**(remaining > 0),另外回一个 hidden_done
+    = 挡掉了几条。收料清单要的就是这个口径:一条需求全收完或全发完之后,不该
+    再出现在开单页上,否则用户会以为「上一个 BOM 还能再收一遍 / 再出一遍」(#31)。
+
+    默认(不带参数)照样返回全部行 —— BOM 明细、缺料导出那些地方要的是全貌,
+    在那里把做完的行藏起来才是真的丢数据。
+    """
     pid = int(m.group(1))
     proj = ctx.con.execute("SELECT * FROM project WHERE id=?", (pid,)).fetchone()
     if not proj:
         raise ApiError(404, "项目不存在")
     rep = bom.shortage_report(ctx.con, pid)
+    if str(ctx.q("pending") or "").strip() in ("1", "true", "yes"):
+        rows = [l for l in rep["lines"] if int(l.get("remaining") or 0) > 0]
+        # 被挡掉几条要让界面说得出「N 条已经做完,不再列出」——
+        # 不说的话用户只会看到行数变少,以为数据丢了
+        rep["hidden_done"] = len(rep["lines"]) - len(rows)
+        rep["lines"] = rows
+        rep["line_count"] = len(rows)
     rep["project"] = db.row_to_dict(proj)
     return 200, rep
 
@@ -2148,7 +2229,15 @@ def project_pick_plan(ctx: Ctx, m):
     界面得知道「这一行还差多少」和「哪些料能凑」,而且勾选、改数量时要能
     在本地反复试算,不能每动一下就往返查一次库。
 
-    remaining 是「还需要发多少」(需求 − 已发料),就是界面上的「BOM 还需要数」。
+    remaining 是「还能出多少」(需求 − 已发料 − 已入库),就是界面上的「还能出库」。
+    已经做完的行(remaining = 0)**在这里就挡掉**,不回给界面:
+
+      * 这是账的口径,不是某个面板的显示偏好 —— 收料页、出库页、以后新加的
+        入口都该是同一个「这条需求还欠着吗」的答案,让每个调用方自己记得筛,
+        迟早漏一个,那一行就又冒出来(#31 就是这么冒出来的)。
+      * 顺手省掉给这些行算相似候选:它们本来一个都不会被勾。
+
+    挡掉几条会放进 hidden_done,界面拿它说一句「N 条已经做完,不再列出」。
     """
     pid = int(m.group(1))
     proj = ctx.con.execute("SELECT * FROM project WHERE id=?", (pid,)).fetchone()
@@ -2163,7 +2252,14 @@ def project_pick_plan(ctx: Ctx, m):
     limit = max(1, min(limit, 30))
 
     lines = []
+    hidden_done = 0
     for line in rep["lines"]:
+        # remaining = 需求 − 已发料 − 已入库,由 build_report 一处算好,
+        # 这里不许再自己减一遍(两处各减一次,迟早只改一处)
+        remaining = max(0, int(line.get("remaining") or 0))
+        if remaining <= 0:
+            hidden_done += 1
+            continue
         cands = similar_components(
             ctx.con, value=line["value"], package=line["package"],
             category=line["category"], limit=limit, in_stock_only=True)
@@ -2201,13 +2297,13 @@ def project_pick_plan(ctx: Ctx, m):
             cands.append(entry)
             known.add(entry["id"])
 
-        lines.append(dict(line, remaining=max(0, line["need"] - line["placed_qty"]),
-                          candidates=cands))
+        lines.append(dict(line, remaining=remaining, candidates=cands))
 
     return 200, {
         "project_id": pid, "project_name": proj["name"], "boards": rep["boards"],
-        "line_count": len(lines), "lines": lines,
-        "hint": "一条 BOM 需求可以由几颗不同的库存料凑齐;勾选后确认出库。",
+        "line_count": len(lines), "lines": lines, "hidden_done": hidden_done,
+        "hint": "一条 BOM 需求可以由几颗不同的库存料凑齐;勾选后确认出库。"
+                + (f"(另有 {hidden_done} 条已经做完,不再列出)" if hidden_done else ""),
     }
 
 
@@ -2230,7 +2326,10 @@ def pick_for_project(ctx: Ctx, m):
         rep = bom.build_report(ctx.con, pid)
         plan = []
         for line in rep["lines"]:
-            need = line["need"] - line["placed_qty"]
+            # 「还能出多少」直接用报告算好的 remaining(已经减掉已发料和已入库)。
+            # 这里再自己写一遍 need − placed 就会漏掉收料那一本账 —— 收了货之后
+            # 整单出库会把刚收进来的那些又发一遍。
+            need = line["remaining"]
             if need > 0:
                 plan.append((line["component_id"], need, None, line["bom_id"]))
 
@@ -2247,8 +2346,10 @@ def pick_for_project(ctx: Ctx, m):
                               operator=ctx.b("operator"), note=f"项目领料({proj['name']})",
                               spill=True)
             if bom_id:
-                _credit_placed(ctx.con, bom_id, qty)
+                _credit_bom(ctx.con, bom_id, qty, "OUT")
             else:
+                # 没指明是哪条需求(自由出库直接传元件):按项目 + 元件找那条,
+                # 记的仍然是「已发料」这一本 —— 出库永远只动发料进度
                 ctx.con.execute(
                     """UPDATE project_bom SET placed_qty = placed_qty + ?
                        WHERE project_id=? AND component_id=?""", (qty, pid, cid))

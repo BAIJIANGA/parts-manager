@@ -13,7 +13,15 @@ import sys
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PKG = os.path.abspath(os.path.join(HERE, "..", "..", "dist", "元器件物料管理"))
+# 包目录:认**当前工作目录**。打包脚本第 8 步会先把 cwd 切到刚组装出来的暂存包
+# 再跑这里;要是照旧写死成 <仓库>\dist\元器件物料管理,第 8 步验的就成了"上一次
+# 已经装好的那个包" —— 新包缺文件、少模块都看不出来。cwd 不像个包时才回退。
+_CWD = os.getcwd()
+if (os.path.isdir(os.path.join(_CWD, "app"))
+        and os.path.isdir(os.path.join(_CWD, "runtime"))):
+    PKG = os.path.abspath(_CWD)
+else:
+    PKG = os.path.abspath(os.path.join(HERE, "..", "..", "dist", "元器件物料管理"))
 REAL = os.path.join(PKG, "data", "parts.db")
 print("包目录:", PKG)
 print("当前工作目录:", os.getcwd())
@@ -230,11 +238,15 @@ try:
     pp.toggle(child)
     app.update()
     ck("勾上之后填好了数量", pp.alloc.get((bid0, cid0)), want)
-    ck("父行的「还需要」立刻跟着减", pp.remain(bid0), rem0 - want)
+    ck("父行的「还能出库」立刻跟着减", pp.remain(bid0), rem0 - want)
     _vals = pp.tree.item(str(bid0), "values")
+    # 表头 #31 之后叫「还能出库」;成品包重打之前那边还是旧名字「还需要」——
+    # 两种都认,免得探针在还没重打包的包上假失败。
+    _heads = [pp.tree.heading(c)["text"] for c in pp.tree.cget("columns")]
+    _left_col = next((n for n in ("还能出库", "还需要") if n in _heads), "还能出库")
     # Treeview 里的单元格一律是字符串
-    ck("父行格子里写着还差多少",
-       int(_vals[col_of(pp.tree, "还需要")]), pp.remain(bid0))
+    ck("父行格子里写着还能出多少",
+       int(_vals[col_of(pp.tree, _left_col)]), pp.remain(bid0))
 
     _rb = gui.messagebox
     gui.messagebox = FakeBox()

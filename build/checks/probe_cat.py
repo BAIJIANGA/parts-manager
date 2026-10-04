@@ -2,11 +2,15 @@
 """#6 品类表迁移探针。
 
 只用**副本**:真实库 data/parts.db 一个字节都不动 —— 用户就在用那个库。
-验四件事:
+验六件事:
   1. 全新库:品类表先按内置清单建好,不用用户自己敲
   2. 老库升上来:库里在用的品类都变成了行,每个元件都挂上了 category_id
   3. 幂等:init_db 连跑三次,行数和挂靠数都不变
   4. 对账:元件文本改了 -> 跟着改挂;子类节点不会被压平到顶层
+  5. 播种时机(#32):只有「这次才建出 category 表」的新库才播种,
+     已经存在的库(用户的库)缺哪个标准品类都不会被补回来
+  6. 删大类(#32):顶层删掉不再造「未分类」,元件变成「没有品类」;
+     子类删掉仍旧挪到上一级;删完再启动/再对账都不许长回来
 """
 import io
 import os
@@ -20,6 +24,7 @@ sys.path.insert(0, os.path.join(ROOT, "app"))
 
 import bom      # noqa: E402
 import db       # noqa: E402
+import server   # noqa: E402  ← 第 6 项要直接调 delete_category(和桌面版同一条路)
 
 OUT = []
 FAILS = []
@@ -35,6 +40,23 @@ def check(label, got, want):
 
 def count(con, sql, *args):
     return con.execute(sql, args).fetchone()[0]
+
+
+class _Match:
+    """路由派发时递给 handler 的那个 match 对象,这里自己捏一个。"""
+
+    def __init__(self, *groups):
+        self._groups = groups
+
+    def group(self, i):
+        return self._groups[i - 1]
+
+
+def del_category(con, cat_id):
+    """走 server.delete_category —— 桌面版按钮调的就是这个函数对象(不经路由表),
+    所以这里能验到的东西和用户点「删除」是同一套逻辑。"""
+    ctx = server.Ctx(None, con, {}, {}, None)
+    return server.delete_category(ctx, _Match(str(cat_id)))
 
 
 def main():
@@ -186,6 +208,97 @@ def main():
     con2.execute("DELETE FROM category WHERE id=?", (child,))
     con2.commit()
     check("删品类不会删元件", count(con2, "SELECT COUNT(*) FROM component"), n_before)
+
+    OUT.append("")
+    OUT.append("【5】播种时机(issue #32):只有「库刚建出来」那一次才播种")
+    # 用户的原话:「品类属于用户的事情,我需要是绝对的自定义自由化」。
+    # 所以标准名单只在**建库那一刻**是初始值;库一旦存在,缺哪个品类都不许自动补。
+    p5 = os.path.join(tmp, "seedtiming.db")
+    con5 = db.connect(p5)
+    db.init_db(con5)                      # 第一次启动 == 这个库刚被建出来
+    check("全新库:标准名单建好了",
+          count(con5, "SELECT COUNT(*) FROM category WHERE parent_id IS NULL"),
+          len(bom.CATEGORIES))
+    check("全新库里没有「未分类」这种系统自造的品类行(它只在界面显示时当兜底词)",
+          count(con5, "SELECT COUNT(*) FROM category WHERE name='未分类'"), 0)
+    # 用户把它删了、又录了一颗自己敲的品类 —— 这就是用户手上那个库的样子
+    con5.execute("DELETE FROM category WHERE parent_id IS NULL AND name='电感'")
+    con5.execute("INSERT INTO component(name, category, value, package) "
+                 "VALUES('探针野料', '用户自己敲的', '1k', '0603')")
+    con5.commit()
+    con5.close()
+    con5 = db.connect(p5)
+    db.init_db(con5)                      # 模拟用户下次双击 exe 的那次启动
+    check("老库启动:被删掉的「电感」不会被建回来",
+          count(con5, "SELECT COUNT(*) FROM category WHERE parent_id IS NULL "
+                      "AND name='电感'"), 0)
+    check("老库启动:顶层 = 剩下的标准品类 + 用户自己敲的那个(缺的一律不补)",
+          [r["name"] for r in con5.execute(
+              "SELECT name FROM category WHERE parent_id IS NULL ORDER BY name")],
+          sorted([c for c in bom.CATEGORIES if c != "电感"] + ["用户自己敲的"]))
+    check("老库启动:维护逻辑没被一起删掉 —— 没挂 category_id 的元件照样挂回文本对应的行",
+          con5.execute("SELECT category_id IS NOT NULL FROM component "
+                       "WHERE name='探针野料'").fetchone()[0], 1)
+    # 「没有品类」的形态 = category_id NULL + 文本空(删顶层之后就是它)。
+    # 对账必须原样放过:一硬塞,删掉的大类就又活过来了。
+    con5.execute("UPDATE component SET category_id=NULL, category='' WHERE name='探针野料'")
+    con5.commit()
+    db.reconcile_categories(con5)
+    check("「没有品类」(NULL + 空文本)的元件不会被对账硬塞一个品类",
+          tuple(con5.execute("SELECT category_id, category FROM component "
+                             "WHERE name='探针野料'").fetchone()), (None, ""))
+    check("对账也不会顺手把「未分类」造成一行",
+          count(con5, "SELECT COUNT(*) FROM category WHERE name='未分类'"), 0)
+
+    OUT.append("")
+    OUT.append("【6】删品类(issue #32):顶层不造「未分类」,子类仍旧挪到上一级")
+    p6 = os.path.join(tmp, "deletecat.db")
+    con6 = db.connect(p6)
+    db.init_db(con6)
+    # ---- 顶层:用户自己敲的一个大类,里面有一颗料
+    top6 = db.ensure_category(con6, "探针大类")
+    con6.commit()
+    con6.execute("INSERT INTO component(name, category, category_id, value, package) "
+                 "VALUES('探针顶层料', '探针大类', ?, '1k', '0603')", (top6,))
+    con6.commit()
+    n_before6 = count(con6, "SELECT COUNT(*) FROM component")
+    st6, rep6 = del_category(con6, top6)
+    check("删顶层:返回 200", st6, 200)
+    check("删顶层:没有上一级,to 是空串(界面靠它显示「这些料暂时没有品类」)",
+          rep6["to"], "")
+    check("删顶层:返回体字段名一个没改(界面按名字读)",
+          sorted(rep6), ["deleted_nodes", "moved_children", "moved_components", "ok", "to"])
+    check("删顶层:报告挪走 1 个元件", rep6["moved_components"], 1)
+    check("删顶层:那个节点真的没了",
+          count(con6, "SELECT COUNT(*) FROM category WHERE id=?", top6), 0)
+    check("删顶层:元件一颗没少", count(con6, "SELECT COUNT(*) FROM component"), n_before6)
+    check("删顶层:元件变成「没有品类」—— category_id NULL + 文本空串",
+          tuple(con6.execute("SELECT category_id, category FROM component "
+                             "WHERE name='探针顶层料'").fetchone()), (None, ""))
+    check("删顶层:没有偷偷长出「未分类」这一行(它是「删了又回来」的元凶)",
+          count(con6, "SELECT COUNT(*) FROM category WHERE name='未分类'"), 0)
+    db.reconcile_categories(con6)
+    db.init_db(con6)                      # 再走一遍启动流程
+    check("删完之后再对账/再启动,那个大类不会回来",
+          count(con6, "SELECT COUNT(*) FROM category WHERE name='探针大类'"), 0)
+    check("「未分类」也没被建出来",
+          count(con6, "SELECT COUNT(*) FROM category WHERE name='未分类'"), 0)
+    # ---- 子级:这条以前就是对的,改 #32 时不许弄坏
+    p_top = db.ensure_category(con6, "探针父类")
+    p_kid = db.ensure_category(con6, "探针子类", parent_id=p_top)
+    con6.commit()
+    con6.execute("INSERT INTO component(name, category, category_id, value, package) "
+                 "VALUES('探针子级料', '探针父类', ?, '2k', '0603')", (p_kid,))
+    con6.commit()
+    st6b, rep6b = del_category(con6, p_kid)
+    check("删子级:元件挪到上一级(不是被扔掉)", rep6b["to"], "探针父类")
+    check("删子级:元件挂在父节点上",
+          con6.execute("SELECT category_id FROM component "
+                       "WHERE name='探针子级料'").fetchone()[0], p_top)
+    check("删子级:父节点还在,只少了这一个节点",
+          (count(con6, "SELECT COUNT(*) FROM category WHERE id=?", p_top),
+           count(con6, "SELECT COUNT(*) FROM category WHERE id=?", p_kid)), (1, 0))
+    con6.close()
 
     OUT.append("")
     OUT.append("=" * 70)

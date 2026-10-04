@@ -153,7 +153,8 @@ CREATE TABLE IF NOT EXISTS project_bom (
   component_id INTEGER NOT NULL REFERENCES component(id) ON DELETE CASCADE,
   required_qty INTEGER NOT NULL,                -- 单块用量
   designators  TEXT,                            -- 位号 R1,R2,R3
-  placed_qty   INTEGER NOT NULL DEFAULT 0,
+  placed_qty   INTEGER NOT NULL DEFAULT 0,      -- 已发料(出库)
+  received_qty INTEGER NOT NULL DEFAULT 0,      -- 已入库(收料)
   optional     INTEGER NOT NULL DEFAULT 0,      -- 可选件:不装也能出货
   consumable   INTEGER NOT NULL DEFAULT 0,      -- 免点件(螺丝/锡):算需求但不卡「能造几块」
   attrition    REAL NOT NULL DEFAULT 0,         -- 损耗率 %
@@ -242,6 +243,10 @@ ADDED_COLUMNS = {
         "attrition": "REAL NOT NULL DEFAULT 0",
         "setup_qty": "INTEGER NOT NULL DEFAULT 0",
         "note": "TEXT",
+        # 「已入库(收料)」= 这条需求收进来了多少。原来这里只记「已发料」,于是
+        # 收完货的那条需求在出库页上照样列着,用户看着像「上一个 BOM 还能再用一遍」。
+        # 入库和出库各记一边、互不干扰,才知道两边各剩多少没动(见 #31)。
+        "received_qty": "INTEGER NOT NULL DEFAULT 0",
     },
     "movement": {
         "purchase_id": "INTEGER REFERENCES purchase(id) ON DELETE SET NULL",
@@ -284,6 +289,16 @@ def _columns(con: sqlite3.Connection, table: str) -> set:
 
 def init_db(con: sqlite3.Connection) -> list:
     """建表 → 补列 → 建索引。返回这次补出来的列名(供日志/自检看)。"""
+    # 播种只认「**这一次**才把 category 表建出来」这个时机(issue #32)。
+    #
+    # 为什么不用 meta 里塞一个「已经播过种」的标志位:标志位本身也是库里的一行数据,
+    # 而这一行恰恰是**老库没有**的 —— 升级上来的库读不到标志,又会被当成新库播一遍,
+    # 正好复现这次要修的病。老库恢复备份、用户手工改库、拷库换机器都会让标志位和
+    # 真实情况脱节;建表时机是 SQLite 自己维护的事实,不会骗人。TABLES 里的建表语句
+    # 全是 CREATE TABLE IF NOT EXISTS,所以「探到表不存在」== 「这次真的建了它」。
+    had_category = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='category'"
+    ).fetchone() is not None
     con.executescript(TABLES)
 
     upgraded = []
@@ -311,7 +326,9 @@ def init_db(con: sqlite3.Connection) -> list:
     backfill_identity(con)
     backfill_package_key(con)
     # 品类表要在元件都就位之后才对账:第 1 步的种子、第 2 步的挂靠都靠读 component
-    reconcile_categories(con)
+    # seed 只在「刚建出这张表」时为真:新库开箱就有标准大类可挑,
+    # 老库(包括用户手上那个)一个品类行都不会被自动创建 —— 见上面那段说明。
+    reconcile_categories(con, seed=not had_category)
     con.commit()
     return upgraded
 
@@ -659,15 +676,27 @@ def place_in_subcategories(con: sqlite3.Connection, component_ids=None,
     return moved
 
 
-def reconcile_categories(con: sqlite3.Connection) -> int:
+def reconcile_categories(con: sqlite3.Connection, *, seed: bool = False) -> int:
     """把品类表和 component 对齐。每次启动都跑,幂等。返回挂上/挪动的元件数。
 
     做四件事:
-      1. 内置品类 + 库里已经在用的品类文本 -> 品类表的顶层行
+      1. **只在 seed=True 时**:内置品类名单 -> 品类表的顶层行
          (老库升上来时,这一步就是「把 DISTINCT category 变成真正的行」)
       2. 没挂 category_id 的元件 -> 挂到同名的顶层行
       3. category_id 挂着但和文本对不上的 -> 以文本为准改挂
       4. 挂在**根节点**上的元件 -> 按封装尺寸落进子树里已有的子类
+
+    第 1 条的 seed**默认 False**,而且只有 init_db 在「这次才建出 category 表」
+    时才传 True(issue #32)。理由:品类是用户自己的东西。标准名单是**新库开箱的
+    初始值**,不是每次启动都要补齐的真理 —— 用户删掉哪个大类,就是他不想要了;
+    照名单 INSERT 回去等于每次启动都把他删的东西复活一遍,他永远删不干净。
+    别的调用点(删品类后的收尾、合并元件后的对账)都不播种,否则刚删掉的那一行
+    会在同一次请求里被长回来。
+
+    第 1 条之外的三件事**与 seed 无关,照旧执行** —— 那是维护(把有文本的元件
+    挂回树上),不是播种。第 1 条里紧跟的那个「库里已经在用的品类文本」循环也留着:
+    它建的行来自 component.category 的真实数据,不是标准名单,用户自己敲的品类
+    照样成行(那是「用户填了个没见过的品类名」这条路,不能因为这次改动断掉)。
 
     第 3 条是给「用户直接改了文本」「从别处导入的数据」兜底的。原来判断只做一层
     (category 是顶层名),再往下分不出用户当初想挂在哪个子类上,于是全库的电阻
@@ -677,15 +706,16 @@ def reconcile_categories(con: sqlite3.Connection) -> int:
     第 4 条同样是给**用户现有的库**兜底的:那些堆在「电阻」上的料,下次启动
     会自己归好位。已经挂在子类上的料一根都不动 —— 那是用户自己放的。
     """
-    for i, name in enumerate(category_seed()):
-        if not str(name).strip():
-            continue
-        row = con.execute(
-            "SELECT id FROM category WHERE parent_id IS NULL AND name=?", (name,)
-        ).fetchone()
-        if row is None:
-            con.execute("INSERT INTO category(parent_id, name, sort) VALUES(NULL,?,?)",
-                        (name, i))
+    if seed:
+        for i, name in enumerate(category_seed()):
+            if not str(name).strip():
+                continue
+            row = con.execute(
+                "SELECT id FROM category WHERE parent_id IS NULL AND name=?", (name,)
+            ).fetchone()
+            if row is None:
+                con.execute("INSERT INTO category(parent_id, name, sort) VALUES(NULL,?,?)",
+                            (name, i))
     # 库里在用的、但不在内置清单里的品类(用户自己敲的)
     used = [r["category"] for r in con.execute(
         "SELECT DISTINCT category FROM component "

@@ -19,7 +19,15 @@ import sys
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PKG = os.path.abspath(os.path.join(HERE, "..", "..", "dist", "元器件物料管理"))
+# 包目录:认**当前工作目录**。打包脚本第 8 步会先把 cwd 切到刚组装出来的暂存包
+# 再跑这里;要是照旧写死成 <仓库>\dist\元器件物料管理,第 8 步验的就成了"上一次
+# 已经装好的那个包" —— 新包缺文件、少模块都看不出来。cwd 不像个包时才回退。
+_CWD = os.getcwd()
+if (os.path.isdir(os.path.join(_CWD, "app"))
+        and os.path.isdir(os.path.join(_CWD, "runtime"))):
+    PKG = os.path.abspath(_CWD)
+else:
+    PKG = os.path.abspath(os.path.join(HERE, "..", "..", "dist", "元器件物料管理"))
 CACHE = os.path.abspath(os.path.join(HERE, "..", "cache"))
 REAL = os.path.join(PKG, "data", "parts.db")
 print("包目录:", PKG)
@@ -182,8 +190,17 @@ try:
     app.update()
     tab = app.tab_comp
 
-    ck("库存首页照旧列出全部标准大类",
-       [c for c in gui.CATEGORY_ORDER if c not in tab.cards], [])
+    # 原先这里断言「写死名单 CATEGORY_ORDER 里的名字全都是卡片」。issue #32
+    # 把品类改成**完全数据驱动**之后这条不成立了:写死名单里"库里没有对应
+    # 行的名字"(实测就一个「传感器」)现在**一张卡片都不该画** —— 它以前
+    # 是一张右键菜单里"删除"被置灰、永远删不掉的幽灵卡片。改成断言新契约:
+    # 每张卡片都必须对应库里真有的顶层品类。
+    _flat = call(server.list_categories)[1]["flat"]
+    _rows = {r["name"] for r in _flat if not r.get("parent_id")}
+    ck("写死名单里、库里没有行的空卡片不再出现(issue #32)",
+       "传感器" not in tab.cards, True)
+    ck("每一张卡片都对应库里真有的顶层品类(除数据驱动的「未分类」)",
+       [c for c in tab.cards if c not in _rows and c != gui.UNCATEGORIZED], [])
 
     top = call(server.create_category, body={"name": "成品包菜单测试"})[1]
     sub = call(server.create_category,

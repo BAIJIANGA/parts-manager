@@ -16,7 +16,15 @@ import sys
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PKG = os.path.abspath(os.path.join(HERE, "..", "..", "dist", "元器件物料管理"))
+# 包目录:认**当前工作目录**。打包脚本第 8 步会先把 cwd 切到刚组装出来的暂存包
+# 再跑这里;要是照旧写死成 <仓库>\dist\元器件物料管理,第 8 步验的就成了"上一次
+# 已经装好的那个包" —— 新包缺文件、少模块都看不出来。cwd 不像个包时才回退。
+_CWD = os.getcwd()
+if (os.path.isdir(os.path.join(_CWD, "app"))
+        and os.path.isdir(os.path.join(_CWD, "runtime"))):
+    PKG = os.path.abspath(_CWD)
+else:
+    PKG = os.path.abspath(os.path.join(HERE, "..", "..", "dist", "元器件物料管理"))
 REAL = os.path.join(PKG, "data", "parts.db")
 print("包目录:", PKG)
 print("当前工作目录:", os.getcwd())

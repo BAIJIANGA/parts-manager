@@ -759,6 +759,9 @@ def build_report(con, project_id: int) -> dict:
       可用      available = 本件现有 + 替代料现有
       缺口      gap       = max(0, need − available)
       该买      to_order  = max(0, gap − 在途)
+      已发料    placed_qty   = 这条需求已经出给板子多少
+      已入库    received_qty = 这条需求已经收进项目多少
+      还剩没动  remaining    = max(0, need − 已发料 − 已入库)
       这一行能支持几块 line_build = floor(max(0, available − 固定损耗) / (per_board × (1+损耗%)))
       能造几块  can_build = 所有「卡产能」的行里最少的那个(= 瓶颈决定产量)
 
@@ -770,6 +773,12 @@ def build_report(con, project_id: int) -> dict:
       「少一个本来就可以不装的电阻」会把整块板的可造数打成 0,对个人使用非常反直觉。
       缺的可选件会单独统计(optional_missing),不会悄悄丢掉。
     * **替代料的库存算进这一行的可用量**,否则设替代料就白设了。
+    * **「已入库」和「已发料」是两本账,不合成一个数**。合成一个「已处理」看着更
+      简洁,但界面就再也说不出「收了 2 个、还有 2 个没动」和「还能出库 2 个」——
+      而这两句正是用户核对时唯一想看的。所以 remaining 减两个数,但两个数分开存。
+    * **gap / to_order 不看这两本账**。它们是「库里还差不差料」的采购口径,
+      收料只会让库存变多、缺口自己变小;发料是发给板子,不会把库里的缺口填上。
+      把 placed_qty 减进 gap 会把「缺料」变成「已经发出去了所以不缺」的假账。
     """
     proj = con.execute("SELECT * FROM project WHERE id=?", (project_id,)).fetchone()
     if not proj:
@@ -778,7 +787,8 @@ def build_report(con, project_id: int) -> dict:
 
     rows = con.execute(
         """SELECT b.id AS bom_id, b.component_id, b.required_qty, b.designators,
-                  b.placed_qty, b.optional, b.consumable, b.attrition, b.setup_qty, b.note,
+                  b.placed_qty, b.received_qty, b.optional, b.consumable,
+                  b.attrition, b.setup_qty, b.note,
                   c.lcsc_pn, c.mpn, c.name, c.category, c.package, c.package_key,
                   c.value, c.unit,
                   c.unit_price, c.min_stock, c.params,
@@ -850,7 +860,13 @@ def build_report(con, project_id: int) -> dict:
             "required_qty": per_board,          # 兼容既有调用
             "need": need,
             "placed_qty": int(r["placed_qty"]),
-            "remaining": max(0, need - int(r["placed_qty"])),
+            "received_qty": int(r["received_qty"]),
+            # 「还剩多少没被消化掉」= 需求 − 已发料 − 已入库。两个方向都要减:
+            # 一件料要么还在货架上(这条需求没动过),要么已经收进这个项目的账上,
+            # 要么已经发给板子了 —— 三者只能占一个,所以减完才是真的「还没动」。
+            # 收料/发料各自的那本账(placed_qty / received_qty)分开留着,界面才说得出
+            # 「已入库几个、还有几个没动」(见 #31)。
+            "remaining": max(0, need - int(r["placed_qty"]) - int(r["received_qty"])),
             "on_hand": on_hand, "sub_qty": sub_qty, "available": available,
             "on_order": on_order, "gap": gap, "to_order": to_order,
             "line_build": line_build, "blocking": blocking,

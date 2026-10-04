@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import os
+import sqlite3
 import sys
 
 ROOT = sys.argv[1]
@@ -1166,12 +1167,16 @@ l30 = next(l for l in rep30["lines"] if l["bom_id"] == B30)
 check("发完之后「还需要」归零", l30["remaining"], 0)
 check("但库里的缺口照旧在(发给板子不等于补回库存):需求 4 减掉还剩的 1 个", l30["gap"], 3)
 
-# 入库也带 bom_id:留下的只是「这批货是为哪条需求买的」,不能算成已发料
+# 入库也带 bom_id:它既留下「这批货是为哪条需求买的」,也把这一笔记到
+# 「已入库」上(#31) —— 收料进度和发料进度是两本账,互不覆盖,详见第 40 节。
 _s, inb = call(server.stock_batch, body={"kind": "IN", "items": [
     {"component_id": C33, "qty": 4, "bom_id": B30}]})
 check("批量入库也留下了来路(为哪条需求买的)",
       CON.execute("SELECT COUNT(*) FROM movement WHERE bom_id=? AND kind='IN'",
                   (B30,)).fetchone()[0], 1)
+check("入库记的是「已入库」那一本",
+      CON.execute("SELECT received_qty FROM project_bom WHERE id=?",
+                  (B30,)).fetchone()[0], 4)
 check("但入库**不算**已发料 —— 货进来不等于发给板子了",
       CON.execute("SELECT placed_qty FROM project_bom WHERE id=?",
                   (B30,)).fetchone()[0], 4)
@@ -1418,26 +1423,63 @@ check("而且元件就挂在这一行上(不是挂了个空)",
       CON.execute("SELECT category_id FROM component WHERE id=?", (c3["id"],)).fetchone()[0],
       cat_node("用户自己敲的品类")["id"])
 
-# ---- 删顶层品类:落到「未分类」,元件照样不丢
-_s, _d2 = call(server.delete_category, match=(cat_node("用户自己敲的品类")["id"],))
-check("删顶层品类时,底下的料落到「未分类」", _d2["to"], "未分类")
-check("元件还在", CON.execute(
-    "SELECT COUNT(*) FROM component WHERE id=?", (c3["id"],)).fetchone()[0], 1)
-check("它的文本也跟着变成未分类", CON.execute(
-    "SELECT category FROM component WHERE id=?", (c3["id"],)).fetchone()[0], "未分类")
-check("未分类这一行是兜底,建出来了", cat_node("未分类") is not None, True)
+# ---- 删顶层品类(issue #32):不许再造「未分类」,元件从品类树里彻底摘出来
+# 用户的原话:「品类属于用户的事情,我需要是绝对的自定义自由化,库存主界面
+# 一定要能够被删掉。」所以删顶层时不再给它编一个「未分类」当去处 —— 那个词是
+# 后端自动建出来的行,建一次就永远删不干净(删了下次启动又回来)。
+_n_before_top = CON.execute("SELECT COUNT(*) FROM component").fetchone()[0]
+_top32 = cat_node("用户自己敲的品类")["id"]
+_s, _d2 = call(server.delete_category, match=(_top32,))
+check("删顶层品类:没有上一级,to 就是空串(界面靠它显示「这些料暂时没有品类」)",
+      _d2["to"], "")
+check("返回体的字段名一个没改(界面按名字读)",
+      sorted(_d2), ["deleted_nodes", "moved_children", "moved_components", "ok", "to"])
+check("moved_components 还是「直接挂在这一级上的元件数」", _d2["moved_components"], 1)
+check("moved_children:它没有子类,所以是 0", _d2["moved_children"], 0)
+check("deleted_nodes 还是 1(只删这一级,不连坐子树)", _d2["deleted_nodes"], 1)
+check("那个顶层节点真的从库里没了", cat_node("用户自己敲的品类"), None)
+check("元件一颗没少 —— 删品类永远不删元件",
+      CON.execute("SELECT COUNT(*) FROM component").fetchone()[0], _n_before_top)
+_row32 = CON.execute("SELECT category_id, category FROM component WHERE id=?",
+                     (c3["id"],)).fetchone()
+check("料被摘出来了:category_id 是 NULL", _row32["category_id"], None)
+check("它的大类文本也清空了 —— 数据层就是「没有品类」", _row32["category"], "")
+check("没有偷偷长出「未分类」这一行品类(它就是「删了又回来」的元凶)",
+      cat_node("未分类"), None)
+# 再对账一次、再走一遍启动流程(init_db)—— 都不许把它弄回来。
+# 这就是用户那句「删了立刻又回来」真正被修好的证据。
+db.reconcile_categories(CON)
+db.init_db(CON)
+check("删完之后再对账/再启动,那个品类不会回来", cat_node("用户自己敲的品类"), None)
+check("重跑 init_db 之后「未分类」也没被建出来", cat_node("未分类"), None)
+check("被摘掉品类的那批料仍旧是 NULL + 空文本(不会被对账硬塞一个品类)",
+      CON.execute("SELECT category_id, category FROM component WHERE id=?",
+                  (c3["id"],)).fetchone()[0], None)
+# 「没有品类」的料多了之后,meta 给的品类候选里不能混进空字符串 ——
+# 那是「删了大类」这件事在界面上的副作用:下拉里会多一条什么都不写的选项。
+_mt32 = call(server.meta)[1]
+check("meta 的品类候选里没有空字符串(空文本就是「没有品类」,不是品类名)",
+      [c for c in _mt32["categories"] if not str(c).strip()], [])
 
 # ---- 野数据(没挂品类的元件)要能被发现,也要能被对账修好
+# 注意:上面刚被摘掉品类的那些料也是 category_id IS NULL,所以这里只能比
+# **增量**。拿 loose == 0 当判据的话,等于要求对账必须给它们硬塞一个品类 ——
+# 那正是 #32 明令禁止的事。
+_s, _t_loose = call(server.list_categories)
+_loose0 = _t_loose["loose"]
 _loose_id = CON.execute(
     "INSERT INTO component(name, category, value, package) VALUES(?,?,?,?)",
     ("野数据", "其他", "0", "0603")).lastrowid
 CON.commit()
 _s, _t4 = call(server.list_categories)
 check("没挂品类的元件会被单独报数 —— 否则用户会在菜单里找不到它却不知道为什么",
-      _t4["loose"] >= 1, True)
+      _t4["loose"], _loose0 + 1)
 db.reconcile_categories(CON)
 _s, _t5 = call(server.list_categories)
-check("启动对账会把野数据挂回去", _t5["loose"], 0)
+check("启动对账会把「有文本、没挂上」的野数据挂回去", _t5["loose"], _loose0)
+check("而刚被摘掉品类的那批料不会被顺手塞回某个品类",
+      CON.execute("SELECT category_id FROM component WHERE id=?",
+                  (c3["id"],)).fetchone()[0], None)
 
 
 p("\n【33】封装索引:C0805 / R0603 / L0402 认得出来,同尺寸算同一个")
@@ -1551,9 +1593,11 @@ check("挪上去那颗料的文本列仍旧等于顶层名字",
 # ---- 删顶层:下级各自成为顶层,元件的文本必须跟着换(否则写着一个不存在的大类)
 T2 = _tree34("B")
 _st34b, _r34b = call(server.delete_category, match=(str(T2["top"]),))
-check("删顶层:直接挂在它下面的料落到未分类",
-      CON.execute("SELECT category FROM component WHERE id=?",
-                  (T2["c_top"],)).fetchone()[0], "未分类")
+check("删顶层:没有上一级,to 是空串", _r34b["to"], "")
+check("删顶层:直接挂在它下面的料被摘掉品类(NULL + 空文本),不再兜进「未分类」",
+      tuple(CON.execute("SELECT category_id, category FROM component WHERE id=?",
+                        (T2["c_top"],)).fetchone()), (None, ""))
+check("删顶层也不许因此多长出一个「未分类」品类行", cat_node("未分类"), None)
 check("中间层自己当了顶层",
       CON.execute("SELECT parent_id FROM category WHERE id=?",
                   (T2["mid"],)).fetchone()[0], None)
@@ -1948,6 +1992,235 @@ for _r in CON.execute("SELECT id, category, category_id FROM component "
     if _root is not None and (_root["name"] or "") != (_r["category"] or ""):
         _mism39 += 1
 check("全库扫描(第 39 节之后):文本和树上顶层名字仍然处处一致", _mism39, 0)
+
+# ---------------------------------------------------------------- 【40】
+# ---------------------------------------------------------------- #31
+p("\n【40】BOM 需求两本账:收料记「已入库」、发料记「已发料」,remaining 两本一起减")
+# #31 的病根是**入库不记账**:以前只有出库把数量记到 BOM 行上,入库传的是 0。
+# 于是「已经全收完的那条需求」在收料页/出库页上照样列着,用户看着像
+# 「同一个 BOM 还能再收一遍 / 再出一遍」。
+# 这一节的数字是凑好的,全部能手算:需求 10 个,收 6 个、发 4 个刚好做满。
+C40 = mk_raw("两本账-10k-0603", "10kΩ", "0603", "电阻", 20)
+P40 = call(server.create_project, body={"name": "SELFTEST-两本账"})[1]["id"]
+B40 = call(server.add_bom_line, match=(str(P40),),
+           body={"component_id": C40, "required_qty": 10})[1]["id"]
+
+
+def cnt40(col):
+    """直接读库,不信接口回显 —— 接口把字段名写错时这样才查得出来。"""
+    return CON.execute(f"SELECT {col} FROM project_bom WHERE id=?", (B40,)).fetchone()[0]
+
+
+def line40():
+    _s, rep = call(server.project_bom, match=(str(P40),))
+    return next(l for l in rep["lines"] if l["bom_id"] == B40)
+
+
+def plan40():
+    return call(server.project_pick_plan, match=(str(P40),))[1]
+
+
+_l = line40()
+check("新库上「已入库」列默认就是 0(不是 NULL)",
+      (_l["received_qty"], _l["placed_qty"]), (0, 0))
+check("还没动过,remaining = 10", _l["remaining"], 10)
+_pl = plan40()
+check("方案里有这一行", [x["bom_id"] for x in _pl["lines"]], [B40])
+check("没有行被隐掉", _pl["hidden_done"], 0)
+
+# ---- 入库:必须记到「已入库」,而且**不能**顺手去加「已发料」
+_s, inb40 = call(server.stock_batch, body={"kind": "IN", "items": [
+    {"component_id": C40, "qty": 4, "bom_id": B40}]})
+check("入库按 bom_id 记到了「已入库」", cnt40("received_qty"), 4)
+check("入库**不动**「已发料」(两个方向各记各的账)", cnt40("placed_qty"), 0)
+check("remaining 要减掉已入库:10 − 4", line40()["remaining"], 6)
+_l = next(x for x in plan40()["lines"] if x["bom_id"] == B40)
+check("出库方案里的「还能出」跟着变成 6", _l["remaining"], 6)
+
+# ---- 出库:记到「已发料」,同样不碰「已入库」
+_s, outs40 = call(server.pick_for_project, match=(str(P40),), body={"items": [
+    {"bom_id": B40, "component_id": C40, "qty": 3, "location": "未分类"}]})
+check("按 BOM 出库成功", outs40["ok"], True)
+check("出库记到了「已发料」", cnt40("placed_qty"), 3)
+check("出库**不动**「已入库」(还是 4)", cnt40("received_qty"), 4)
+check("remaining 两个数一起减:10 − 4 − 3", line40()["remaining"], 3)
+
+# ---- 全收完之后:方案里不再有它,但 /bom 照样给全部行 + 三个计数
+inb40b = call(server.stock_batch, body={"kind": "IN", "items": [
+    {"component_id": C40, "qty": 6, "bom_id": B40}]})[1]
+check("收满 10 个", cnt40("received_qty"), 10)
+_s, rep40 = call(server.project_bom, match=(str(P40),))
+_l = next((x for x in rep40["lines"] if x["bom_id"] == B40), None)
+check("做完的行**仍然**在 /api/projects/<id>/bom 里(由界面自己按 remaining 筛)",
+      _l is not None, True)
+check("它带着「已入库 10」", _l["received_qty"], 10)
+check("它带着「已发料 3」", _l["placed_qty"], 3)
+check("它带着 remaining 0", _l["remaining"], 0)
+check("这个项目只有这一行,全做完也还是 1 行(没被悄悄删掉)", len(rep40["lines"]), 1)
+_pl = plan40()
+check("出库方案里已经没有它了", [x["bom_id"] for x in _pl["lines"]], [])
+check("并且明说了被隐掉几条(不让界面干巴巴地少一行)", _pl["hidden_done"], 1)
+check("提示语里也说得出这句", "1 条已经做完" in _pl["hint"], True)
+_s, _pend = call(server.project_bom, query={"pending": "1"}, match=(str(P40),))
+check("收料侧用 ?pending=1 拿到的才是空清单", _pend["lines"], [])
+check("并且同样给了被隐掉的条数", _pend["hidden_done"], 1)
+
+# ---- 撤销入库:「已入库」必须冲回来。这是最容易漏的一条 ——
+#      库存退回去了、需求上的账没退,那条需求会永远显示「收完了」,
+#      收料页再也看不到它。这里**真造一条入库流水再撤它**。
+M40 = inb40["done"][0]["movement_ids"][0]
+_s, _v40 = call(server.void_movement, match=(str(M40),), body={"operator": "SELFTEST"})
+check("撤销入库后「已入库」从 10 冲回 6", cnt40("received_qty"), 6)
+check("撤销入库不动「已发料」(还是 3)", cnt40("placed_qty"), 3)
+check("remaining 跟着回来:10 − 6 − 3", line40()["remaining"], 1)
+_pl = plan40()
+check("这条需求重新出现在方案里", [x["bom_id"] for x in _pl["lines"]], [B40])
+check("被隐掉的条数归零", _pl["hidden_done"], 0)
+
+# 同一条入库流水撤销两次:第二次必须被挡住,账本一个数都不能再动 ——
+# 否则「已入库」会被多冲一次(这里减的是 4,冲两次就从 10 变 2),这类错账最难查。
+try:
+    call(server.void_movement, match=(str(M40),), body={"operator": "SELFTEST"})
+    _twice = "没拦住"
+except server.ApiError as exc:
+    _twice = exc.message
+check("同一条入库流水撤销两次会被挡住", "撤销过" in _twice, True)
+check("被挡住之后「已入库」没被再冲一次", cnt40("received_qty"), 6)
+
+# 撤销记录本身也不能再被撤销(否则「撤销」会一层层套下去)
+try:
+    call(server.void_movement, match=(str(_v40["movement_id"]),),
+         body={"operator": "SELFTEST"})
+    _twice2 = "没拦住"
+except server.ApiError as exc:
+    _twice2 = exc.message
+check("撤销补的那笔反向流水不能再被撤销", "撤销记录" in _twice2, True)
+check("被挡住之后「已入库」仍然是 6", cnt40("received_qty"), 6)
+
+# ---- 全发完之后对称:收料侧翻全表时两个数都要对得上
+_s, outs40b = call(server.pick_for_project, match=(str(P40),), body={"items": [
+    {"bom_id": B40, "component_id": C40, "qty": 1, "location": "未分类"}]})
+check("把「还能出」的那 1 个也发掉", outs40b["ok"], True)
+_s, rep40b = call(server.project_bom, match=(str(P40),))
+_l = next(x for x in rep40b["lines"] if x["bom_id"] == B40)
+check("发完之后「已发料」= 4", _l["placed_qty"], 4)
+check("「已入库」仍然是 6(发料不回头改收料那本账)", _l["received_qty"], 6)
+check("两边合起来正好把需求吃满:6 + 4 = 10",
+      _l["placed_qty"] + _l["received_qty"], 10)
+check("remaining 再次归零", _l["remaining"], 0)
+_pl = plan40()
+check("两个方向都做完,方案里再次没有它", [x["bom_id"] for x in _pl["lines"]], [])
+check("被隐掉的条数是 1", _pl["hidden_done"], 1)
+
+# ---- 反向也要对称:撤销一笔**出库**只冲「已发料」,不能碰「已入库」
+M40b = outs40b["picked"][0]["movement_ids"][0]
+call(server.void_movement, match=(str(M40b),), body={"operator": "SELFTEST"})
+_l = line40()
+check("撤销出库只冲「已发料」:4 → 3", _l["placed_qty"], 3)
+check("撤销出库不碰「已入库」:还是 6", _l["received_qty"], 6)
+check("remaining 回到 1", _l["remaining"], 1)
+check("这条需求又回到方案里(撤销把「做完」退回去了)",
+      [x["bom_id"] for x in plan40()["lines"]], [B40])
+
+# ---- 老库平滑升级:补列清单 + 建表语句里都得有这一列,而且真升一次数据不少
+check("建表语句里有「已入库」列(新库直接就带)",
+      "received_qty" in [r[1] for r in CON.execute("PRAGMA table_info(project_bom)")],
+      True)
+check("补列清单里也有它(老库靠这条 ALTER 平滑升上来)",
+      "received_qty" in (db.ADDED_COLUMNS.get("project_bom") or {}), True)
+
+# 光看清单不够:清单对但 ALTER 写错,用户升级那天才发现就晚了。
+# 所以真造一个「还没有这一列」的库升一次 —— 先按新库建表,再把那一列 DROP 掉,
+# 这样比手抄一份老 DDL 更不容易随建表语句一起腐坏。
+_olddb = os.path.join(CACHE, "apitest_old31.db")
+for _sfx in ("", "-journal", "-wal", "-shm"):
+    if os.path.exists(_olddb + _sfx):
+        os.remove(_olddb + _sfx)
+_oc = db.connect(_olddb)
+db.init_db(_oc)
+_oc.execute("INSERT INTO project(id, name, qty) VALUES(1, '老库项目', 2)")
+_oc.execute("INSERT INTO component(id, name, category) VALUES(1, '老库元件', '电阻')")
+_oc.execute("INSERT INTO project_bom(id, project_id, component_id, required_qty,"
+            " designators, placed_qty) VALUES(1, 1, 1, 7, 'R1 R2', 3)")
+_oc.commit()
+_oc.execute("ALTER TABLE project_bom DROP COLUMN received_qty")   # 退回老库的样子
+_oc.commit()
+_oc.close()
+_oc = db.connect(_olddb)
+_added = db.init_db(_oc)                # 模拟用户双击 exe 时那次启动升级
+_row = _oc.execute("SELECT required_qty, designators, placed_qty, received_qty"
+                   " FROM project_bom WHERE id=1").fetchone()
+check("老库补列:原来那条 BOM 需求还在,老字段一个没动",
+      (int(_row["required_qty"]), _row["designators"], int(_row["placed_qty"])),
+      (7, "R1 R2", 3))
+check("老库补列:新列默认 0(不是 NULL,免得界面显示不出来)",
+      int(_row["received_qty"]), 0)
+check("老库补列:补的正是这一列", "project_bom.received_qty" in (_added or []), True)
+check("老库补列:项目一条不少",
+      _oc.execute("SELECT COUNT(*) FROM project").fetchone()[0], 1)
+_oc.close()
+for _sfx in ("", "-journal", "-wal", "-shm"):   # 体检完就把临时老库删掉,不留垃圾
+    if os.path.exists(_olddb + _sfx):
+        os.remove(_olddb + _sfx)
+
+# ---------------------------------------------------------------- 【41】
+p("\n【41】issue #32:品类是用户自己的东西 —— 老库启动再也不播种")
+
+# 这一节要**换库**跑(验的是「库刚建出来」和「库早就存在」这两种启动时机),
+# 所以另开临时库,不去搅主自检库的状态。
+_cat_old = os.path.join(CACHE, "apitest_cat_old.db")
+for _sfx in ("", "-journal", "-wal", "-shm"):
+    _f = _cat_old + _sfx
+    if os.path.exists(_f):
+        os.remove(_f)
+_co = db.connect(_cat_old)
+db.init_db(_co)                          # 第一次启动 == 这个库刚被建出来
+check("全新库照旧按内置名单播种(新用户开箱就得有品类可挑,这个体验不能丢)",
+      [r[0] for r in _co.execute(
+          "SELECT name FROM category WHERE parent_id IS NULL ORDER BY sort")],
+      list(bom.CATEGORIES))
+# 把它删掉、再录一颗自己敲的品类 —— 这就是「用户的库」真实的样子:
+# category 表在,但里面缺标准名单里的东西。
+_co.execute("DELETE FROM category WHERE parent_id IS NULL AND name='电感'")
+_co.execute("INSERT INTO component(name, category, value, package)"
+            " VALUES('老库野料', '用户自己敲的', '1k', '0603')")
+_co.commit()
+_co.close()
+
+_co = db.connect(_cat_old)
+db.init_db(_co)                          # 模拟用户下次双击 exe 的那次启动
+check("老库(品类表已存在)不会再播种:被删掉的「电感」没有被建回来",
+      _co.execute("SELECT COUNT(*) FROM category WHERE parent_id IS NULL"
+                  " AND name='电感'").fetchone()[0], 0)
+check("老库的顶层品类 = 剩下的标准品类 + 用户自己敲的那个(名单里缺的一律不补)",
+      [r[0] for r in _co.execute(
+          "SELECT name FROM category WHERE parent_id IS NULL ORDER BY name")],
+      sorted([c for c in bom.CATEGORIES if c != "电感"] + ["用户自己敲的"]))
+check("但维护逻辑没被一起删掉:没挂 category_id 的元件照样挂回文本对应的行",
+      _co.execute("SELECT category_id IS NOT NULL FROM component"
+                  " WHERE name='老库野料'").fetchone()[0], 1)
+# 再删一个、再启动一次:同样不许回来(证明不是「只对第一次启动有效」的巧合)
+_co.execute("DELETE FROM category WHERE parent_id IS NULL AND name='其他'")
+_co.commit()
+db.init_db(_co)
+check("再删一个内置品类 + 再启动一次,同样不会被补回来",
+      _co.execute("SELECT COUNT(*) FROM category WHERE parent_id IS NULL"
+                  " AND name IN ('电感', '其他')").fetchone()[0], 0)
+_co.close()
+for _sfx in ("", "-journal", "-wal", "-shm"):   # 用完就删,不留垃圾
+    _f = _cat_old + _sfx
+    if os.path.exists(_f):
+        os.remove(_f)
+
+# ---- 路由:HTTP / 网页版删品类必须调到 delete_category
+# 病根是 _retag_category_subtree 头上也贴着一行一模一样的 DELETE 装饰器,而派发
+# 「取第一条匹配」—— 于是调它、少一个 root_name 参数、永远 500。桌面版不走路由表,
+# 所以只有网页/HTTP 版会中。这条断言直接查路由表绑的函数对象。
+_del_cat_routes = [fn for (_m, _p, fn) in server.ROUTES
+                   if _m == "DELETE" and _p.pattern == r"^/api/categories/(\d+)$"]
+check("DELETE /api/categories/<id> 只注册了一条", len(_del_cat_routes), 1)
+check("而且绑的就是 delete_category(不是内部帮手 _retag_category_subtree)",
+      _del_cat_routes[0] if _del_cat_routes else None, server.delete_category)
 
 CON.close()
 p("\n" + "=" * 62)
