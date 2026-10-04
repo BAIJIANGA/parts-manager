@@ -2399,11 +2399,19 @@ class ComponentsTab(ttk.Frame):
         return "break"          # 覆盖层自己不要再处理一遍
 
     def _paint_cell_colors(self):
-        """把有底色的格子铺上色块;滚出可视区 / 已经不在这一屏的一律撤掉。"""
+        """把有底色的格子铺上色块;滚出可视区 / 已经不在这一屏的一律撤掉。
+
+        注意要**以 `_cell_colors` 为准**去遍历:色块是"有颜色才现造"的,
+        反着遍历已有色块的话,第一次刷色根本不会造出色块(这个 bug 被断言抓到过)。
+        """
         rows, cols = self._sel_rows(), self._sel_cols()
         for rc, fr in list(self._cell_patches.items()):
+            if rc not in self._cell_colors:      # 颜色已经被清掉的旧色块:撤走
+                fr.place_forget()
+        for rc in list(self._cell_colors):
+            fr = self._cell_patch(rc)
             item, col = rc
-            if rc not in self._cell_colors or item not in rows or col not in cols:
+            if item not in rows or col not in cols:
                 fr.place_forget()
                 continue
             try:

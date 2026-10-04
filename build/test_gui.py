@@ -4850,6 +4850,53 @@ def main() -> int:
             _tab50._sel_clear()
         p(f"  [OK ] 选中:行 {len(_rows50)} / 列 {len(_specs50)}")
 
+        # ------------- 【51】#36 单格底色:色块 + **事件转发** -------------
+        p("\n【51】#36 单格底色:刷上去看得见,而且色块必须把鼠标事件转发回表格")
+        if len(_rows50) >= 2 and len(_specs50) >= 3:
+            _tab51 = _tab50
+            _t51 = _t50
+            _rc51 = (_rows50[0], "#1")
+            check("一开始没有任何格子底色", len(_tab51._cell_colors), 0)
+            _tab51._sel_click(_ev50(*_cell50(0, 0)))
+            _tab51.set_cell_color("#123456")
+            check("刷完底色,状态里记下了这一格",
+                  _tab51._cell_colors.get(_rc51), "#123456")
+            _fr51 = _tab51._cell_patches.get(_rc51)
+            check("给这一格造了覆盖色块", _fr51 is not None, True)
+            if _fr51 is not None:
+                check("色块真的摆在表格上(看得见)",
+                      bool(_fr51.place_info()), True)
+                check("色块的底色就是刷的那个颜色",
+                      str(_fr51.cget("background")), "#123456")
+                # 这一条是 #36 的命门:色块盖在格子上,**必须**把鼠标事件转发回表格,
+                # 否则双击进编辑、右键菜单、拖动框选全都会失效。bind() 查得到命令
+                # 就说明接了转发,查不到就说明会被吃掉。
+                _fwd51 = {_n: bool(_fr51.bind(_n)) for _n in
+                          ("<Button-1>", "<Double-1>", "<Button-3>", "<B1-Motion>")}
+                check("色块把单击/双击/右键/拖动都转发回表格了",
+                      _fwd51, {"<Button-1>": True, "<Double-1>": True,
+                               "<Button-3>": True, "<B1-Motion>": True})
+            # 清掉:状态去掉,而且色块必须从表上撤走(不留野控件)
+            _tab51.clear_cell_color()
+            check("清掉之后状态里没有了", _tab51._cell_colors.get(_rc51), None)
+            if _fr51 is not None:
+                check("清掉之后色块也从表上撤走了(不留野控件)",
+                      bool(_fr51.place_info()), False)
+            # 多格一起刷(框选之后刷底色)
+            _tab51._sel_click(_ev50(*_cell50(0, 0)))
+            if _p50b:
+                _tab51._sel_click(_ev50(_p50b[0], _p50b[1], state=1))
+                _tab51.set_cell_color("#eef4fb")
+                check("框选之后一起刷:6 格全都记上了",
+                      len(_tab51._cell_colors), 6)
+                check("这 6 格的色块都摆在表上",
+                      sum(1 for _r, _c in _tab51._cell_colors
+                          if _tab51._cell_patches.get((_r, _c))
+                          and _tab51._cell_patches[(_r, _c)].place_info()), 6)
+                _tab51.set_cell_color(None)
+                check("再一起清掉:一格不剩", len(_tab51._cell_colors), 0)
+            _tab51._sel_clear()
+
         app.update()
         p("  [OK ] 全量刷新")
         app.destroy()
