@@ -1034,6 +1034,11 @@ class ComponentsTab(ttk.Frame):
         # 表头底色在 Windows 主题下常被主题自己盖掉,而且说不清是插在它前面还是后面。
         self.hdr_line = tk.Frame(self.tree.master, width=2, bg="#2f6fd0",
                                  bd=0, highlightthickness=0)
+        # issue #35:拖动换列要"跟手" —— 这两个是拖动过程中的状态:
+        # _hdr_after 是「边缘自动滚动」的定时器 id,_hdr_last_x 是最后一次鼠标横坐标
+        # (自动滚动之后没有新的 motion 事件,要靠它把提示线重新贴到落点上)
+        self._hdr_after = None
+        self._hdr_last_x = None
         self.tree.bind("<ButtonPress-1>", self._hdr_drag_begin, add="+")
         self.tree.bind("<B1-Motion>", self._hdr_drag_motion, add="+")
         self.tree.bind("<ButtonRelease-1>", self._hdr_drag_end, add="+")
@@ -2297,6 +2302,13 @@ class ComponentsTab(ttk.Frame):
         for i, (x0, x1) in enumerate(spans):
             if x0 <= event.x < x1:
                 self._hdr_src = i
+                self._hdr_last_x = event.x
+                # issue #35:跟手反馈 —— 一按住标题鼠标就变成左右箭头。
+                # 没有这个的时候,拖的时候只有那条细细的提示线,连"我正在拖"都不明显。
+                try:
+                    self.tree.config(cursor="sb_h_double_arrow")
+                except tk.TclError:
+                    pass
                 return "break"               # 表头上的按下由我们接管
         return None                          # 落在最后一列右边的空处:不起拖
 
@@ -2304,10 +2316,16 @@ class ComponentsTab(ttk.Frame):
         """拖着的时候算落点、画提示线。没在拖就返回 None —— 行上的拖动照旧。"""
         if self._hdr_src is None:
             return None
+        self._hdr_last_x = event.x
+        self._hdr_arm_scroll()               # issue #35:顶到左右边缘就开始自动滚
+        return self._hdr_place(event.x)
+
+    def _hdr_place(self, x):
+        """按鼠标横坐标 x 算落点并画提示线(自动滚动之后也要用它重画)。"""
         keys, spans = self._hdr_bounds()
         if not spans or len(keys) != len(spans):
             return "break"
-        slot, x = self._hdr_slot_at(event.x, spans)
+        slot, x = self._hdr_slot_at(x, spans)
         src = self._hdr_src
         # slot 是「插到老顺序的第几格之前」;把自己抽走之后,身后的下标都要往前挪
         # 一格,所以 slot == src 和 slot == src+1 都是「原地放下」—— 那就别画线,
@@ -2322,8 +2340,54 @@ class ComponentsTab(ttk.Frame):
             self.hdr_line.lift()
         return "break"
 
+    def _hdr_arm_scroll(self):
+        """鼠标贴近表格左/右边缘时启动「边缘自动滚动」(issue #35)。
+
+        为什么用定时器、而不是在 motion 里滚一次就完:鼠标**贴着边不动**的时候
+        不会再有 motion 事件,只滚一次就停住了 —— 而"想换到看不见的那一列"
+        恰恰就是这种"顶到边上不动"的姿势。鼠标离开边缘就停(_hdr_scroll_tick 判断),
+        松手也会停(见 _hdr_drag_end)。
+        """
+        if self._hdr_after is not None:
+            return                           # 已经在滚了,别叠第二个定时器
+        x, w = self._hdr_last_x, self.tree.winfo_width()
+        if x is None or w <= 1:
+            return
+        if x <= 28 or x >= w - 28:
+            self._hdr_after = self.tree.after(40, self._hdr_scroll_tick)
+
+    def _hdr_scroll_tick(self):
+        """自动滚动的一格:还在拖、鼠标还贴着边就继续滚,否则停。"""
+        self._hdr_after = None
+        x = self._hdr_last_x
+        if self._hdr_src is None or x is None:
+            return                           # 已经松手了
+        w = self.tree.winfo_width()
+        step = -1 if x <= 28 else (1 if x >= w - 28 else 0)
+        if not step:
+            return                           # 鼠标离开边缘:停,等下一次 motion 再起
+        before = self.tree.xview()
+        self.tree.xview_scroll(step, "units")
+        if self.tree.xview() == before:
+            return                           # 滚到头了,别再空转
+        self._hdr_place(x)                   # 滚完把提示线重新贴到落点上
+        self._hdr_after = self.tree.after(40, self._hdr_scroll_tick)
+
     def _hdr_drag_end(self, _event=None):
         """松手:真拖了就写回新顺序并存盘;只是在标题上点了一下就什么都不改。"""
+        # issue #35:收拖必须把自动滚动停掉、鼠标形状还原 —— 漏掉任何一样,
+        # 后面整张表都会一直自己滚 / 鼠标一直卡在左右箭头
+        if self._hdr_after is not None:
+            try:
+                self.tree.after_cancel(self._hdr_after)
+            except Exception:  # noqa: BLE001
+                pass
+            self._hdr_after = None
+        self._hdr_last_x = None
+        try:
+            self.tree.config(cursor="")
+        except tk.TclError:
+            pass
         src, slot = self._hdr_src, self._hdr_slot
         self._hdr_src = self._hdr_slot = None
         self.hdr_line.place_forget()
