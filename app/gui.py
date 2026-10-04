@@ -29,6 +29,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 import attrs       # noqa: E402  ← 属性名的建议、归一化和显示格式
+import bom         # noqa: E402  ← 事后重算「品类是不是猜的」,见 bom_guess
 import db          # noqa: E402
 import footprint   # noqa: E402  ← 标准封装识别:C0805 / R0603 / L0402 归到同一个尺寸
 import server      # noqa: E402  ← 复用全部业务逻辑
@@ -434,7 +435,7 @@ class App(tk.Tk):
             return
         self.status.set(
             f"元件 {s['components']} 种   总库存 {s['total_qty']} 个   "
-            f"缺货 {s['out']} 种   偏低 {s['low']} 种   项目 {s['projects']} 个"
+            f"缺货 {s['out']} 种   缺料 {s['low']} 种   项目 {s['projects']} 个"
         )
 
     def set_status(self, text, seconds=4):
@@ -1193,11 +1194,18 @@ class ComponentsTab(ttk.Frame):
         specs = []
         # 「本级」:大类下面既有细分出来的子类、又有还没细分的料,是很常见的摆法。
         # 少了这张卡片,那些料就永远进不去 —— 点一个「有子类的品类」只会看到子类。
-        own = int(node.get("own_stocked") or 0)
+        #
+        # 判断**摆不摆**这张卡片的是 `own`(直接挂在这个节点下的元件数,**不看库存**),
+        # 不是 `own_stocked`。原来的写法只认有库存的,于是"这个节点有子类、本级又直接挂了
+        # 一批 0 库存的料"时,那批料在菜单上**没有任何入口**,只能靠搜索 ——
+        # 这正是 issue #40 说的"物料不要自动消失"。
+        # 卡片上的**数字**仍然只用有库存的(点进去看到的就是那些),和子类卡片口径一致。
+        own = int(node.get("own") or 0)
+        own_stocked = int(node.get("own_stocked") or 0)
         if own:
             glyph, color = CATEGORY_STYLE.get(node["name"], DEFAULT_CAT_STYLE)
             specs.append(("self", "本级(挂在这里的)", glyph, color,
-                          f"{own} 种在库", False))
+                          f"{own_stocked} 种在库" if own_stocked else "暂无库存", False))
         stocked = 0
         for ch in self._pick_items:
             glyph, color = CATEGORY_STYLE.get(ch["name"], DEFAULT_CAT_STYLE)
@@ -1208,7 +1216,7 @@ class ComponentsTab(ttk.Frame):
             specs.append((str(ch["id"]), ch["name"], glyph, color,
                           f"{n} 种在库" if n else "暂无库存", not n))
         self.pick_title.set(node["name"])
-        total = stocked + own
+        total = stocked + own_stocked
         self.pick_count.set(f"{len(self._pick_items)} 个子类"
                             + (f",共 {total} 种在库" if total else ""))
         self.pick_board.render(specs, empty_text="这个品类下面还没有子类。")
@@ -1901,7 +1909,9 @@ class ComponentsTab(ttk.Frame):
 
         背景色和文字色分开存:只设了文字色的行,背景照旧走原来的规则色。
 
-        内置那两条规则色(out 缺货红底 / low 偏低黄底)也是靠 tag 配背景的。
+        内置那两条规则色(out 缺货红底 / low 缺料黄底)也是靠 tag 配背景的。
+        (#38 之后后端 `stock_state` 只有 ok / low / out 三档,旧的那档 'short'
+        已无任何来源,所以这里不用为它留分支、也没给它配过颜色。)
         同一行有多个 tag 都配了同一个选项时,**谁生效由 Tk 说了算,而且不是
         「行上 tags 列表的先后」** —— 实测(6 种创建顺序 + 把抢色的 tag 换成
         第 4 个)规则是**谁先 tag_configure 谁赢,`item(..., tags=[…])` 里
@@ -4459,6 +4469,11 @@ class BomPickPane(BomPaneBase):
         t.tag_configure("fp", foreground="#0b6bcb")
         t.tag_configure("own", foreground="#1e7a34")
         t.tag_configure("empty", foreground="#999")
+        # issue #39:领不到料的行 —— 需求行还有剩余却一个候选都凑不出来,或者候选自己库存是 0。
+        # 底色和库存页的「缺货」用同一个值;#39 的要害是**替换**而不是叠加:
+        # 多个 tag 都配了 background 时,Tk 的规则是"谁先 tag_configure 谁赢",
+        # 与 item(tags=[...]) 的顺序无关 —— 直接叠一个红会被先注册的 line(淡蓝底)压掉。
+        t.tag_configure("short", background="#ffe3e3")
         return f, t
 
     def extra_tools(self, bar):
@@ -4549,9 +4564,15 @@ class BomPickPane(BomPaneBase):
             # 只在同名出现不止一次时补封装,而且是补在树列上当作区分用的后缀
             text = f"{nm}{' ' + pkg if pkg and dup.get(nm, 0) > 1 else ''}" \
                    f"  ×{need}   [{mark}]"
-            tags = ["line"]
-            if rem == 0 and need:
-                tags.append("covered")
+            # issue #39:这一行**领不到料**就标红。rem == 0 是"这次已经配齐";
+            # 真领不到的是「还有剩余(rem > 0)却一个候选都没有」——
+            # 候选列表只列有库存的料,所以"没有候选"就等于"库里凑不出来"。
+            if rem > 0 and not (l.get("candidates") or []):
+                tags = ["short"]
+            else:
+                tags = ["line"]
+                if rem == 0 and need:
+                    tags.append("covered")
             self.tree.insert("", "end", iid=str(bid), text=text, open=(bid in self._open),
                              values=("", l.get("category") or "未分类",
                                      l.get("value") or "", l.get("package") or "",
@@ -4567,15 +4588,20 @@ class BomPickPane(BomPaneBase):
                 self.tree.insert(str(bid), "end", iid=f"{bid}:none", text="",
                                  values=("", "", "", "", "", "", "", rem,
                                          "库存里没有能凑它的料,得先入库或设替代料"),
-                                 tags=("empty",))
+                                 tags=("short",))
                 continue
             for c in cands:
                 key = (bid, c["id"])
                 self._idx[key] = c
                 on = key in self.alloc
-                tags = ("own",) if c.get("own") else ()
-                if c.get("fp_match"):
-                    tags += ("fp",)
+                # issue #39:候选自己库存是 0 也算"领不到"。现在候选被"只列有库存的"挡着,
+                # 基本触发不到,但规则要在。同样走**替换**,保持"一行最多一个配背景色的 tag"。
+                if not int(c.get("on_hand") or 0):
+                    tags = ("short",)
+                else:
+                    tags = ("own",) if c.get("own") else ()
+                    if c.get("fp_match"):
+                        tags += ("fp",)
                 self.tree.insert(str(bid), "end", iid=self.child_iid(bid, c["id"]),
                                  text="", values=(
                                      CHECK_ON if on else CHECK_OFF,
@@ -5499,6 +5525,59 @@ class LineDetail(ttk.Frame):
         self.app.refresh_all()
 
 
+# 「标记」列里给用户看的那两个字,做成常量:自检要按它断言,免得两边各写一份字面量
+GUESS_FLAG = "待核"
+
+
+def bom_guess(line: dict) -> tuple[bool, str]:
+    """**事后**判断一条 BOM 需求的品类是不是「猜的」。返回 (要不要核, 一句话依据)。
+
+    背景(issue #37):导入不再拦一道「核对品类」了,那「哪几行是猜的」就得换个
+    地方说 —— 落库之后再让人一眼看到。可 BOM 解析出来的 `category_confidence` /
+    `category_reason` **不落库**:`project_bom` 只存 component_id / required_qty /
+    designators,品类记在 component 上。所以导入之后界面手上只剩「位号 / 值 /
+    封装 / 库里存着的品类」,只能拿它们重跑一遍 `bom.classify`。
+
+    两条判据,任意一条成立就值得人自己看一眼:
+
+      * `confidence` 是 low / none —— 线索本身定不下来(认不出,或者互相打架);
+      * 重算出来的品类**和库里存的不一样** —— 这行的品类跟它自己的位号/值/封装
+        对不上,该核。少了这一条会漏掉一类行:hint 那一票在导入时可能把结论
+        从 high 拉到 low,重算没那一票又会算回 high(见下面「局限」)。
+
+    ------------------------------------------------------------------ 局限
+    重算**只能传 `hint=""`**。`classify` 的第 4 个参数 hint 来自 BOM 文件自己的
+    「品类 / 分类 / 类别」列(见 `bom.HEADER_ALIASES`),而**那一列不落库**,事后
+    拿不回来。所以对「自带品类列的 BOM」,这里的判决可能和导入那一刻不一致,
+    两个方向都会发生:
+
+      * 这一行**只**靠品类列站住(位号/值/封装全无线索):导入时 high,重算
+        none —— **多标**一次「待核」。这行本来也没别的证据,核一下不亏。
+      * 品类列和位号/值打架、导入时已判 low:重算少了品类列那一票,可能反倒
+        算成 high。靠上面第二条判据兜:结论变了,就说明这行的品类**只**在那一
+        列上有支撑,同样该看。真正会漏的是「hint 和别的线索打架、重算却算出
+        **同一个**品类」那种行 —— 概率小,但不是零。
+
+    还有一件事得说清:这个标记**不是**「导入时算错了」的意思,而是「这一行的
+    品类没法用行内线索确认,值得你自己看一眼」。所以「复核品类…」里人亲手改过
+    的行也可能照样被标上 —— 库里只存品类值,没存「这是人定的」,而人改的往往
+    正是线索本来就定不下来的那些行(那正是人去改它的原因)。多标不丢数据,
+    比漏标好。
+
+    一句话:这是个**提示**,不是结论。宁可多标几行,也不装作知道。
+    """
+    stored = str(line.get("category") or "").strip()
+    designators = bom.split_designators(str(line.get("designators") or ""))
+    cat, conf, why = bom.classify(designators, line.get("package") or "",
+                                  line.get("value") or "")
+    if conf in (bom.CONF_LOW, bom.CONF_NONE):
+        return True, why
+    if stored and stored != cat:
+        return True, (f"{why}；但库里这行的品类是「{stored}」 —— 导入时 BOM 自带"
+                      f"的那一列品类没落库,重算少了它这一票,所以对不上")
+    return False, ""
+
+
 class ProjectsTab(ttk.Frame):
     def __init__(self, parent, app: App):
         super().__init__(parent, padding=8)
@@ -5506,6 +5585,7 @@ class ProjectsTab(ttk.Frame):
         self.con = app.con
         self._pid = None
         self._lines = {}
+        self._guess = {}          # bom_id -> 品类是不是猜的(见 bom_guess)
         self.report = {}
 
         bar = ttk.Frame(self)
@@ -5563,6 +5643,10 @@ class ProjectsTab(ttk.Frame):
         # BOM 上这一行和库里那颗料的写法对不上时用这个 ——
         # 导出的 BOM 常常只剩值和封装,严格相等是找不到的
         ttk.Button(tools, text="找相似库存…", command=self.similar_for_line).pack(side="left")
+        # 导入之后**主动**想连品类一起过一遍才走这个(issue #37)。它不再是导入的
+        # 必经步骤:主路(📥 导入 BOM)选完文件就落库,复核窗口只在这里出现。
+        ttk.Button(tools, text="复核品类…", command=self.review_categories).pack(
+            side="left", padx=6)
         ttk.Label(tools, text="双击一行可直接改用量/损耗/可选/免点。",
                   style="Dim.TLabel").pack(side="left", padx=8)
 
@@ -5575,6 +5659,10 @@ class ProjectsTab(ttk.Frame):
         # 列宽合计 640:这一页右边多了详情面板,原本 842 的账放不下了。
         # 让出来的是「名称」和「位号」这两个拉伸列 —— 它们本来就会吃掉剩余空间,
         # 收窄它们的基准宽度不损失信息;详情面板里能看到完整的名字。
+        # issue #37 之后「标记」列多担了一件事:品类是猜的行要在这里写「待核」。
+        # 40px 装不下(「可选 替代2 待核」会互相挤掉),所以加宽到 56,这 16px 从
+        # 「位号」出 —— 它还是拉伸列,1360 宽的窗口下拿到的是「基准宽 + 余量」,
+        # 基准小一点只是余量多一点,而且合计仍然是 640(check_layout.py 盯着这个数)。
         f2, self.t_bom = make_tree(bom_side, [
             ("name", "名称", 104, "w", True),
             ("lcsc_pn", "商品编号", 62, "center"),
@@ -5586,8 +5674,8 @@ class ProjectsTab(ttk.Frame):
             ("on_hand", "现有", 38, "e"),
             ("sub_qty", "替代", 36, "e"),
             ("gap", "缺口", 40, "e"),
-            ("flag", "标记", 40, "center"),
-            ("designators", "位号", 100, "w", True)], height=16)
+            ("flag", "标记", 56, "center"),
+            ("designators", "位号", 84, "w", True)], height=16)
         f2.pack(fill="both", expand=True)
         self.t_bom.tag_configure("short", background="#ffe3e3")
         self.t_bom.tag_configure("done", foreground="#888")
@@ -5648,6 +5736,7 @@ class ProjectsTab(ttk.Frame):
         """
         clear_tree(self.t_bom)
         self._lines = {}
+        self._guess = {}
         self.report = {}
         self.title.set("（左侧选一个项目）")
         self.shortage.set("")
@@ -5696,6 +5785,10 @@ class ProjectsTab(ttk.Frame):
             self.detail.clear()
             return
         self.detail.show(self._lines.get(int(sel[0])))
+        # 「标记」列只有两个字,依据得说出来 —— 只说「待核」等于让人重头猜一遍
+        why = self._guess.get(int(sel[0]))
+        if why:
+            self.app.set_status(f"这一行的品类是猜的:{why}", 8)
 
     def similar_for_line(self):
         """拿 BOM 明细里选中那一行的值+封装,去库存里找相似。"""
@@ -5783,6 +5876,7 @@ class ProjectsTab(ttk.Frame):
         rep = call(self.con, server.project_bom, match=(self._pid,), quiet=True)
         clear_tree(self.t_bom)
         self._lines = {}
+        self._guess = {}
         self.report = rep or {}
         if not rep:
             self.detail.clear()
@@ -5793,6 +5887,13 @@ class ProjectsTab(ttk.Frame):
         for line in rep.get("lines") or []:
             self._lines[line["bom_id"]] = line
             flags = []
+            # 品类是猜的,就在「标记」列写「待核」—— 导入不再拦一道复核了(issue
+            # #37),「哪几行得自己看一眼」只能落在表里。放在最前面:这一列很窄,
+            # 后面还可能跟着「可选 / 免点 / 替代N」,最要紧的一条得先看见。
+            need_check, why = bom_guess(line)
+            if need_check:
+                self._guess[line["bom_id"]] = why
+                flags.append(GUESS_FLAG)
             if line.get("optional"):
                 flags.append("可选")
             if line.get("consumable"):
@@ -5929,6 +6030,23 @@ class ProjectsTab(ttk.Frame):
     # ------------------------------------------------------ 动作
 
     def import_bom(self):
+        """选一个 BOM 文件,**直接导进去** —— 不再拦一道「核对品类」。
+
+        issue #37,用户原话:「导入 BOM 不要显示什么需要确认的这种东西,用户会
+        自己确认一遍,你的算法不一定准确。」
+
+        从前这里是:先 POST /api/bom/preview,再弹一个模态的 BomReviewDialog,
+        不点「确认导入」就一个字节都不落库。品类推断只是**辅助**,那个窗口却把
+        它变成了**门禁** —— 后端从来没这个要求(`bom_import` 的 categories 是
+        可选参数),网页版(/api/bom/import)也一直是直接导。所以现在:
+
+          * 项目名默认取文件名(和网页版一致),**不额外问一次名字**;
+          * 落库、切到新项目、报结果,由 _do_import 一手做完;
+          * 「哪几行品类是猜的」改成**事后**在 BOM 明细的「标记」列写「待核」
+            (见 bom_guess / load_bom),人自己回头核;
+          * 想连品类一起过一遍的,用明细工具栏的「复核品类…」—— 那是用户主动
+            要的,不再是必经之路。
+        """
         path = filedialog.askopenfilename(
             parent=self, title="选择 BOM 文件",
             filetypes=[("BOM 文件", "*.xlsx *.xlsm *.csv *.tsv"),
@@ -5945,18 +6063,55 @@ class ProjectsTab(ttk.Frame):
             return
 
         upload = {"filename": os.path.basename(path), "data": data}
-        # 先解析一遍再让人确认。直接导进去再改就晚了:那一刻品类已经落库,
-        # 而且人根本不知道哪些行是猜的。
+        name = os.path.splitext(os.path.basename(path))[0]
+        self._do_import(upload, name)
+
+    def review_categories(self):
+        """导入**之后**主动复核品类:选文件 → 看推断 → 改完按改的整份重导。
+
+        这就是原来那条「导入前核对」的路,只是从**必经**改成**按需**:复核窗口
+        还在(BomReviewDialog),但只有用户点了这个按钮才会出现。
+
+        为什么要重选文件:落库走的是 bom_import(它按文件重新解析、整份覆盖同名
+        项目),项目自己并不留 BOM 文件路径,所以复核必须拿到源文件。复核的是
+        **当前项目**:项目名默认填当前项目名,改完的品类跟着文件一起重导,覆盖的
+        就是这个项目(replace_existing 默认开),`self._pid` 自然还是它。
+
+        项目名空着时 BomReviewDialog 会挡住(它自己校验),这里不用重复。
+        """
+        if not self._pid:
+            messagebox.showinfo("提示", "先在左边选一个要复核的项目。", parent=self)
+            return
+        path = filedialog.askopenfilename(
+            parent=self, title="选择这个项目对应的 BOM(复核完按你改的品类整份重导)",
+            filetypes=[("BOM 文件", "*.xlsx *.xlsm *.csv *.tsv"),
+                       ("全部文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            messagebox.showerror("读不了文件", str(exc), parent=self)
+            return
+
+        upload = {"filename": os.path.basename(path), "data": data}
         preview = call(self.con, server.bom_preview, upload=upload, parent=self)
         if not preview:
             return
-        default_name = os.path.splitext(os.path.basename(path))[0]
+        # 默认顶上当前项目名,复核完覆盖的就是它。用户想改名也可以直接改这个框。
+        default_name = (self.report.get("project") or {}).get("name") or \
+            os.path.splitext(os.path.basename(path))[0]
         BomReviewDialog(self, self.app, preview, default_name=default_name,
-                        on_confirm=lambda name, cats: self._import_confirmed(
+                        on_confirm=lambda name, cats: self._do_import(
                             upload, name, cats))
 
-    def _import_confirmed(self, upload, name, categories):
-        """复核完了,带着人工改过的品类真正落库。"""
+    def _do_import(self, upload, name, categories=None):
+        """把文件真的导进去,然后把结果**说清楚**。
+
+        categories 是「复核品类…」带回来的人工结果({行号: 品类});从
+        「📥 导入 BOM」直接进来时是 None,品类全走推断。
+        """
         rep = call(self.con, server.bom_import,
                    body={"project_name": name, "categories": categories},
                    upload=upload, parent=self)
@@ -5966,17 +6121,26 @@ class ProjectsTab(ttk.Frame):
         # 报告里的字段名是 bom_lines;这里曾经写成 line_count,导入成功后必然 KeyError。
         # 用 get 兜一下,免得以后再改字段名又炸一次。
         lines = rep.get("bom_lines", rep.get("line_count", 0))
-        msg = (f"项目:{rep['project_name']}\n"
-               f"BOM {lines} 行,新建/复用元件 {rep.get('components_created', 0)} 个\n"
+        # 先把「切到新项目」做完(SET self._pid + 全量刷新),再弹完成提示:
+        #   * 提示是模态的,弹在前面等于让人对着旧表点确定;
+        #   * load_bom() 顺手算出了「哪几行品类是猜的」(self._guess),那个条数
+        #     要写进提示里,先刷新就不用为它再查一次后端。
+        self._pid = rep["project_id"]
+        self.app.refresh_all()
+        guess = len(self._guess)
+        msg = (f"{lines} 行已导入,请核对\n"
+               f"项目:{rep['project_name']}\n"
+               f"新建/复用元件 {rep.get('components_created', 0)} 个\n"
                f"总需求 {rep.get('total_qty', 0)}\n"
                f"警告 {len(warn)} 条")
         if categories:
             msg += f"\n人工改过品类的 {len(categories)} 行已按你改的落库"
+        if guess:
+            msg += (f"\n其中 {guess} 行的品类是**猜的**:明细表「标记」列写了"
+                    f"「{GUESS_FLAG}」,点中那一行右边会说推断依据,品类可以直接改")
         if warn:
             msg += "\n\n" + "\n".join(f"· {w}" for w in warn[:10])
         messagebox.showinfo("导入完成", msg, parent=self)
-        self._pid = rep["project_id"]
-        self.app.refresh_all()
 
     def new_project(self):
         name = ask_text(self, "新建项目", "项目名称:", "")

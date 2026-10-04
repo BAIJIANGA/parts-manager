@@ -4504,6 +4504,163 @@ def main() -> int:
               [x for x in ("#ffe3e3", "#1f618d", "#008000") if x in _raw45], [])
         check("收尾:色板也收起来了", _t45.pal_panel.winfo_manager(), "")
 
+        # ------------------------------------------------- 导入那一步的门禁(#37)
+        # 这一节**真的导一个 BOM 进来**(建项目、建元件),所以放在最后:跑完谁都
+        # 不受影响,临时库(build\cache\selftest.db)本来也是跑完就删。
+        p("\n【46】#37 BOM 导入去掉「需要确认」这一步:选完文件直接落库")
+        pr = app.tab_proj
+        # 两行的线索刻意选成相反的两种,而且值/封装在自检库里不会撞上已有的料:
+        #   R1  位号 / 值 / 封装三条线索都说是电阻 —— **明确**,不该被标「待核」
+        #   C9  位号说电容、值 10kΩ 说电阻 —— **打架**,必须被标「待核」
+        _csv46 = os.path.join(CACHE, "selftest_import.csv")
+        with open(_csv46, "w", encoding="utf-8", newline="") as _f46:
+            _f46.write("Designator,Quantity,Value,Footprint\n"
+                       "R1,1,68kΩ,2512\n"
+                       "C9,1,10kΩ,0805\n")
+        _open46 = gui.filedialog.askopenfilename
+        gui.filedialog.askopenfilename = lambda *a, **k: _csv46
+
+        # 「不再要人确认」得有牙齿地证:让复核窗口**一被构造就抛** —— 它一旦被摆
+        # 出来就说明门禁回来了。空桩(不弹而已)是蒙人的:以后把窗口放回这条路上,
+        # 空桩照样绿。
+        _real_review46 = gui.BomReviewDialog
+
+        class _Boom46:
+            def __init__(self, *a, **k):
+                raise AssertionError("导入又弹出核对窗口了 —— #37 要的是直接导")
+
+        gui.BomReviewDialog = _Boom46
+        box46 = FakeBox()
+        _mb46 = gui.messagebox
+        gui.messagebox = box46
+        _boom46 = ""
+        try:
+            pr.import_bom()
+            app.update()
+        except AssertionError as _e46:
+            _boom46 = str(_e46)
+        finally:
+            gui.BomReviewDialog = _real_review46
+            gui.filedialog.askopenfilename = _open46
+            gui.messagebox = _mb46
+
+        check("从「📥 导入 BOM」进去,一路没有复核窗口", _boom46, "")
+        _p46 = app_con.execute("SELECT id, name FROM project WHERE name=?",
+                               ("selftest_import",)).fetchone()
+        check("项目名默认取文件名(和网页版一致),没有额外问一次名字",
+              _p46 is not None, True)
+        _pid46 = _p46["id"] if _p46 else -1
+
+        # 提示:只该有一条,而且不该有任何问句
+        check("只弹了一条提示,标题是「导入完成」",
+              [t for t, _m in box46.infos], ["导入完成"])
+        check("没有任何「要确认吗」的提问(门禁真的没了)",
+              (list(box46.asks), list(box46.warns)), ([], []))
+        _msg46 = box46.infos[0][1] if box46.infos else ""
+        check("第一句就写清导了几行、请核对",
+              _msg46.splitlines()[0], "2 行已导入,请核对")
+        check("行数 / 新建元件数 / 总需求 / 警告 都还在",
+              [k for k in ("新建/复用元件", "总需求", "警告") if k not in _msg46], [])
+
+        # 明细表**真的**切到新项目(不只 self._pid 变了、表还停在旧项目上)
+        _want46 = sorted(str(r["id"]) for r in app_con.execute(
+            "SELECT id FROM project_bom WHERE project_id=?", (_pid46,)).fetchall())
+        check("库里这个项目有 2 行", len(_want46), 2)
+        check("self._pid 指向新项目", pr._pid, _pid46)
+        check("左边项目列表选中了它", tuple(pr.t_proj.selection()), (str(_pid46),))
+        check("BOM 明细里的行**就是**新项目的那些行(不是上一个项目的残影)",
+              sorted(pr.t_bom.get_children()), _want46)
+        check("标题栏写着新项目名", "selftest_import" in pr.title.get(), True)
+
+        # 「品类是猜的」在明细表里看得见:靠现成的「标记」列
+        _rep46 = API(server.project_bom, match=(_pid46,))
+        _bid46 = {l["designators"]: l["bom_id"] for l in _rep46["lines"]}
+        _ci46 = [str(c) for c in pr.t_bom["columns"]].index("flag")
+
+        def _flag46(_bid):
+            return str(pr.t_bom.item(str(_bid), "values")[_ci46])
+
+        check("线索打架的 C9 那行,「标记」列写着「待核」",
+              gui.GUESS_FLAG in _flag46(_bid46["C9"]), True)
+        check("线索明确的 R1 那行不标(不是无脑全标)",
+              gui.GUESS_FLAG in _flag46(_bid46["R1"]), False)
+        check("提示里报了要核的条数,并指向「标记」列",
+              ("1 行" in _msg46 and gui.GUESS_FLAG in _msg46), True)
+        pr.t_bom.selection_set(str(_bid46["C9"]))
+        app.update()
+        check("点中那一行,状态栏把推断依据说出来(不只留「待核」两个字)",
+              "矛盾" in app.status.get(), True)
+
+        # 「复核品类…」入口还在(窗口类没被删,只是从必经改成按需)
+        _btns46 = buttons_of(pr.sub.winfo_children()[0])
+        check("BOM 明细工具栏里摆着「复核品类…」这个入口",
+              any("复核品类" in t for t in _btns46), True)
+        try:
+            os.remove(_csv46)
+        except OSError:
+            pass
+
+        # ------------- 【47】#39 出库页:「领不到料」的行标红 -------------
+        p("\n【47】#39 出库页:凑不出料的行标红(#ffe3e3),能配齐的不许被误伤")
+        # 造两条需求:一条"库里一颗都没有"(必然凑不出),一条"库里有货"(用来证明不是整页红)
+        _c47a = app.con.execute(
+            "INSERT INTO component(name, category, value, unit) VALUES(?,?,?,?)",
+            ("筛测47-没货", "电阻", "47k", "个")).lastrowid
+        _c47b = app.con.execute(
+            "INSERT INTO component(name, category, value, unit) VALUES(?,?,?,?)",
+            ("筛测47-有货", "电阻", "4.7k", "个")).lastrowid
+        app.con.execute("INSERT INTO stock(component_id, location_id, qty) "
+                        "VALUES(?,1,99)", (_c47b,))
+        _p47 = app.con.execute(
+            "INSERT INTO project(name, qty, status) VALUES(?,?,?)",
+            ("筛测47-项目", 1, "active")).lastrowid
+        _b47a = app.con.execute(
+            "INSERT INTO project_bom(project_id, component_id, required_qty) "
+            "VALUES(?,?,?)", (_p47, _c47a, 5)).lastrowid
+        _b47b = app.con.execute(
+            "INSERT INTO project_bom(project_id, component_id, required_qty) "
+            "VALUES(?,?,?)", (_p47, _c47b, 3)).lastrowid
+        app.con.commit()
+        app.nb.select(app.tab_proj)
+        app.update()
+        _pp47 = app.tab_proj.pane_out.bom_form
+        _pp47.set_project(_p47)
+        app.update()
+
+        def _tags47(iid):
+            return tuple(_pp47.tree.item(iid, "tags") or ())
+
+        check("凑不出料的那条需求行挂了 short(红底)",
+              "short" in _tags47(_b47a), True)
+        check("库里有货的那条需求行没挂 short(没被误伤)",
+              "short" in _tags47(_b47b), False)
+        check("那条「库存里没有能凑它的料」的占位行也是红的",
+              "short" in _tags47(f"{_b47a}:none"), True)
+        # short 的实际底色直接问 Tk,别猜 —— 它就是"领不到"该有的那个红
+        check("short 这个 tag 配的底色就是库存页缺货那个红",
+              str(_pp47.tree.tag_configure("short", "background")), "#ffe3e3")
+        # 全页不能是红的:挂了 short 的行要远少于总行数
+        _rows47 = [str(r) for r in _pp47.tree.get_children("")]
+        for _b in _rows47:
+            _rows47 += [str(c) for c in _pp47.tree.get_children(_b)]
+        _reds47 = [r for r in _rows47 if "short" in _tags47(r)]
+        check("这一屏不是整页红(红的行数远少于总行数)",
+              len(_reds47) < max(1, len(_rows47)), True)
+        check("至少确实红了两行(那条需求 + 它的占位行)", len(_reds47) >= 2, True)
+        # 老前提「一行最多只有一个配 background 的 tag」现在也管到出库页
+        _bg_tags47 = set()
+        for _t in ("line", "own", "fp", "empty", "short", "covered"):
+            try:
+                if str(_pp47.tree.tag_configure(_t, "background") or ""):
+                    _bg_tags47.add(_t)
+            except Exception:  # noqa: BLE001
+                pass
+        _multi47 = [r for r in _rows47
+                    if len(_bg_tags47.intersection(_tags47(r))) > 1]
+        check("出库页每行最多只有一个配背景色的 tag(两行红底会互相盖)",
+              _multi47, [])
+        p(f"  [OK ] 出库页 {len(_rows47)} 行,其中标红的 {len(_reds47)} 行")
+
         app.update()
         p("  [OK ] 全量刷新")
         app.destroy()
