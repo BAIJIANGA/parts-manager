@@ -1012,6 +1012,11 @@ class ComponentsTab(ttk.Frame):
         # 注意这是**整行**上色:ttk 连单元格做不到,连整列也不行(见 _row_tags)。
         self.menu.add_command(label="文字颜色…", command=lambda: self.pick_row_color("fg"))
         self.menu.add_command(label="背景色…", command=lambda: self.pick_row_color("bg"))
+        # issue #36:选中的**格子**单独刷底色。和上面两条(刷整行)分开,互不干扰 ——
+        # 行色是 tag,格子色是覆盖色块,两套东西。
+        self.menu.add_separator()
+        self.menu.add_command(label="选中格子:底色…", command=self.pick_cell_color)
+        self.menu.add_command(label="选中格子:清掉底色", command=self.clear_cell_color)
         self.menu.add_command(label="清除自定义行配色", command=self.clear_row_colors)
         self.menu.add_separator()
         self.menu.add_command(label="挪到品类…", command=self.move_to_category)
@@ -1044,6 +1049,11 @@ class ComponentsTab(ttk.Frame):
         # 下面这几个 bind 也**只画框、绝不返回 "break"**,行上原来那一套照旧走。
         self._sel_cells = set()          # {(行 iid, "#列号")}
         self._sel_anchor = None          # 框选的起点,(行 iid, "#列号")
+        # issue #36 的另一半:单格底色。每个有底色的格子是一个覆盖色块,所以
+        # **数量要省着用**(只给真刷过色的格子造);而且每个色块都必须把
+        # Button-1 / Double-1 / Button-3 转发回表格,否则双击进编辑、右键菜单会失效。
+        self._cell_colors = {}           # {(行 iid, "#列号"): "#rrggbb"}
+        self._cell_patches = {}          # {(行 iid, "#列号"): tk.Frame}
         self._sel_frames = [tk.Frame(self.tree, background="#1f6feb")
                             for _i in range(4)]      # 上/下/左/右
         self.tree.bind("<ButtonPress-1>", self._sel_click, add="+")
@@ -2296,6 +2306,8 @@ class ComponentsTab(ttk.Frame):
         """
         for f in self._sel_frames:
             f.place_forget()
+        # 色块和边框要一起同步:先撤边框,再重铺色块,最后画新边框(边框在色块上面)
+        self._paint_cell_colors()
         if not self._sel_cells:
             return
         rows, cols = self._sel_rows(), self._sel_cols()
@@ -2349,6 +2361,83 @@ class ComponentsTab(ttk.Frame):
         self._sel_extend(cur)
         self._sel_paint()
         return None
+
+    # ---- 单格底色(#36 的另一半):覆盖色块 + 事件转发 ----
+    def set_cell_color(self, bg, cells=None):
+        """给选中的格子刷底色(bg=None 表示清掉)。"""
+        for rc in (self._sel_cells if cells is None else cells):
+            if bg:
+                self._cell_colors[(rc[0], rc[1])] = str(bg)
+            else:
+                self._cell_colors.pop((rc[0], rc[1]), None)
+        self._sel_paint()
+
+    def _cell_patch(self, rc):
+        """取(没有就造)某一格的覆盖色块,并把鼠标事件转发回表格。"""
+        fr = self._cell_patches.get(rc)
+        if fr is None:
+            fr = tk.Frame(self.tree, borderwidth=0, highlightthickness=0)
+            for _name in ("<Button-1>", "<Double-1>", "<Button-3>",
+                          "<B1-Motion>", "<ButtonRelease-1>"):
+                fr.bind(_name,
+                        lambda e, _f=fr, _n=_name: self._forward_to_tree(_f, _n, e))
+            self._cell_patches[rc] = fr
+        return fr
+
+    def _forward_to_tree(self, fr, name, event):
+        """把覆盖色块上的鼠标事件转发回表格本体。
+
+        issue #36 的要害就是这一句:覆盖层会吃掉事件,不转发的话双击进编辑、
+        右键菜单、拖动框选会全部失效。坐标必须换算 —— 覆盖层是 tree 的子控件,
+        `winfo_x/y` 就是它在 tree 里的位置。
+        """
+        try:
+            self.tree.event_generate(name, x=fr.winfo_x() + event.x,
+                                     y=fr.winfo_y() + event.y)
+        except tk.TclError:
+            pass
+        return "break"          # 覆盖层自己不要再处理一遍
+
+    def _paint_cell_colors(self):
+        """把有底色的格子铺上色块;滚出可视区 / 已经不在这一屏的一律撤掉。"""
+        rows, cols = self._sel_rows(), self._sel_cols()
+        for rc, fr in list(self._cell_patches.items()):
+            item, col = rc
+            if rc not in self._cell_colors or item not in rows or col not in cols:
+                fr.place_forget()
+                continue
+            try:
+                b = self.tree.bbox(item, col)
+            except tk.TclError:
+                b = None
+            if not b:                       # 滚出可视区了:撤掉,别画到错的地方
+                fr.place_forget()
+                continue
+            fr.configure(background=self._cell_colors[rc])
+            fr.place(x=b[0], y=b[1], width=b[2], height=b[3])
+            fr.lower()                      # 压到选中边框下面,边框才看得见
+
+    def pick_cell_color(self):
+        """右键菜单:给选中的格子挑一个底色。"""
+        if not self._sel_cells:
+            try:
+                self.app.set_status("先点一格,或者按住 Shift / 拖动框选几格,再刷底色", 6)
+            except AttributeError:
+                pass
+            return "break"
+        cur = self._cell_colors.get(next(iter(self._sel_cells))) or "#ffe3e3"
+        try:
+            _rgb, hexv = colorchooser.askcolor(color=cur, parent=self)
+        except tk.TclError:
+            return "break"
+        if hexv:
+            self.set_cell_color(hexv)
+        return "break"
+
+    def clear_cell_color(self):
+        """右键菜单:把选中格子的底色清掉(行色是另一套,不动)。"""
+        self.set_cell_color(None)
+        return "break"
 
     def _hdr_bounds(self):
         """屏幕上每一列的左右边界(像素),给横向拖动算落点用。
