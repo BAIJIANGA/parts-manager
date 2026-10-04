@@ -75,10 +75,28 @@ try:
     st = app.tab_stock
     ck("两个方向", sorted(st.btn), ["IN", "OUT"])
     ck("没有开单区了", hasattr(st, "submit"), False)
-    ck("入库流水行数 = 库里全部入库流水",
+    # 第十批起这一页按项目折叠(#30):树顶那一层是「组行」(一个项目一行),真正的
+    # 流水行挂在组下面,而且默认收着。所以 tree.get_children() 数出来的是「几个项目」,
+    # 不是「几笔流水」—— 拿它跟流水条数比,有库时必然差一个数量级(空库时两边都是 0,
+    # 所以这个错法只有「有库」才暴露得出来)。
+    # MovementGroups.row_ids() 才是表里真正的流水行(收着的组也算上)—— 撤销和断言
+    # 都走它,这是那个类自己写明的口径。
+    # 顺手把条数窗对齐:页面默认只查 300 条,下面那句查的是 5000 条,不设成同一个窗口
+    # 就会在流水多的库上比出「差了几百条」这种假失败。
+    st.limit.set("5000")
+    st.reload()
+    app.update()
+    want = server.list_movements(gui.make_ctx(app.con, query={"kind": "IN", "limit": "5000"}),
+                                 gui._Match())[1]["items"]
+    got = sorted(int(i) for i in st.groups.row_ids())
+    ck("入库流水行数 = 库里全部入库流水", len(got), len(want))
+    # 比「两边元件 id 的集合」,不受折叠影响:每一笔都在表里,一笔不多一笔不少。
+    # 这才是这一步真正要防的:折叠只该把流水收起来,不该把它弄丢或插重。
+    ck("每一笔流水都在表里、一笔不多一笔不少(折叠只是收起来,不是藏起来)",
+       got, sorted(int(m["id"]) for m in want))
+    ck("顶层一行一个项目(都不挂项目时正好 1 组)",
        len(st.tree.get_children()),
-       len(server.list_movements(gui.make_ctx(app.con, query={"kind": "IN", "limit": "5000"}),
-                                 gui._Match())[1]["items"]))
+       len({m.get("project_id") or 0 for m in want}))
     print("  摘要:", st.summary.get())
     ck("摘要说明了只查账", "只查账" in st.summary.get(), True)
     ck("项目下拉有「全部项目」", st.ALL in st.cb_proj.cget("values"), True)
@@ -137,6 +155,10 @@ try:
         pass
     os.remove(tmp)
     print("\n结果:" + ("成品包新版界面 PASS" if not bad else f"FAIL {bad}"))
+    # 有 bad 就必须以非 0 退出:build\build.ps1 第 8 步是拿 $LASTEXITCODE 判定的,
+    # 只 print 一句 FAIL 然后正常返回,等于这道闸门一直没关上(日志里那句「通过」
+    # 不代表任何东西)。这里照 step2/3/4 的写法收口。
+    sys.exit(1 if bad else 0)
 except Exception:
     print("!! 失败:")
     traceback.print_exc()

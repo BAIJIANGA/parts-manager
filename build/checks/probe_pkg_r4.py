@@ -6,8 +6,10 @@
     runtime\\python.exe ..\\..\\build\\checks\\probe_pkg_r4.py
 
 讲究和前面几步一样,而且这一步**尤其**要注意:第四轮的核心是「老库要能升上来」,
-所以这里刻意直接用包里那份**真实**数据库的副本跑一遍,而不是造一个干净的库 ——
-干净的新库建表当然成功,什么都证明不了。
+所以这里刻意直接用包里那份**真实**数据库的副本跑一遍。品类那两个方向分开咬:
+**老库**(本来就有 category 表)只认它**自己的现状** —— 一个内置种都不许补
+(issue #32:用户亲手删掉的空卡片不许被名单重新播种回来);**新库**(没有
+category 表)才拿内置名单当期望,19 个大类必须一个不漏地播下去。
 
 库里有没有项目都无所谓(用户的包里正好没有,那正是 #4 那个 bug 的场景),
 需要就现造一个。全程只碰副本,跑完回头确认原库一个字节都没动。
@@ -61,6 +63,18 @@ def cols_of(tree):
 def col_of(tree, title):
     """按表头找列号。写死下标的话,加一列就会让断言去看别的格子。"""
     return cols_of(tree).index(title)
+
+
+def roots_of(con):
+    """库里所有**顶层**品类名,按 id 顺序(建表/迁移都不会重排 id,所以先后可比)。"""
+    return [r["name"] for r in con.execute(
+        "SELECT name FROM category WHERE parent_id IS NULL ORDER BY id")]
+
+
+def cat_rows(con):
+    """库里所有品类行(名字, 父级)。老库那一侧的期望就靠迁移前后逐行比。"""
+    return [(r["name"], r["parent_id"]) for r in con.execute(
+        "SELECT name, parent_id FROM category ORDER BY id")]
 
 
 def cell_text(tree):
@@ -127,27 +141,45 @@ try:
     ck("说明书里写了品类管理", "品类管理" in txt, True)
 
     # ------------------------------------------------ 老库迁移(这一步的关键)
-    print("\n--- 老库升上来:品类表要自己建出来 ---")
+    print("\n--- 老库升上来:category 表本来就是它自己的,不许被重新播种 ---")
     tmp = os.path.join(CACHE, "_pkgprobe_r4.db")
     for suffix in ("", "-wal", "-shm"):
         if os.path.exists(tmp + suffix):
             os.remove(tmp + suffix)
     shutil.copy2(REAL, tmp)
 
+    # 老库这一侧的期望**只能来自库自己的现状**,不能来自内置名单。
+    # issue #32 之后品类是完全数据驱动的:用户在界面上亲手删掉的空卡片,启动时
+    # 不许被内置名单重新播种回来 —— 那正是他说的「我需要所有的东西都能删掉」。
+    # (旧版本每次启动都照名单 INSERT 一遍,人删一张它长一张,永远删不干净。)
     raw = db.connect(tmp)
     n_comp = raw.execute("SELECT COUNT(*) FROM component").fetchone()[0]
     n_stock = raw.execute("SELECT COUNT(*) FROM stock").fetchone()[0]
+    rows_before = cat_rows(raw)
+    roots_before = roots_of(raw)
     raw.close()
-    print(f"      迁移前:元件 {n_comp} 个,库存行 {n_stock} 行")
+    print(f"      迁移前:元件 {n_comp} 个,库存行 {n_stock} 行,"
+          f"品类 {len(rows_before)} 行(顶层 {len(roots_before)} 个)")
+    print("      迁移前的顶层名单:", roots_before)
 
     con = db.connect(tmp)
     db.init_db(con)
     n_cat = con.execute("SELECT COUNT(*) FROM category").fetchone()[0]
-    roots = [r["name"] for r in con.execute(
-        "SELECT name FROM category WHERE parent_id IS NULL").fetchall()]
-    ck("迁移之后 category 表建出来了", n_cat >= 19, True)
-    ck("内置那 19 个顶层品类一个不少",
-       [c for c in bom.CATEGORIES if c not in roots], [])
+    rows_after = cat_rows(con)
+    roots = roots_of(con)
+    print("      迁移后的顶层名单:", roots)
+    ck("迁移之后 category 表还在(老库本来就有这张表)", n_cat > 0, True)
+    # 核心一:老库**一个内置种都不许补**。内置名单里有、库里本来没有的那几个
+    # 名字(用户删掉的)如果又冒出来,这条就红 —— 这是 #32 的契约。
+    ck("一个内置品类都没有被重新播种(用户删掉的不许回来)",
+       [c for c in bom.CATEGORIES if c in roots and c not in roots_before], [])
+    # 核心二:库里原来那几行也不许被动(改名 / 改父级 / 少一行都会红)。
+    # 这一侧以前拿内置名单当期望,于是把「用户删过」误判成「迁移没做全」——
+    # 内置名单不是老库的真理,只是新库开箱的初始值,所以只在下面「全新空库」
+    # 那一侧当期望。
+    ck("老库原有的品类行逐名不变(一行没多、一行没少、没被改名改父级)",
+       rows_after, rows_before)
+    ck("顶层品类逐名不变", roots, roots_before)
     ck("元件一个都没少", con.execute("SELECT COUNT(*) FROM component").fetchone()[0],
        n_comp)
     ck("库存行一个都没少", con.execute("SELECT COUNT(*) FROM stock").fetchone()[0],
@@ -171,6 +203,28 @@ try:
     ck("再跑一遍迁移结果不变(用户每次启动都会走一遍)",
        con.execute("SELECT COUNT(*) FROM category").fetchone()[0], n_cat)
     con.close()
+
+    # ------------------------------------------------ 新库那一侧(内置名单只管这里)
+    # 上面那条只能证明「不播种」;光有它的话,把播种整个删掉也照样绿。所以这边
+    # 反过来咬一口:真正**第一次**建出 category 表时,19 个内置大类必须都在 ——
+    # 新装的库打开就有标准大类可挑,不用自己在空列表里敲。
+    print("\n--- 全新空库:第一次建出 category 表时才播种 ---")
+    fresh = os.path.join(CACHE, "_pkgprobe_r4_fresh.db")
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(fresh + suffix):
+            os.remove(fresh + suffix)
+    fcon = db.connect(fresh)
+    ck("新库在建表之前本来没有 category 表",
+       fcon.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='category'"
+                    ).fetchone() is None, True)
+    db.init_db(fcon)
+    fresh_roots = roots_of(fcon)
+    print("      首次建表后的顶层名单:", fresh_roots)
+    ck("全新库首次建表把内置品类都播下去了(一个不漏)",
+       [c for c in bom.CATEGORIES if c not in fresh_roots], [])
+    ck("新库顶层数 = 内置名单数(没多播也没漏播)",
+       len(fresh_roots), len(bom.CATEGORIES))
+    fcon.close()
 
     # ------------------------------------------------ #5 属性
     print("\n--- #5 自己定义属性 ---")
@@ -401,13 +455,14 @@ except Exception:
 # ---------------------------------------------------- 收尾与原库校验
 # 临时库可能还被 sqlite 的连接占着(Windows 上删不掉),删不掉不算失败 ——
 # 它在 build/cache/ 下,本来就不进版本库
-for suffix in ("", "-wal", "-shm"):
-    p = os.path.join(CACHE, "_pkgprobe_r4.db" + suffix)
-    try:
-        if os.path.exists(p):
-            os.remove(p)
-    except OSError:
-        pass
+for _name in ("_pkgprobe_r4.db", "_pkgprobe_r4_fresh.db"):
+    for suffix in ("", "-wal", "-shm"):
+        p = os.path.join(CACHE, _name + suffix)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
 after = snapshot(REAL)
 ck("用户真实数据库一个字节都没被动过", after, before)
 

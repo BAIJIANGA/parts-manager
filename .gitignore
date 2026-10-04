@@ -24,6 +24,11 @@ data/*.err
 # 就得放在 build/checks/(见下),不能放在这里。
 build/cache/
 
+# build.ps1 自己生成的打包脚本副本(里面的路径已经被改写成 build\cache\dist_stage\...),
+# 是产物不是源:源是 build\build.ps1,改它没有意义,下次打包还会被覆盖回去。
+# 和 build/cache/ 那几条一个道理 —— 产物不进库。
+build/_build_stage.ps1
+
 # 改代码前留的对照备份,只是干活时的临时东西
 app/*_before_*.py
 
