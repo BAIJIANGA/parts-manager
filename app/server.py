@@ -220,16 +220,21 @@ SELECT c.*,
        MAX(0, {REQUIRED_SQL} - {ON_HAND_SQL}) AS deficit,
        MAX(0, MAX({REQUIRED_SQL}, c.min_stock) - {ON_HAND_SQL} - {ON_ORDER_SQL}) AS to_order,
        CASE
+         -- 库存状态**只跟安全库存比**(issue #38):库存 ≤ 安全库存才算缺料。
+         -- 这里以前还有一档 "on_hand < required THEN 'short'"(拿 BOM 需求量当缺料),
+         -- 那是**项目 BOM 的口径**,不是库存本身的事 —— 库里的料明明够,只因为某个
+         -- 项目 BOM 要得比手上多就被打成「缺料」,正是用户被误导的来源(见 gui.py 里
+         -- 「需求/缺口/在途该摆在项目页,不是库存页」那段注释)。采购页要的
+         -- target/to_order 仍照旧用 required 算,不受这里影响。
          WHEN {ON_HAND_SQL} = 0 THEN 'out'
-         WHEN {ON_HAND_SQL} < c.min_stock THEN 'low'
-         WHEN {ON_HAND_SQL} < {REQUIRED_SQL} THEN 'short'
+         WHEN {ON_HAND_SQL} <= c.min_stock THEN 'low'
          ELSE 'ok'
        END AS stock_state
 FROM component c
 """
 
-# 库存状态的显示名,界面和报表共用
-STATE_LABEL = {"ok": "充足", "low": "偏低", "short": "缺料", "out": "缺货"}
+# 库存状态的显示名,界面和报表共用。只剩三档:缺料就是"到安全库存了"(含相等)。
+STATE_LABEL = {"ok": "充足", "low": "缺料", "out": "缺货"}
 KIND_LABEL = {"IN": "入库", "OUT": "出库", "ADJUST": "盘点", "TRANSFER": "移库"}
 
 
@@ -507,7 +512,7 @@ def list_components(ctx: Ctx, m):
     sql = f"SELECT * FROM ({inner})"
     outer_where, outer_args = [], []
     state = ctx.q("state")
-    if state in ("ok", "low", "out", "short"):
+    if state in ("ok", "low", "out"):
         outer_where.append("stock_state = ?")
         outer_args.append(state)
     # stocked=1:只要真正有库存的。on_hand 是子查询算出来的,所以只能在外层过滤。
@@ -2670,8 +2675,11 @@ def _shopping_rows(con) -> list:
         reasons = []
         if d["deficit"] > 0:
             reasons.append(f"项目缺料 {d['deficit']}")
-        if d["min_stock"] and d["on_hand"] < d["min_stock"]:
-            reasons.append(f"低于安全库存 {d['min_stock'] - d['on_hand']}")
+        if d["min_stock"] and d["on_hand"] <= d["min_stock"]:
+            # 口径是「库存 ≤ 安全库存」(#38),所以相等时差值就是 0 ——
+            # 那时候写「低于安全库存 0」读起来别扭,说「已到安全库存」才准。
+            _gap = d["min_stock"] - d["on_hand"]
+            reasons.append("已到安全库存" if _gap <= 0 else f"低于安全库存 {_gap}")
         if d["on_order"]:
             reasons.append(f"在途 {d['on_order']}")
         d["reasons"] = reasons
@@ -2702,7 +2710,7 @@ def dashboard(ctx: Ctx, m):
                    COALESCE(SUM(on_hand * unit_price),0) AS value,
                    COALESCE(SUM(CASE WHEN on_hand = 0 THEN 1 ELSE 0 END),0) AS out_kinds,
                    COALESCE(SUM(CASE WHEN on_hand > 0 AND min_stock > 0
-                                      AND on_hand < min_stock THEN 1 ELSE 0 END),0) AS low_kinds
+                                      AND on_hand <= min_stock THEN 1 ELSE 0 END),0) AS low_kinds
               FROM ({COMPONENT_SELECT})""").fetchone()
 
     buy = _shopping_rows(ctx.con)

@@ -144,7 +144,7 @@ check("A 需求 = 10 × 5", a["required"], 50)
 check("A 缺口 = 50 − 30", a["deficit"], 20)
 check("A 目标 = max(需求50, 安全库存100)", a["target"], 100)
 check("A 该买 = 目标100 − 现有30 − 在途0", a["to_order"], 70)
-check("A 状态(30 < 安全库存100)是偏低", a["stock_state"], "low")
+check("A 状态(30 < 安全库存100)是缺料", a["stock_state"], "low")
 
 b = by_id[B]
 check("B 需求 = 2 × 5", b["required"], 10)
@@ -2221,6 +2221,201 @@ _del_cat_routes = [fn for (_m, _p, fn) in server.ROUTES
 check("DELETE /api/categories/<id> 只注册了一条", len(_del_cat_routes), 1)
 check("而且绑的就是 delete_category(不是内部帮手 _retag_category_subtree)",
       _del_cat_routes[0] if _del_cat_routes else None, server.delete_category)
+
+# ---- issue #38:库存状态**只跟安全库存比**,BOM 需求再大也不算缺料 -------
+# 用户库 19 颗料库存都够、安全库存全没设,却因为某个项目 BOM 要得多就被打成
+# 「缺料」—— 那是 BOM 的口径,不是库存本身的事。下面把三条边界钉死:
+#   库存 == 安全库存  → low(`<=` 的边界,本次改动的关键)
+#   库存  > 安全库存  → ok
+#   库存 <  BOM 需求  → 照样 ok(需求只影响 缺口/该买,不影响 状态)
+p("\n【42】issue #38:库存状态只跟安全库存比,需求再大也不算缺料")
+# 另起一批料和一个项目,不碰前面那套场景(前 41 节的期望值全是手算好的)。
+E38 = mkcomp("issue38 相等边界", "电阻", "38Ω", min_stock=50, package="R0603")
+G38 = mkcomp("issue38 高一个", "电阻", "39Ω", min_stock=50, package="R0603")
+H38 = mkcomp("issue38 低一个", "电阻", "37Ω", min_stock=50, package="R0603")
+I38 = mkcomp("issue38 需求特大", "电阻", "1Ω", min_stock=0, package="R0603")
+for _cid38, _qty38 in ((E38, 50), (G38, 51), (H38, 49), (I38, 10)):
+    call(server.stock_move, body={"kind": "IN", "component_id": _cid38, "qty": _qty38})
+
+# 让 I38 挂在一个 active 项目的 BOM 上,需求 999 —— 远大于手上的 10。
+_s, _p38 = call(server.create_project, body={"name": "issue38 大需求项目", "qty": 1})
+call(server.add_bom_line, body={"component_id": I38, "required_qty": 999},
+     match=(str(_p38["id"]),))
+
+_s, _c38 = call(server.list_components, query={"limit": 0})
+_b38 = {c["id"]: c for c in _c38["items"]}
+_e38, _g38, _h38, _i38 = _b38[E38], _b38[G38], _b38[H38], _b38[I38]
+
+check("库存 50 == 安全库存 50 → 缺料(low,`<=` 的边界)",
+      _e38["stock_state"], "low")
+check("库存 51 > 安全库存 50 → 充足(ok)", _g38["stock_state"], "ok")
+check("库存 49 < 安全库存 50 → 缺料(低的那一侧照旧)",
+      _h38["stock_state"], "low")
+
+# 「BOM 需求大不算缺料」这条回归钉子:先证明场景是真的(需求 999 ≫ 库存 10),
+# 再证明状态不受它影响,而 缺口/该买 照旧按需求算(只改了状态那一档)。
+check("I38 的 BOM 需求确实远大于库存(999 ≫ 10)",
+      (_i38["required"], _i38["on_hand"], _i38["deficit"] > 0), (999, 10, True))
+check("需求 999 > 库存 10,状态仍是充足而不是缺料", _i38["stock_state"], "ok")
+check("需求照样进缺口 999 − 10,状态不掺和采购口径", _i38["deficit"], 989)
+
+# 状态只有三档:显示名对得上,而且三档条数加起来正好是全部(没有第四档)。
+check("STATE_LABEL 的键集合只有 ok/low/out",
+      set(server.STATE_LABEL), {"ok", "low", "out"})
+check("STATE_LABEL['low'] 是「缺料」", server.STATE_LABEL["low"], "缺料")
+check("没有哪条料的 stock_state 逃出三档",
+      sorted({c["stock_state"] for c in _c38["items"]} - {"ok", "low", "out"}), [])
+_n38 = {st: call(server.list_components, query={"limit": 0, "state": st})[1]["total"]
+        for st in ("ok", "low", "out")}
+check("三档 ?state= 的条数加起来正好是全部(状态没有第四档)",
+      sum(_n38.values()), _c38["total"])
+
+
+# ---------------------------------------------------------------- 【43】
+p("\n【43】两个库存筛选按钮的钉桩:state=out / state=low 在整棵子树上都成立")
+# 用户在库存页要的是两个按钮:「库存=0」和「低于安全库存」。后端**不需要新参数** ——
+# list_components 的 state=out / state=low 就是这两个口径(见 server.py 的 COMPONENT_SELECT:
+# 库存 = 0 → out,库存 ≤ min_stock → low)。过滤发生在外层、对算好的 stock_state 做比较,
+# 所以按 category_id 筛的时候**整棵子树**里的料都落在同一套口径上,
+# 界面点一次按钮就是一次 ?state= 请求,不用自己拼「多个品类」。
+# 这一节把四件事钉住:
+#   ① 子树筛得到:顶层 / 中间层都能筛到叶子下面那颗 0 库存料;
+#   ② own=1 只看本级,不会越界到别的节点;
+#   ③ state=out 与 state=low 互补且没有第四档 —— 两者条数之和 == 不传 state 时 out+low 的条数;
+#   ④ 与 unit/package 是**交集**;而 stocked=1 与 state=out **互斥**,同时传永远是空表。
+# 另起一棵全新的三级品类和一批料,不碰前 42 节手算好的场景。
+S43 = {"a": call(server.create_category, body={"name": "筛测43-顶层"})[1]["id"]}
+S43["b"] = call(server.create_category,
+                body={"name": "筛测43-中间", "parent_id": S43["a"]})[1]["id"]
+S43["c"] = call(server.create_category,
+                body={"name": "筛测43-叶子", "parent_id": S43["b"]})[1]["id"]
+
+
+def _mk43(name, category_id, value, package, min_stock=0, qty=0):
+    """挂到指定**节点**下(不是按大类名),再按需要的数量入一笔库。
+
+    qty=0 就一笔都不入 —— 那就是「库存 0」,正是这一节要盯住的那种料。
+    """
+    cid = call(server.create_component, body={
+        "name": name, "category_id": category_id, "value": value,
+        "package": package, "min_stock": min_stock})[1]["id"]
+    if qty:
+        call(server.stock_move, body={"kind": "IN", "component_id": cid, "qty": qty})
+    return cid
+
+
+# C(叶子)下三颗:库存 0 / 低于安全库存 / 正常。
+C43_out = _mk43("筛测43-零库存", S43["c"], "1uF", "0603", min_stock=0, qty=0)
+C43_low = _mk43("筛测43-缺料", S43["c"], "4.7kΩ", "0603", min_stock=5, qty=2)
+C43_ok = _mk43("筛测43-充足", S43["c"], "10kΩ", "0805", min_stock=0, qty=5)
+# 再补两颗「缺料」,专门给下面「与 unit/package 是交集」那条断言用:一颗单位相同、
+# 封装不同;一颗封装相同、单位不同 —— 单看任何一个条件都缩小不到最终答案,
+# 必须两个条件同时生效才算交集(否则那条断言等于没牙)。
+C43_low_pkg = _mk43("筛测43-缺料换封装", S43["c"], "4.7kΩ", "0805", min_stock=5, qty=2)
+C43_low_unit = _mk43("筛测43-缺料换单位", S43["c"], "100nF", "0603", min_stock=5, qty=2)
+# A(顶层)**本级**直接挂一颗 0 库存的料 —— 用来验「子树」和「本级」的分界。
+A43_out = _mk43("筛测43-顶层本级零库存", S43["a"], "1uF", "0805", min_stock=0, qty=0)
+
+
+def _ids43(query):
+    """按查询取 id 集合。limit=0 = 不截断,断言才看得到全部。"""
+    _s, _r = call(server.list_components, query=dict(query, limit="0"))
+    return {i["id"] for i in _r["items"]}
+
+
+_s, _all43 = call(server.list_components,
+                  query={"category_id": str(S43["a"]), "limit": "0"})
+# 查状态用全库那份:这样「三颗料的状态是三档」这条断言不依赖品类筛选,
+# 免得品类筛选一旦坏掉,场景本身就先塌了、看不到下面那些断言变红。
+_s, _glob43 = call(server.list_components, query={"limit": "0"})
+_st43 = {i["id"]: i["stock_state"] for i in _glob43["items"]}
+check("三颗料的状态就是三档(场景成立:0 库存=out、2<5=low、5>0=ok)",
+      (_st43[C43_out], _st43[C43_low], _st43[C43_ok]), ("out", "low", "ok"))
+
+# ---- ① 子树筛得到:顶层 A 和中间层 B 都能筛到 C(叶子)下那颗 0 库存料
+check("顶层子树 state=out:含叶子 C 下面那颗 0 库存料(整棵子树都筛得到)",
+      C43_out in _ids43({"category_id": str(S43["a"]), "state": "out"}), True)
+check("中间层子树 state=out:同样筛得到",
+      C43_out in _ids43({"category_id": str(S43["b"]), "state": "out"}), True)
+check("顶层子树 state=out 里也有 A 本级那颗 0 库存料(它本来就在这棵树里)",
+      A43_out in _ids43({"category_id": str(S43["a"]), "state": "out"}), True)
+check("子树 state=out 不含正常那颗(库存 5 不算缺货)",
+      C43_ok in _ids43({"category_id": str(S43["a"]), "state": "out"}), False)
+
+# ---- ② own=1:只到这一个节点为止,不越界
+check("own=1 只看本级:叶子 C 的 state=out 只有它自己那颗",
+      _ids43({"category_id": str(S43["c"]), "own": "1", "state": "out"}),
+      {C43_out})
+check("own=1 不越界到 A 本级那颗 0 库存料(只有子树才能筛到它)",
+      A43_out in _ids43({"category_id": str(S43["c"]), "own": "1", "state": "out"}), False)
+check("对称的一面:A 本级 own=1 看到的是 A 自己挂的那颗,不含 C 下的",
+      _ids43({"category_id": str(S43["a"]), "own": "1", "state": "out"}),
+      {A43_out})
+
+# ---- ③ low 的口径:库存 < 安全库存;`<=` 的边界和「没设安全库存」的坑都在 #42 验过
+_low43 = _ids43({"category_id": str(S43["a"]), "state": "low"})
+check("子树 state=low:正好是「库存 < 安全库存」的那三颗",
+      _low43, {C43_low, C43_low_pkg, C43_low_unit})
+check("state=low 不含正常那颗(库存 5 > 安全库存 0)",
+      C43_ok in _low43, False)
+check("state=low 不含「安全库存没设(min_stock=0)且库存 0」那颗 —— 它属于 out,不是 low",
+      C43_out in _low43, False)
+
+# ---- ③' 口径自洽:out + low 的条数之和 == 不传 state 时 out+low 的条数
+_n_out43 = call(server.list_components,
+                query={"category_id": str(S43["a"]), "state": "out",
+                       "limit": "0"})[1]["total"]
+_n_low43q = call(server.list_components,
+                 query={"category_id": str(S43["a"]), "state": "low",
+                        "limit": "0"})[1]["total"]
+check("state=out + state=low 的条数之和 == 不传 state 时的 out+low 条数(口径自洽)",
+      _n_out43 + _n_low43q,
+      len([i for i in _all43["items"] if i["stock_state"] in ("out", "low")]))
+check("两个筛选都不是空表(否则上面那条恒等于 0+0,验不出东西)",
+      (_n_out43, _n_low43q), (2, 3))
+
+# ---- ④ 与别的筛选并存 = 交集(内层按 unit/package 过滤,外层按 stock_state 过滤,AND 起来)
+_lo_unit43 = _ids43({"category_id": str(S43["a"]), "state": "low", "unit": "Ω"})
+_lo_pkg43 = _ids43({"category_id": str(S43["a"]), "state": "low", "package": "0603"})
+_lo_both43 = _ids43({"category_id": str(S43["a"]), "state": "low",
+                     "unit": "Ω", "package": "0603"})
+check("单看单位:state=low + unit=Ω 还有两颗", _lo_unit43, {C43_low, C43_low_pkg})
+check("单看封装:state=low + package=0603 也还有两颗", _lo_pkg43, {C43_low, C43_low_unit})
+check("两个一起传 = 交集,只剩「4.7kΩ + 0603」那一颗", _lo_both43, {C43_low})
+check("交集确实是交集:结果 ⊆ 每一份单独的结果",
+      _lo_both43 <= _lo_unit43 and _lo_both43 <= _lo_pkg43, True)
+
+# ---- ④' 已知的互斥:**界面点了「库存=0」时不许再传 stocked**,否则永远是空表。
+# 外层是 AND:stocked=1 加的是 on_hand > 0,而 out 的定义就是 on_hand = 0,
+# 两个条件不可能同时成立 —— 这是我们自己口径的必然结果,不是 bug,所以显式钉住,
+# 免得以后有人以为「空表 = 筛选没生效」又去乱改。(界面那边由另一个代理处理。)
+_s, _both43 = call(server.list_components,
+                   query={"category_id": str(S43["a"]), "state": "out",
+                          "stocked": "1", "limit": "0"})
+check("stocked=1 与 state=out 同时传 ⇒ 必须为空(外层 AND 的必然结果)",
+      (_both43["total"], _both43["items"]), (0, []))
+check("对照:只传 state=out 有 2 条 —— 空表是互斥造成的,不是筛选写错",
+      _n_out43, 2)
+
+# ---- 任务 2:0 库存的料必须有入口,靠的是 /api/categories 本来就有的 own
+# 中间页的「本级」卡片以前只在 own_stocked > 0 时摆 —— 于是「有子类 + 本级挂着一批
+# 0 库存料」时,那批料在菜单上没有任何入口。own 是「直接挂在这个节点下的元件数」,
+# **不看库存**,正是判断要不要摆卡片的那个数;own_stocked 只用来写卡片上的「N 种在库」。
+# 这里不用新增字段,把两者在 0 库存场景下的关系钉住。
+_s, _cat43 = call(server.list_categories)
+_lv43 = {n["id"]: n for n in _cat43["flat"]}
+_a43, _c43 = _lv43[S43["a"]], _lv43[S43["c"]]
+check("A 本级挂着 1 颗料(它 0 库存)", _a43["own"], 1)
+check("而 A 本级的「在库」是 0 —— 过去就是靠这个数判断,卡片于是整个消失",
+      _a43["own_stocked"], 0)
+check("所以「本级」卡片该看 own 而不是 own_stocked:own > 0 但 own_stocked == 0",
+      (_a43["own"] > 0, _a43["own_stocked"] == 0), (True, True))
+check("叶子 C:本级 5 颗、其中有库存的 4 颗(0 库存那颗不算「在库」)",
+      (_c43["own"], _c43["own_stocked"]), (5, 4))
+check("own 与 own_stocked 的差就是本级 0 库存的条数(own 不看库存、own_stocked 只看)",
+      _c43["own"] - _c43["own_stocked"],
+      len([i for i in _all43["items"]
+           if i["category_id"] == S43["c"] and not i["on_hand"]]))
 
 CON.close()
 p("\n" + "=" * 62)

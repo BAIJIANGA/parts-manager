@@ -11,7 +11,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ESC_MAP[c]);
 const num = (n) => (n === null || n === undefined ? '0' : String(n));
 
 const KIND_LABEL = { IN: '入库', OUT: '出库', ADJUST: '盘点', TRANSFER: '移库' };
-const STATE_LABEL = { ok: '充足', low: '偏低', out: '缺货' };
+const STATE_LABEL = { ok: '充足', low: '缺料', out: '缺货' };
 
 async function api(path, { method = 'GET', body, form } = {}) {
   const init = { method, headers: {} };
@@ -86,7 +86,7 @@ async function loadStats() {
   $('#stats').innerHTML = `
     <div class="stat"><b>${num(s.components)}</b><span>元件种类</span></div>
     <div class="stat"><b>${num(s.total_qty)}</b><span>库存总数</span></div>
-    <div class="stat warn"><b>${num(s.low)}</b><span>库存偏低</span></div>
+    <div class="stat warn"><b>${num(s.low)}</b><span>缺料</span></div>
     <div class="stat bad"><b>${num(s.out)}</b><span>缺货</span></div>
     <div class="stat"><b>${num(s.projects)}</b><span>项目</span></div>`;
 }
@@ -110,7 +110,7 @@ async function renderComponents() {
         <select id="f-state">
           <option value="">全部状态</option>
           <option value="ok"${f.state === 'ok' ? ' selected' : ''}>充足</option>
-          <option value="low"${f.state === 'low' ? ' selected' : ''}>偏低</option>
+          <option value="low"${f.state === 'low' ? ' selected' : ''}>缺料</option>
           <option value="out"${f.state === 'out' ? ' selected' : ''}>缺货</option>
         </select>
         <select id="f-sort">
