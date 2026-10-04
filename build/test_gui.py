@@ -4661,6 +4661,71 @@ def main() -> int:
               _multi47, [])
         p(f"  [OK ] 出库页 {len(_rows47)} 行,其中标红的 {len(_reds47)} 行")
 
+        # ------------- 【48】#40 库存筛选:点按钮时真正发出去的查询 -------------
+        p("\n【48】#40 库存筛选按钮:发出去的查询参数对不对(不依赖当前层级是谁)")
+        _tab48 = app.tab_comp
+        app.nb.select(_tab48)
+        app.update()
+        _seen48 = []
+        _orig_call48 = gui.call
+
+        def _spy48(con, fn, **kw):
+            if fn is server.list_components:
+                _seen48.append(dict(kw.get("query") or {}))
+            return _orig_call48(con, fn, **kw)
+
+        gui.call = _spy48
+        try:
+            _tab48.zero_stock.set(True)
+            _tab48.stock_filter = ""
+            _tab48.load_category()
+            app.update()
+            check("不筛的时候查询里没有 state",
+                  "state" in _seen48[-1], False)
+            _tab48.set_stock_filter("out")
+            app.update()
+            check("点「库存=0」发出去的查询带着 state=out",
+                  _seen48[-1].get("state"), "out")
+            # 最关键的一条:这两个条件是 AND,同时发出去必然是空表
+            check("筛「库存=0」时绝不能再带 stocked(否则永远是空表)",
+                  "stocked" in _seen48[-1], False)
+            check("点「库存=0」自动打开了「显示零库存」",
+                  bool(_tab48.zero_stock.get()), True)
+            check("标签上写着当前筛的是什么(用户看得见)",
+                  "库存=0" in _tab48.f_stock.get(), True)
+            _tab48.set_stock_filter("low")
+            app.update()
+            check("点「低于安全库存」带着 state=low",
+                  _seen48[-1].get("state"), "low")
+            _tab48.set_stock_filter("low")        # 再点一次 = 取消
+            app.update()
+            check("再点同一个按钮 = 取消筛选", _tab48.stock_filter, "")
+            check("取消之后查询里不再有 state",
+                  "state" in _seen48[-1], False)
+            # 关掉「显示零库存」时,普通列表照旧只看有货的(不能因为加了筛选就丢了这个口径)
+            _tab48.zero_stock.set(False)
+            _tab48.load_category()
+            app.update()
+            check("关掉零库存开关时普通列表照旧带 stocked=1",
+                  _seen48[-1].get("stocked"), "1")
+            # 反过来:筛着「库存=0」的同时把开关关掉,也不能退化成空表
+            _tab48.zero_stock.set(True)
+            _tab48.set_stock_filter("out")
+            app.update()
+            _tab48.zero_stock.set(False)
+            _tab48.load_category()
+            app.update()
+            check("筛「库存=0」时把零库存开关关掉,查询里依然不带 stocked",
+                  "stocked" in _seen48[-1], False)
+            _tab48.zero_stock.set(True)
+        finally:
+            gui.call = _orig_call48
+        check("扒完参数后 gui.call 已还原(别把后面段落带坏)",
+              gui.call is _orig_call48, True)
+        _tab48.set_stock_filter("")               # 收尾:取消筛选
+        app.update()
+        p(f"  [OK ] 其间抓到 {len(_seen48)} 次 list_components 查询")
+
         app.update()
         p("  [OK ] 全量刷新")
         app.destroy()
